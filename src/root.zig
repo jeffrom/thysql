@@ -11,7 +11,10 @@ fn _readline(prompt: ?[]const u8) ?[:0]const u8 {
 }
 
 pub fn readLine() !void {
-    while (isocline.ic_readline(">>") != null) {}
+    while (true) {
+        const line = _readline("") orelse break;
+        std.debug.print("typed: {s}\n", .{line});
+    }
 }
 
 pub fn bufferedPrint() !void {
