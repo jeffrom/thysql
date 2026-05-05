@@ -2,11 +2,16 @@ const std = @import("std");
 const thysql = @import("thysql");
 
 pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
     // Prints to stderr, ignoring potential errors.
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
     try thysql.bufferedPrint();
 
-    try thysql.readLine();
+    try thysql.runREPL(allocator);
 }
 
 test "simple test" {

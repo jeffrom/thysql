@@ -55,14 +55,16 @@ pub fn build(b: *std.Build) void {
     //     .files = &.{"src/*.c"},
     // });
     // mod.addIncludePath(isocline_dep.path("include"));
-    mod.linkLibrary(isocline_dep.artifact("isocline"));
     mod.link_libc = true;
+    mod.linkLibrary(isocline_dep.artifact("isocline"));
 
     // const isocline_mod = b.createModule(.{
     //     .name = "isocline",
     //     .target = target,
     //     .optimize = optimize,
     // });
+
+    mod.linkSystemLibrary("mysqlclient", .{});
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
