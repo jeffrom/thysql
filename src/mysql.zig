@@ -65,5 +65,8 @@ pub const DB = struct {
         while (mysqlclient.mysql_fetch_row(result)) |row| {
             std.debug.print("row: {*}\n", .{row[0]});
         }
+
+        const affected = mysqlclient.mysql_affected_rows(self.conn);
+        std.debug.print("{d} row(s) affected\n", .{affected});
     }
 };

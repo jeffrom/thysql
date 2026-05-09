@@ -1,0 +1,23 @@
+const std = @import("std");
+
+const isocline = @import("isocline.zig");
+
+pub fn freeLine(ptr: ?*anyopaque) void {
+    isocline.freeMemory(ptr);
+}
+
+pub fn one(prompt: ?[]const u8) ?[:0]const u8 {
+    return isocline.readline(prompt);
+}
+
+// fn wordCompleter(env: *isocline.ic_completion_env_t, word: [*c]const u8) callconv(.c) void {
+//     const completions = [_][*:0]const u8{"select"};
+//     // isocline.ic_add_completions(env, word, completions);
+// }
+
+pub fn setup() !void {
+    // isocline.ic_set_history(null, 5000);
+
+    // isocline.ic_set_default_completer(wordCompleter, null);
+    // isocline.ic_enable_auto_tab(true);
+}

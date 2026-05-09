@@ -3,15 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Mysql = @import("mysql.zig");
-
-const isocline = @cImport({
-    @cInclude("isocline.h");
-});
-
-fn _readline(prompt: ?[]const u8) ?[:0]const u8 {
-    const result = isocline.ic_readline(if (prompt) |p| p.ptr else null);
-    return if (result) |p| std.mem.span(p) else null;
-}
+const Readline = @import("readline.zig");
 
 pub fn runREPL(allocator: Allocator) !void {
     const db = try Mysql.DB.init(allocator, .{
@@ -22,10 +14,14 @@ pub fn runREPL(allocator: Allocator) !void {
     });
     defer db.close();
 
+    try Readline.setup();
+
     while (true) {
-        const line = _readline("promt") orelse break;
+        const line = Readline.one("mysql") orelse break;
         std.debug.print("typed: {s}\n", .{line});
         try db.exec(line);
+
+        Readline.freeLine(@ptrCast(@constCast(line)));
     }
 }
 
