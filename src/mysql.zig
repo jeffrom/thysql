@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const mysqlclient = @cImport({
+const C = @cImport({
     @cInclude("mysql/mysql.h");
 });
 
@@ -14,17 +14,17 @@ pub const DBInfo = struct {
 };
 
 pub const DB = struct {
-    conn: *mysqlclient.struct_st_mysql,
+    conn: *C.struct_st_mysql,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, info: DBInfo) !DB {
-        const db = mysqlclient.mysql_init(null);
+        const db = C.mysql_init(null);
 
         if (db == null) {
             return error.InitError;
         }
 
-        const conn_result = mysqlclient.mysql_real_connect(
+        const conn_result = C.mysql_real_connect(
             db,
             info.host,
             info.user,
@@ -32,10 +32,10 @@ pub const DB = struct {
             info.database,
             info.port,
             null,
-            mysqlclient.CLIENT_MULTI_STATEMENTS,
+            C.CLIENT_MULTI_STATEMENTS,
         );
         if (conn_result == null) {
-            std.debug.print("Connect to database failed: {s}\n", .{mysqlclient.mysql_error(db)});
+            std.debug.print("Connect to database failed: {s}\n", .{C.mysql_error(db)});
             return error.ConnectError;
         }
 
@@ -46,27 +46,59 @@ pub const DB = struct {
     }
 
     pub fn close(self: DB) void {
-        mysqlclient.mysql_close(self.conn);
+        C.mysql_close(self.conn);
     }
 
     pub fn exec(self: DB, query: []const u8) !void {
-        if (mysqlclient.mysql_real_query(self.conn, query.ptr, query.len) != 0) {
-            std.debug.print("Exec query failed: {s}\n", .{mysqlclient.mysql_error(self.conn)});
+        if (C.mysql_real_query(self.conn, query.ptr, query.len) != 0) {
+            std.debug.print("Exec query failed: {s}\n", .{C.mysql_error(self.conn)});
             return error.ExecError;
         }
 
-        const result = mysqlclient.mysql_store_result(self.conn);
+        const result = C.mysql_store_result(self.conn);
         if (result == null) {
-            std.debug.print("Store result failed: {s}\n", .{mysqlclient.mysql_error(self.conn)});
+            std.debug.print("Store result failed: {s}\n", .{C.mysql_error(self.conn)});
             return error.StoreError;
         }
-        defer mysqlclient.mysql_free_result(result);
+        defer C.mysql_free_result(result);
 
-        while (mysqlclient.mysql_fetch_row(result)) |row| {
+        // TODO ctrl+c should break this loop
+        while (C.mysql_fetch_row(result)) |row| {
             std.debug.print("row: {*}\n", .{row[0]});
+            render_result(result);
         }
 
-        const affected = mysqlclient.mysql_affected_rows(self.conn);
+        const affected = C.mysql_affected_rows(self.conn);
         std.debug.print("{d} row(s) affected\n", .{affected});
     }
 };
+
+fn render_result(result: [*c]C.struct_st_mysql_res) void {
+    while (true) {
+        const row = C.mysql_fetch_row(result);
+        if (row == null) {
+            break;
+        }
+        // const lengths = mysqlclient.mysql_fetch_lengths(result);
+        const numFields = C.mysql_num_fields(result);
+        // var buffer = "";
+
+        var i: u8 = 0;
+        while (i < numFields) : (i += 1) {
+            const field = C.mysql_fetch_field(result);
+            const length = @max(4, field.*.length, field.*.max_length, field.*.name_length);
+            field.*.max_length = length;
+        }
+
+        _ = C.mysql_field_seek(result, 0);
+        while (true) {
+            const field = C.mysql_fetch_field(result);
+            std.debug.print("field: {*}\n", .{field});
+            if (field == null) {
+                break;
+            }
+            const name = field.*.name;
+            std.debug.print("field name: {*}\n", .{name});
+        }
+    }
+}

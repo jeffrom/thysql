@@ -16,7 +16,7 @@ pub fn one(prompt: ?[]const u8) ?[:0]const u8 {
 // }
 
 pub fn setup() !void {
-    // isocline.ic_set_history(null, 5000);
+    isocline.setupHistory();
 
     // isocline.ic_set_default_completer(wordCompleter, null);
     // isocline.ic_enable_auto_tab(true);

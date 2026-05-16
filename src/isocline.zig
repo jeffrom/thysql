@@ -17,3 +17,7 @@ pub fn readline(prompt: ?[]const u8) ?[:0]const u8 {
     const result = C.ic_readline(if (prompt) |p| p.ptr else null);
     return if (result) |p| std.mem.span(p) else null;
 }
+
+pub fn setupHistory() void {
+    C.ic_set_history(null, 5000);
+}
