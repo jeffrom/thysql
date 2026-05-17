@@ -11,10 +11,6 @@ pub fn main() !void {
     var stdoutWriter = std.fs.File.stdout().writer(&stdoutBuffer);
     const stdout = &stdoutWriter.interface;
 
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try thysql.bufferedPrint();
-
     try thysql.runREPL(allocator, stdout);
 
     try stdout.flush();
