@@ -5,7 +5,21 @@ const Allocator = std.mem.Allocator;
 const Mysql = @import("mysql.zig");
 const Readline = @import("readline.zig");
 
-pub fn runREPL(allocator: Allocator) !void {
+fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
+    const line = Readline.one("mysql");
+    if (line == null) {
+        return true;
+    }
+    defer Readline.freeLine(@ptrCast(@constCast(line)));
+
+    try stdout.print("typed: {s}\n", .{line.?});
+    try stdout.flush();
+
+    try db.exec(line.?);
+    return false;
+}
+
+pub fn runREPL(allocator: Allocator, stdout: *std.Io.Writer) !void {
     const db = try Mysql.DB.init(allocator, .{
         .host = "127.0.0.1",
         .user = "root",
@@ -17,11 +31,10 @@ pub fn runREPL(allocator: Allocator) !void {
     try Readline.setup();
 
     while (true) {
-        const line = Readline.one("mysql") orelse break;
-        std.debug.print("typed: {s}\n", .{line});
-        try db.exec(line);
-
-        Readline.freeLine(@ptrCast(@constCast(line)));
+        const done = try readOneLine(db, stdout);
+        if (done) {
+            break;
+        }
     }
 }
 

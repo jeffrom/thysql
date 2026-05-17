@@ -19,5 +19,5 @@ pub fn readline(prompt: ?[]const u8) ?[:0]const u8 {
 }
 
 pub fn setupHistory() void {
-    C.ic_set_history(null, 5000);
+    C.ic_set_history("/Users/jeff/.local/state/thysql/history.txt", 5000);
 }

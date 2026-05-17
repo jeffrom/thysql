@@ -62,11 +62,7 @@ pub const DB = struct {
         }
         defer C.mysql_free_result(result);
 
-        // TODO ctrl+c should break this loop
-        while (C.mysql_fetch_row(result)) |row| {
-            std.debug.print("row: {*}\n", .{row[0]});
-            render_result(result);
-        }
+        render_result(result);
 
         const affected = C.mysql_affected_rows(self.conn);
         std.debug.print("{d} row(s) affected\n", .{affected});
@@ -74,13 +70,14 @@ pub const DB = struct {
 };
 
 fn render_result(result: [*c]C.struct_st_mysql_res) void {
-    while (true) {
-        const row = C.mysql_fetch_row(result);
+    // TODO ctrl+c should break this loop
+    while (C.mysql_fetch_row(result)) |row| {
         if (row == null) {
             break;
         }
         // const lengths = mysqlclient.mysql_fetch_lengths(result);
         const numFields = C.mysql_num_fields(result);
+        std.debug.print("debug row: {any} {d}\n", .{ row, numFields });
         // var buffer = "";
 
         var i: u8 = 0;
@@ -98,7 +95,9 @@ fn render_result(result: [*c]C.struct_st_mysql_res) void {
                 break;
             }
             const name = field.*.name;
-            std.debug.print("field name: {*}\n", .{name});
+            std.debug.print("field name: {s}\n", .{name});
+
+            std.debug.print("field type: {d}\n", .{field.*.type});
         }
     }
 }

@@ -7,11 +7,17 @@ pub fn main() !void {
 
     const allocator = arena.allocator();
 
+    var stdoutBuffer: [1024]u8 = undefined;
+    var stdoutWriter = std.fs.File.stdout().writer(&stdoutBuffer);
+    const stdout = &stdoutWriter.interface;
+
     // Prints to stderr, ignoring potential errors.
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
     try thysql.bufferedPrint();
 
-    try thysql.runREPL(allocator);
+    try thysql.runREPL(allocator, stdout);
+
+    try stdout.flush();
 }
 
 test "simple test" {
