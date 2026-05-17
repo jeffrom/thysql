@@ -11,6 +11,9 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
         return true;
     }
     defer Readline.freeLine(@ptrCast(@constCast(line)));
+    if (line.?.len == 0) {
+        return false;
+    }
 
     try stdout.print("typed: {s}\n", .{line.?});
     try stdout.flush();
