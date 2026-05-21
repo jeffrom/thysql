@@ -49,7 +49,7 @@ pub const DB = struct {
         C.mysql_close(self.conn);
     }
 
-    pub fn exec(self: DB, query: []const u8) !void {
+    pub fn exec(self: DB, query: []const u8) ![*c]C.struct_st_mysql_res {
         if (C.mysql_real_query(self.conn, query.ptr, query.len) != 0) {
             std.debug.print("Exec query failed: {s}\n", .{C.mysql_error(self.conn)});
             return error.ExecError;
@@ -60,16 +60,15 @@ pub const DB = struct {
             std.debug.print("Store result failed: {s}\n", .{C.mysql_error(self.conn)});
             return error.StoreError;
         }
-        defer C.mysql_free_result(result);
-
-        render_result(result);
-
-        const affected = C.mysql_affected_rows(self.conn);
-        std.debug.print("{d} row(s) affected\n", .{affected});
+        return result;
     }
 };
 
-fn render_result(result: [*c]C.struct_st_mysql_res) void {
+pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
+    C.mysql_free_result(result);
+}
+
+pub fn render_result(stdout: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !void {
     // TODO ctrl+c should break this loop
     while (C.mysql_fetch_row(result)) |row| {
         if (row == null) {
@@ -77,7 +76,8 @@ fn render_result(result: [*c]C.struct_st_mysql_res) void {
         }
         // const lengths = mysqlclient.mysql_fetch_lengths(result);
         const numFields = C.mysql_num_fields(result);
-        std.debug.print("debug row: {any} {d}\n", .{ row, numFields });
+        try stdout.print("debug row: {any} {d}\n", .{ row, numFields });
+        try stdout.flush();
         // var buffer = "";
 
         var i: u8 = 0;
@@ -88,9 +88,10 @@ fn render_result(result: [*c]C.struct_st_mysql_res) void {
         }
 
         _ = C.mysql_field_seek(result, 0);
-        while (true) {
+        i = 0;
+        while (true) : (i += 1) {
             const field = C.mysql_fetch_field(result);
-            std.debug.print("field: {*}\n", .{field});
+            std.debug.print("field: {any}\n", .{field});
             if (field == null) {
                 break;
             }
@@ -98,6 +99,25 @@ fn render_result(result: [*c]C.struct_st_mysql_res) void {
             std.debug.print("field name: {s}\n", .{name});
 
             std.debug.print("field type: {d}\n", .{field.*.type});
+
+            std.debug.print("row data: {any}\n", .{row[i].*});
+            const serialized = try serializeType(field.*.type, row[i]);
+            try stdout.print(" {s} ", .{serialized});
         }
     }
+}
+
+fn serializeType(kind: u32, col: [*:0]const u8) ![*:0]const u8 {
+    // if (col == null) {
+    //     return "NULL";
+    // }
+    switch (kind) {
+        8 => {
+            return col;
+        },
+        else => {
+            @panic("unhandled mysql data type");
+        },
+    }
+    return "";
 }

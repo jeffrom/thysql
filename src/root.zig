@@ -20,7 +20,14 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
     try stdout.print("typed: {s}\n", .{line});
     try stdout.flush();
 
-    try db.exec(line);
+    const result = try db.exec(line);
+    defer Mysql.freeResult(result);
+
+    try Mysql.render_result(stdout, result);
+
+    // const affected = C.mysql_affected_rows(self.conn);
+    // std.debug.print("{d} row(s) affected\n", .{affected});
+
     return false;
 }
 
