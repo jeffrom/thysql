@@ -64,11 +64,11 @@ pub const DB = struct {
     }
 };
 
-pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
+pub fn freeResult(result: [*]C.struct_st_mysql_res) void {
     C.mysql_free_result(result);
 }
 
-pub fn render_result(stdout: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !void {
+pub fn render_result(stdout: *std.Io.Writer, result: [*]C.struct_st_mysql_res) !void {
     // TODO ctrl+c should break this loop
     while (C.mysql_fetch_row(result)) |row| {
         if (row == null) {
@@ -87,11 +87,12 @@ pub fn render_result(stdout: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) 
             field.*.max_length = length;
         }
 
+        const lengths = C.mysql_fetch_lengths(result);
+
         _ = C.mysql_field_seek(result, 0);
         i = 0;
         while (true) : (i += 1) {
             const field = C.mysql_fetch_field(result);
-            std.debug.print("field: {any}\n", .{field});
             if (field == null) {
                 break;
             }
@@ -101,16 +102,29 @@ pub fn render_result(stdout: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) 
             std.debug.print("field type: {d}\n", .{field.*.type});
 
             std.debug.print("row data: {any}\n", .{row[i].*});
-            const serialized = try serializeType(field.*.type, row[i]);
-            try stdout.print(" {s} ", .{serialized});
+
+            const dataLength = lengths[i];
+            const data = row[i];
+            try printData(stdout, data, dataLength);
+            // const serialized = try serializeType(field.*.type, row[i]);
+            // try stdout.print(" {s} ", .{serialized});
         }
     }
 }
 
+fn printData(stdout: *std.Io.Writer, data: [*]const u8, len: usize) !void {
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        try stdout.printAsciiChar(data[i], .{});
+    }
+    try stdout.print("\n", .{});
+    try stdout.flush();
+}
+
 fn serializeType(kind: u32, col: [*:0]const u8) ![*:0]const u8 {
-    // if (col == null) {
-    //     return "NULL";
-    // }
+    if (col == null) {
+        return "NULL";
+    }
     switch (kind) {
         8 => {
             return col;
