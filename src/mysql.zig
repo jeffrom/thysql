@@ -81,8 +81,7 @@ pub fn render_result(out: *std.Io.Writer, result: [*]C.struct_st_mysql_res) !voi
         // var buffer = "";
 
         try out.printAsciiChar('+', .{});
-        var i: u8 = 0;
-        while (i < numFields) : (i += 1) {
+        for (0..numFields) |_| {
             const field = C.mysql_fetch_field(result);
             const length = @max(4, field.*.length, field.*.max_length, field.*.name_length);
             field.*.max_length = length;
@@ -94,8 +93,7 @@ pub fn render_result(out: *std.Io.Writer, result: [*]C.struct_st_mysql_res) !voi
         const lengths = C.mysql_fetch_lengths(result);
 
         _ = C.mysql_field_seek(result, 0);
-        i = 0;
-        while (true) : (i += 1) {
+        for (0..numFields) |i| {
             const field = C.mysql_fetch_field(result);
             if (field == null) {
                 break;
@@ -107,7 +105,24 @@ pub fn render_result(out: *std.Io.Writer, result: [*]C.struct_st_mysql_res) !voi
 
             std.debug.print("row data: {any}\n", .{row[i].*});
 
-            // data length and unicode length matter here
+            // TODO unicode for name and data below
+            try out.printAsciiChar('|', .{});
+            try out.printAsciiChar(' ', .{});
+            try out.print("{s}", .{field.*.name});
+            try out.printAsciiChar(' ', .{});
+            try out.printAsciiChar('|', .{});
+            try out.printAsciiChar('\n', .{});
+        }
+
+        _ = C.mysql_field_seek(result, 0);
+        try out.printAsciiChar('+', .{});
+        for (0..numFields) |_| {
+            const field = C.mysql_fetch_field(result);
+            try printRowSeparator(out, field.*.max_length);
+        }
+        try out.print("+\n", .{});
+
+        for (0..numFields) |i| {
             const dataLength = lengths[i];
             const data = row[i];
             try out.printAsciiChar('|', .{});
