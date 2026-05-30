@@ -1,14 +1,14 @@
 const std = @import("std");
 const thysql = @import("thysql");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
     const allocator = arena.allocator();
 
     var stdoutBuffer: [1024]u8 = undefined;
-    var stdoutWriter = std.fs.File.stdout().writer(&stdoutBuffer);
+    var stdoutWriter = std.Io.File.stdout().writer(init.io, &stdoutBuffer);
     const stdout = &stdoutWriter.interface;
 
     try thysql.runREPL(allocator, stdout);

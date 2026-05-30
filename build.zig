@@ -41,8 +41,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    // mod.addImport
-
     const isocline_dep = b.dependency("isocline", .{
         .target = target,
         .optimize = optimize,
@@ -50,11 +48,6 @@ pub fn build(b: *std.Build) void {
 
     // std.debug.print("hi {} \n", .{isocline_dep.builder.modules.count()});
 
-    // mod.addCSourceFiles(.{
-    //     .root = isocline_dep.path(""),
-    //     .files = &.{"src/*.c"},
-    // });
-    // mod.addIncludePath(isocline_dep.path("include"));
     mod.link_libc = true;
     mod.linkLibrary(isocline_dep.artifact("isocline"));
 
