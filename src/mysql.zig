@@ -80,15 +80,16 @@ pub fn render_result(out: *std.Io.Writer, result: [*]C.struct_st_mysql_res) !voi
         try out.flush();
         // var buffer = "";
 
-        try out.printAsciiChar('+', .{});
         for (0..numFields) |_| {
+            try out.printAsciiChar('+', .{});
             const field = C.mysql_fetch_field(result);
-            const length = @max(4, field.*.length, field.*.max_length, field.*.name_length);
+            const length = @max(3, field.*.length, field.*.max_length, field.*.name_length);
             field.*.max_length = length;
 
             try printRowSeparator(out, length);
+            try out.print("+", .{});
         }
-        try out.print("+\n", .{});
+        try out.print("\n", .{});
 
         const lengths = C.mysql_fetch_lengths(result);
 
@@ -99,7 +100,7 @@ pub fn render_result(out: *std.Io.Writer, result: [*]C.struct_st_mysql_res) !voi
                 break;
             }
             const name = field.*.name;
-            std.debug.print("field name: {s}\n", .{name});
+            std.debug.print("field name: {s} max length {d}\n", .{ name, field.*.max_length });
 
             std.debug.print("field type: {d}\n", .{field.*.type});
 
@@ -145,8 +146,14 @@ pub fn render_result(out: *std.Io.Writer, result: [*]C.struct_st_mysql_res) !voi
 }
 
 fn printRowSeparator(out: *std.Io.Writer, len: usize) !void {
-    for (0..len - 1) |_| {
-        try out.print("-", .{});
+    for (0..len) |_| {
+        try out.printAsciiChar('-', .{});
+    }
+}
+
+fn printPadding(out: *std.Io.Writer, len: usize) !void {
+    for (0..len) |_| {
+        try out.printAsciiChar(' ', .{});
     }
 }
 
