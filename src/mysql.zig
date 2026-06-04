@@ -1,9 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const C = @cImport({
-    @cInclude("mysql/mysql.h");
-});
+const C = @import("mysql_c");
 
 pub const DBInfo = struct {
     host: [:0]const u8,
@@ -97,6 +95,9 @@ pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !vo
         const lengths = C.mysql_fetch_lengths(result);
 
         try printMysqlRow(out, result, row, lengths, numFields);
+        _ = C.mysql_field_seek(result, 0);
+        try printColumnSeparators(out, result, numFields);
+        try out.print("+\n", .{});
         try out.flush();
     }
     try out.flush();
@@ -152,6 +153,11 @@ fn printRow(out: *std.Io.Writer, column_names: []const []const u8, row: []const 
         try printDataCell(out, value, name.len);
     }
     try out.print("|\n", .{});
+
+    for (column_names) |name| {
+        try printColumnSeparator(out, name.len);
+    }
+    try out.print("+\n", .{});
 }
 
 fn printColumnSeparator(out: *std.Io.Writer, len: usize) !void {
@@ -218,6 +224,7 @@ test "render SELECT 1" {
         \\| 1 |
         \\+---+
         \\| 1 |
+        \\+---+
         \\
     ;
     try std.testing.expectEqualStrings(expect, writer.written());

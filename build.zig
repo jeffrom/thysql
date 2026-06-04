@@ -16,6 +16,11 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const mysql_include_dir = b.option(
+        []const u8,
+        "mysql-include-dir",
+        "Directory containing mysql/mysql.h",
+    ) orelse "/opt/homebrew/opt/mariadb/include";
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -45,11 +50,31 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const isocline_artifact = isocline_dep.artifact("isocline");
+
+    const mysql_c_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/mysql_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mysql_c_translate.addSystemIncludePath(.{ .cwd_relative = mysql_include_dir });
+    const mysql_c = mysql_c_translate.createModule();
+
+    const isocline_c_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/isocline_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    isocline_c_translate.addIncludePath(isocline_artifact.getEmittedIncludeTree());
+    const isocline_c = isocline_c_translate.createModule();
+
+    mod.addImport("mysql_c", mysql_c);
+    mod.addImport("isocline_c", isocline_c);
 
     // std.debug.print("hi {} \n", .{isocline_dep.builder.modules.count()});
 
     mod.link_libc = true;
-    mod.linkLibrary(isocline_dep.artifact("isocline"));
+    mod.linkLibrary(isocline_artifact);
 
     // const isocline_mod = b.createModule(.{
     //     .name = "isocline",
@@ -139,6 +164,8 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    // mod_tests.root_module.addIncludePath(b.path("/opt/homebrew/include"));
+    mod_tests.root_module.linkSystemLibrary("mysqlclient", .{});
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);

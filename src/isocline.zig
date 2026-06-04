@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const C = @cImport({
-    @cInclude("isocline.h");
-});
+const C = @import("isocline_c");
 
 pub fn freeMemory(ptr: ?*anyopaque) void {
     C.ic_free(ptr);
