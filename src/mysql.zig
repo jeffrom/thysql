@@ -11,6 +11,8 @@ pub const DBInfo = struct {
     port: u32 = 3306,
 };
 
+pub const DBError = error{ExecError};
+
 pub const DB = struct {
     conn: *C.struct_st_mysql,
     allocator: Allocator,
@@ -225,6 +227,50 @@ test "render SELECT 1" {
         \\+---+
         \\| 1 |
         \\+---+
+        \\
+    ;
+    try std.testing.expectEqualStrings(expect, writer.written());
+}
+
+test "render SELECT 1 AS one" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+
+    const columns = [_][]const u8{"one"};
+    try printHeader(&writer.writer, &columns);
+    try printRow(&writer.writer, &columns, &[_][]const u8{"1"});
+
+    const expect =
+        \\+-----+
+        \\| one |
+        \\+-----+
+        \\|   1 |
+        \\+-----+
+        \\
+    ;
+    try std.testing.expectEqualStrings(expect, writer.written());
+}
+
+test "render SELECT 'one' AS '1'" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+
+    const columns = [_][]const u8{"1"};
+    try printHeader(&writer.writer, &columns);
+    try printRow(&writer.writer, &columns, &[_][]const u8{"one"});
+
+    const expect =
+        \\+-----+
+        \\| one |
+        \\+-----+
+        \\|   1 |
+        \\+-----+
         \\
     ;
     try std.testing.expectEqualStrings(expect, writer.written());

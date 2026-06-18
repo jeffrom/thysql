@@ -20,7 +20,17 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
     try stdout.print("typed: {s}\n", .{line});
     try stdout.flush();
 
-    const result = try db.exec(line);
+    const result = db.exec(line) catch |err| {
+        switch (err) {
+            Mysql.DBError => {
+                return false;
+            },
+            else => {
+                return true;
+            },
+        }
+        // print error
+    };
     defer Mysql.freeResult(result);
 
     try Mysql.render_result(stdout, result);
