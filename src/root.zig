@@ -22,7 +22,7 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
 
     const result = db.exec(line) catch |err| {
         switch (err) {
-            Mysql.DBError => {
+            Mysql.DBError.ExecError => {
                 return false;
             },
             else => {

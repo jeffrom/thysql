@@ -11,7 +11,7 @@ pub const DBInfo = struct {
     port: u32 = 3306,
 };
 
-pub const DBError = error{ExecError};
+pub const DBError = error{ ExecError, UseResultError };
 
 pub const DB = struct {
     conn: *C.struct_st_mysql,
@@ -49,16 +49,16 @@ pub const DB = struct {
         C.mysql_close(self.conn);
     }
 
-    pub fn exec(self: DB, query: []const u8) ![*c]C.struct_st_mysql_res {
+    pub fn exec(self: DB, query: []const u8) DBError![*c]C.struct_st_mysql_res {
         if (C.mysql_real_query(self.conn, query.ptr, query.len) != 0) {
             std.debug.print("Exec query failed: {s}\n", .{C.mysql_error(self.conn)});
-            return error.ExecError;
+            return DBError.ExecError;
         }
 
         const result = C.mysql_use_result(self.conn);
         if (result == null) {
             std.debug.print("Use result failed: {s}\n", .{C.mysql_error(self.conn)});
-            return error.UseResultError;
+            return DBError.UseResultError;
         }
         return result;
     }
