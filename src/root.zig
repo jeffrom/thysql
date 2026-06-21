@@ -5,6 +5,26 @@ const Allocator = std.mem.Allocator;
 const Mysql = @import("mysql.zig");
 const Readline = @import("readline.zig");
 
+const QueryInput = struct {
+    sql: []const u8,
+    vertical: bool,
+};
+
+fn parseQueryInput(line: []const u8) QueryInput {
+    var sql = std.mem.trim(u8, line, " \t\r\n");
+    var vertical = false;
+
+    if (sql.len >= 2 and sql[sql.len - 2] == '\\' and sql[sql.len - 1] == 'G') {
+        vertical = true;
+        sql = std.mem.trim(u8, sql[0 .. sql.len - 2], " \t\r\n");
+    }
+
+    return .{
+        .sql = sql,
+        .vertical = vertical,
+    };
+}
+
 fn useDatabaseName(line: []const u8) ?[]const u8 {
     var remaining = std.mem.trim(u8, line, " \t\r\n");
     if (remaining.len == 0) {
@@ -42,7 +62,13 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
         return false;
     }
 
-    if (useDatabaseName(line)) |database| {
+    const query = parseQueryInput(line);
+
+    if (query.sql.len == 0) {
+        return false;
+    }
+
+    if (useDatabaseName(query.sql)) |database| {
         const database_z = try db.allocator.dupeZ(u8, database);
         defer db.allocator.free(database_z);
 
@@ -62,7 +88,7 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
         return false;
     }
 
-    const exec_result = db.exec(line) catch |err| {
+    const exec_result = db.exec(query.sql) catch |err| {
         switch (err) {
             Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
                 try db.renderLastError(stdout);
@@ -77,7 +103,11 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
     switch (exec_result) {
         .result => |result| {
             defer Mysql.freeResult(result);
-            try Mysql.render_result(stdout, result);
+            if (query.vertical) {
+                try Mysql.render_result_vertical(stdout, result);
+            } else {
+                try Mysql.render_result(stdout, result);
+            }
         },
         .ok => |ok| try Mysql.render_ok(stdout, ok),
     }
@@ -113,6 +143,20 @@ pub fn add(a: i32, b: i32) i32 {
 
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
+}
+
+test "parse vertical query terminator" {
+    var query = parseQueryInput("select 1\\G");
+    try std.testing.expectEqualStrings("select 1", query.sql);
+    try std.testing.expect(query.vertical);
+
+    query = parseQueryInput("  select 1  \\G  ");
+    try std.testing.expectEqualStrings("select 1", query.sql);
+    try std.testing.expect(query.vertical);
+
+    query = parseQueryInput("select 1;");
+    try std.testing.expectEqualStrings("select 1;", query.sql);
+    try std.testing.expect(!query.vertical);
 }
 
 test "detect USE database command" {

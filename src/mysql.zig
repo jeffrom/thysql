@@ -215,6 +215,50 @@ pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !vo
     try out.flush();
 }
 
+pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !void {
+    const numFields: usize = C.mysql_num_fields(result);
+
+    if (C.mysql_num_rows(result) == 0) {
+        try out.print("Empty set\n\n", .{});
+        try out.flush();
+        return;
+    }
+
+    _ = C.mysql_field_seek(result, 0);
+    var maxNameLength: usize = 0;
+    for (0..numFields) |_| {
+        const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
+        maxNameLength = @max(maxNameLength, field.*.name_length);
+    }
+
+    C.mysql_data_seek(result, 0);
+    var rowCount: usize = 1;
+    while (C.mysql_fetch_row(result)) |row| {
+        if (row == null) {
+            break;
+        }
+
+        try out.print("*************************** {}. row ***************************\n", .{rowCount});
+
+        const lengths = C.mysql_fetch_lengths(result);
+        _ = C.mysql_field_seek(result, 0);
+        for (0..numFields) |i| {
+            const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
+            const name = field.*.name[0..field.*.name_length];
+            try printPadding(out, maxNameLength - name.len);
+            try out.print("{s}: ", .{name});
+            if (row[i] == null) {
+                try out.print("NULL\n", .{});
+            } else {
+                try out.print("{s}\n", .{row[i][0..lengths[i]]});
+            }
+        }
+
+        rowCount += 1;
+    }
+    try out.flush();
+}
+
 fn printColumnSeparators(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, numFields: usize) !void {
     for (0..numFields) |_| {
         const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
@@ -346,21 +390,60 @@ fn mysqlField(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_field_ty
 
 const MysqlRowStorage1 = extern struct {
     values: [2][*c]u8,
+    bytes: [5]u8,
     lengths: [1]c_ulong,
 };
 
-fn mysqlRowStorage1(value: [*c]u8, length: c_ulong) MysqlRowStorage1 {
-    return .{
-        .values = .{ value, null },
-        .lengths = .{length},
+const MysqlRowStorage2 = extern struct {
+    values: [3][*c]u8,
+    bytes: [8]u8,
+    lengths: [2]c_ulong,
+};
+
+// Test-only row fixtures. libmariadb's stored-result mysql_fetch_lengths()
+// derives lengths from adjacent MYSQL_ROW value pointers, so these fixtures
+// keep contiguous row bytes plus one extra end pointer. They must be initialized
+// in place; returning them by value would leave value pointers aimed at a
+// temporary copy.
+fn initMysqlRowStorage1(storage: *MysqlRowStorage1, value: ?[]const u8) void {
+    storage.* = .{
+        .values = .{ null, null },
+        .bytes = @splat(0),
+        .lengths = .{0},
     };
+    if (value) |bytes| {
+        std.debug.assert(bytes.len + 1 <= storage.bytes.len);
+        @memcpy(storage.bytes[0..bytes.len], bytes);
+        storage.values[0] = &storage.bytes[0];
+        storage.values[1] = &storage.bytes[bytes.len + 1];
+    }
 }
 
-fn mysqlRow(storage: *MysqlRowStorage1, next: [*c]C.struct_st_mysql_rows) C.struct_st_mysql_rows {
+fn initMysqlRowStorage2(storage: *MysqlRowStorage2, value1: []const u8, value2: []const u8) void {
+    storage.* = .{
+        .values = .{ null, null, null },
+        .bytes = @splat(0),
+        .lengths = .{ 0, 0 },
+    };
+    const value2Offset = value1.len + 1;
+    const endOffset = value2Offset + value2.len + 1;
+    std.debug.assert(endOffset <= storage.bytes.len);
+    @memcpy(storage.bytes[0..value1.len], value1);
+    @memcpy(storage.bytes[value2Offset..][0..value2.len], value2);
+    storage.values[0] = &storage.bytes[0];
+    storage.values[1] = &storage.bytes[value2Offset];
+    storage.values[2] = &storage.bytes[endOffset];
+}
+
+fn mysqlRow(storage: anytype, next: [*c]C.struct_st_mysql_rows) C.struct_st_mysql_rows {
     var row: C.struct_st_mysql_rows = std.mem.zeroes(C.struct_st_mysql_rows);
     row.next = next;
     row.data = &storage.values;
-    row.length = storage.lengths[0];
+    var length: c_ulong = 0;
+    for (storage.lengths) |field_length| {
+        length += field_length;
+    }
+    row.length = length;
     return row;
 }
 
@@ -391,6 +474,18 @@ fn expectRendered(result: *C.struct_st_mysql_res, expect: []const u8) !void {
     defer buf = writer.toArrayList();
 
     try render_result(&writer.writer, result);
+
+    try std.testing.expectEqualStrings(expect, writer.written());
+}
+
+fn expectRenderedVertical(result: *C.struct_st_mysql_res, expect: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+
+    try render_result_vertical(&writer.writer, result);
 
     try std.testing.expectEqualStrings(expect, writer.written());
 }
@@ -471,7 +566,8 @@ test "render SELECT 1" {
     var fields = [_]C.struct_st_mysql_field{
         mysqlField("1", 1, C.MYSQL_TYPE_LONG),
     };
-    var row_storage = mysqlRowStorage1(@constCast("1"), 1);
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "1");
     var row = mysqlRow(&row_storage, null);
     var data = mysqlData(&row, 1, fields.len);
     var result = mysqlResult(&fields, &data, &row_storage.lengths);
@@ -491,7 +587,8 @@ test "render SELECT 1 AS one" {
     var fields = [_]C.struct_st_mysql_field{
         mysqlField("one", 1, C.MYSQL_TYPE_LONG),
     };
-    var row_storage = mysqlRowStorage1(@constCast("1"), 1);
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "1");
     var row = mysqlRow(&row_storage, null);
     var data = mysqlData(&row, 1, fields.len);
     var result = mysqlResult(&fields, &data, &row_storage.lengths);
@@ -507,11 +604,32 @@ test "render SELECT 1 AS one" {
     try expectRendered(&result, expect);
 }
 
+test "render SELECT 1 AS one, 'two' AS two vertically" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("one", 1, C.MYSQL_TYPE_LONG),
+        mysqlField("two", 3, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row_storage, "1", "two");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\*************************** 1. row ***************************
+        \\one: 1
+        \\two: two
+        \\
+    ;
+    try expectRenderedVertical(&result, expect);
+}
+
 test "render SELECT 'one' AS '1'" {
     var fields = [_]C.struct_st_mysql_field{
         mysqlField("1", 0, C.MYSQL_TYPE_VAR_STRING),
     };
-    var row_storage = mysqlRowStorage1(@constCast("one"), 3);
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "one");
     var row = mysqlRow(&row_storage, null);
     var data = mysqlData(&row, 1, fields.len);
     var result = mysqlResult(&fields, &data, &row_storage.lengths);
@@ -531,7 +649,8 @@ test "render string cells left aligned" {
     var fields = [_]C.struct_st_mysql_field{
         mysqlField("word", 1, C.MYSQL_TYPE_VAR_STRING),
     };
-    var row_storage = mysqlRowStorage1(@constCast("x"), 1);
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "x");
     var row = mysqlRow(&row_storage, null);
     var data = mysqlData(&row, 1, fields.len);
     var result = mysqlResult(&fields, &data, &row_storage.lengths);
@@ -551,7 +670,8 @@ test "render nullable column leaves room for NULL" {
     var fields = [_]C.struct_st_mysql_field{
         mysqlFieldWithFlags("n", 0, C.MYSQL_TYPE_VAR_STRING, 0),
     };
-    var row_storage = mysqlRowStorage1(null, 0);
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, null);
     var row = mysqlRow(&row_storage, null);
     var data = mysqlData(&row, 1, fields.len);
     var result = mysqlResult(&fields, &data, &row_storage.lengths);
@@ -571,8 +691,10 @@ test "render multiple rows with one bottom border" {
     var fields = [_]C.struct_st_mysql_field{
         mysqlField("1", 1, C.MYSQL_TYPE_LONG),
     };
-    var row2_storage = mysqlRowStorage1(@constCast("2"), 1);
-    var row1_storage = mysqlRowStorage1(@constCast("1"), 1);
+    var row2_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row2_storage, "2");
+    var row1_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row1_storage, "1");
     var row2 = mysqlRow(&row2_storage, null);
     var row1 = mysqlRow(&row1_storage, &row2);
     var data = mysqlData(&row1, 2, fields.len);
