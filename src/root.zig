@@ -50,7 +50,7 @@ fn useDatabaseName(line: []const u8) ?[]const u8 {
     return if (name.len == 0) null else name;
 }
 
-fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
+fn readOneLine(db: Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
     const maybeLine = Readline.one("mysql");
     if (maybeLine == null) {
         return true;
@@ -88,6 +88,7 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
         return false;
     }
 
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
     const exec_result = db.exec(query.sql) catch |err| {
         switch (err) {
             Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
@@ -100,16 +101,17 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
         }
         // print error
     };
+    const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
     switch (exec_result) {
         .result => |result| {
             defer Mysql.freeResult(result);
             if (query.vertical) {
-                try Mysql.render_result_vertical(stdout, result);
+                try Mysql.render_result_vertical_timed(stdout, result, elapsed_ns);
             } else {
-                try Mysql.render_result(stdout, result);
+                try Mysql.render_result_timed(stdout, result, elapsed_ns);
             }
         },
-        .ok => |ok| try Mysql.render_ok(stdout, ok),
+        .ok => |ok| try Mysql.render_ok_timed(stdout, ok, elapsed_ns),
     }
 
     // const affected = C.mysql_affected_rows(self.conn);
@@ -118,7 +120,7 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
     return false;
 }
 
-pub fn runREPL(allocator: Allocator, stdout: *std.Io.Writer) !void {
+pub fn runREPL(allocator: Allocator, io: std.Io, stdout: *std.Io.Writer) !void {
     const db = try Mysql.DB.init(allocator, .{
         .host = "127.0.0.1",
         .user = "root",
@@ -130,7 +132,7 @@ pub fn runREPL(allocator: Allocator, stdout: *std.Io.Writer) !void {
     try Readline.setup();
 
     while (true) {
-        const done = try readOneLine(db, stdout);
+        const done = try readOneLine(db, io, stdout);
         if (done) {
             break;
         }

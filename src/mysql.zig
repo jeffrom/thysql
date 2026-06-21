@@ -111,6 +111,27 @@ pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
 }
 
 pub fn render_ok(out: *std.Io.Writer, ok: OKResult) !void {
+    try render_ok_status(out, ok);
+    try out.print("\n", .{});
+    if (ok.info) |info| {
+        try out.print("{s}\n", .{info});
+    }
+    try out.print("\n", .{});
+    try out.flush();
+}
+
+pub fn render_ok_timed(out: *std.Io.Writer, ok: OKResult, elapsed_ns: i96) !void {
+    try render_ok_status(out, ok);
+    try renderElapsed(out, elapsed_ns);
+    try out.print("\n", .{});
+    if (ok.info) |info| {
+        try out.print("{s}\n", .{info});
+    }
+    try out.print("\n", .{});
+    try out.flush();
+}
+
+fn render_ok_status(out: *std.Io.Writer, ok: OKResult) !void {
     if (ok.affected_rows == C.MYSQL_COUNT_ERROR) {
         try out.print("Query OK", .{});
     } else {
@@ -126,13 +147,21 @@ pub fn render_ok(out: *std.Io.Writer, ok: OKResult) !void {
             if (ok.warnings == 1) "" else "s",
         });
     }
+}
 
-    try out.print("\n", .{});
-    if (ok.info) |info| {
-        try out.print("{s}\n", .{info});
+fn renderElapsed(out: *std.Io.Writer, elapsed_ns: i96) !void {
+    const rounded_ms = @divTrunc(elapsed_ns + @as(i96, std.time.ns_per_ms / 2), std.time.ns_per_ms);
+    const seconds = @divTrunc(rounded_ms, 1000);
+    const millis = @rem(rounded_ms, 1000);
+
+    try out.print(" ({}.", .{seconds});
+    if (millis < 100) {
+        try out.print("0", .{});
     }
-    try out.print("\n", .{});
-    try out.flush();
+    if (millis < 10) {
+        try out.print("0", .{});
+    }
+    try out.print("{} sec)", .{millis});
 }
 
 pub fn render_error(out: *std.Io.Writer, errno: u32, sqlstate: ?[]const u8, message: []const u8) !void {
@@ -215,6 +244,19 @@ pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !vo
     try out.flush();
 }
 
+pub fn render_result_timed(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96) !void {
+    if (C.mysql_num_rows(result) == 0) {
+        try out.print("Empty set", .{});
+        try renderElapsed(out, elapsed_ns);
+        try out.print("\n\n", .{});
+        try out.flush();
+        return;
+    }
+
+    try render_result(out, result);
+    try render_result_footer(out, result, elapsed_ns);
+}
+
 pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !void {
     const numFields: usize = C.mysql_num_fields(result);
 
@@ -256,6 +298,27 @@ pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql
 
         rowCount += 1;
     }
+    try out.flush();
+}
+
+pub fn render_result_vertical_timed(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96) !void {
+    if (C.mysql_num_rows(result) == 0) {
+        try out.print("Empty set", .{});
+        try renderElapsed(out, elapsed_ns);
+        try out.print("\n\n", .{});
+        try out.flush();
+        return;
+    }
+
+    try render_result_vertical(out, result);
+    try render_result_footer(out, result, elapsed_ns);
+}
+
+fn render_result_footer(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96) !void {
+    const rows = C.mysql_num_rows(result);
+    try out.print("{} {s} in set", .{ rows, if (rows == 1) "row" else "rows" });
+    try renderElapsed(out, elapsed_ns);
+    try out.print("\n\n", .{});
     try out.flush();
 }
 
@@ -490,6 +553,30 @@ fn expectRenderedVertical(result: *C.struct_st_mysql_res, expect: []const u8) !v
     try std.testing.expectEqualStrings(expect, writer.written());
 }
 
+fn expectRenderedTimed(result: *C.struct_st_mysql_res, elapsed_ns: i96, expect: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+
+    try render_result_timed(&writer.writer, result, elapsed_ns);
+
+    try std.testing.expectEqualStrings(expect, writer.written());
+}
+
+fn expectRenderedVerticalTimed(result: *C.struct_st_mysql_res, elapsed_ns: i96, expect: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+
+    try render_result_vertical_timed(&writer.writer, result, elapsed_ns);
+
+    try std.testing.expectEqualStrings(expect, writer.written());
+}
+
 fn expectRenderedOk(ok: OKResult, expect: []const u8) !void {
     const gpa = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
@@ -498,6 +585,18 @@ fn expectRenderedOk(ok: OKResult, expect: []const u8) !void {
     defer buf = writer.toArrayList();
 
     try render_ok(&writer.writer, ok);
+
+    try std.testing.expectEqualStrings(expect, writer.written());
+}
+
+fn expectRenderedOkTimed(ok: OKResult, elapsed_ns: i96, expect: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+
+    try render_ok_timed(&writer.writer, ok, elapsed_ns);
 
     try std.testing.expectEqualStrings(expect, writer.written());
 }
@@ -533,6 +632,18 @@ test "render query OK with affected rows" {
     );
 }
 
+test "render timed query OK with affected rows" {
+    try expectRenderedOkTimed(.{
+        .affected_rows = 2,
+        .warnings = 0,
+        .info = null,
+    }, 2 * std.time.ns_per_ms,
+        \\Query OK, 2 rows affected (0.002 sec)
+        \\
+        \\
+    );
+}
+
 test "render query OK singular affected row with warnings and info" {
     try expectRenderedOk(.{
         .affected_rows = 1,
@@ -562,6 +673,22 @@ test "render empty result set" {
     try expectRendered(&result, expect);
 }
 
+test "render timed empty result set" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("1", 0, C.MYSQL_TYPE_LONG),
+    };
+    var data = mysqlData(null, 0, fields.len);
+    var lengths = [_]c_ulong{0};
+    var result = mysqlResult(&fields, &data, &lengths);
+
+    const expect =
+        \\Empty set (0.002 sec)
+        \\
+        \\
+    ;
+    try expectRenderedTimed(&result, 2 * std.time.ns_per_ms, expect);
+}
+
 test "render SELECT 1" {
     var fields = [_]C.struct_st_mysql_field{
         mysqlField("1", 1, C.MYSQL_TYPE_LONG),
@@ -581,6 +708,29 @@ test "render SELECT 1" {
         \\
     ;
     try expectRendered(&result, expect);
+}
+
+test "render SELECT 1 with timed footer" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("1", 1, C.MYSQL_TYPE_LONG),
+    };
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "1");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+---+
+        \\| 1 |
+        \\+---+
+        \\| 1 |
+        \\+---+
+        \\1 row in set (0.002 sec)
+        \\
+        \\
+    ;
+    try expectRenderedTimed(&result, 2 * std.time.ns_per_ms, expect);
 }
 
 test "render SELECT 1 AS one" {
@@ -622,6 +772,28 @@ test "render SELECT 1 AS one, 'two' AS two vertically" {
         \\
     ;
     try expectRenderedVertical(&result, expect);
+}
+
+test "render SELECT 1 AS one, 'two' AS two vertically with timed footer" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("one", 1, C.MYSQL_TYPE_LONG),
+        mysqlField("two", 3, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row_storage, "1", "two");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\*************************** 1. row ***************************
+        \\one: 1
+        \\two: two
+        \\1 row in set (0.002 sec)
+        \\
+        \\
+    ;
+    try expectRenderedVerticalTimed(&result, 2 * std.time.ns_per_ms, expect);
 }
 
 test "render SELECT 'one' AS '1'" {

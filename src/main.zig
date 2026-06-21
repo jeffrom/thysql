@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
     var stdoutWriter = std.Io.File.stdout().writer(io, &stdoutBuffer);
     const stdout = &stdoutWriter.interface;
 
-    try thysql.runREPL(gpa, stdout);
+    try thysql.runREPL(gpa, io, stdout);
 
     try stdout.flush();
 }
