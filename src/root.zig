@@ -89,7 +89,7 @@ fn readOneLine(db: Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
     }
 
     const start = std.Io.Clock.Timestamp.now(io, .awake);
-    const exec_result = db.exec(query.sql) catch |err| {
+    var exec_result = db.exec(query.sql) catch |err| {
         switch (err) {
             Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
                 try db.renderLastError(stdout);
@@ -101,17 +101,32 @@ fn readOneLine(db: Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
         }
         // print error
     };
-    const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
-    switch (exec_result) {
-        .result => |result| {
-            defer Mysql.freeResult(result);
-            if (query.vertical) {
-                try Mysql.render_result_vertical_timed(stdout, result, elapsed_ns);
-            } else {
-                try Mysql.render_result_timed(stdout, result, elapsed_ns);
+
+    while (true) {
+        const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+        switch (exec_result) {
+            .result => |result| {
+                defer Mysql.freeResult(result);
+                if (query.vertical) {
+                    try Mysql.render_result_vertical_timed(stdout, result, elapsed_ns);
+                } else {
+                    try Mysql.render_result_timed(stdout, result, elapsed_ns);
+                }
+            },
+            .ok => |ok| try Mysql.render_ok_timed(stdout, ok, elapsed_ns),
+        }
+
+        exec_result = (db.nextResult() catch |err| {
+            switch (err) {
+                Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
+                    try db.renderLastError(stdout);
+                    return false;
+                },
+                // else => {
+                //     return true;
+                // },
             }
-        },
-        .ok => |ok| try Mysql.render_ok_timed(stdout, ok, elapsed_ns),
+        }) orelse break;
     }
 
     // const affected = C.mysql_affected_rows(self.conn);

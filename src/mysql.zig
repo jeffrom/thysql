@@ -71,6 +71,22 @@ pub const DB = struct {
             return DBError.ExecError;
         }
 
+        return self.currentExecResult();
+    }
+
+    pub fn nextResult(self: DB) DBError!?ExecResult {
+        const status = C.mysql_next_result(self.conn);
+        if (status < 0) {
+            return null;
+        }
+        if (status > 0) {
+            return DBError.ExecError;
+        }
+
+        return try self.currentExecResult();
+    }
+
+    fn currentExecResult(self: DB) DBError!ExecResult {
         const result = self.mysqlStoreResultForLazy() catch return DBError.StoreResultError;
         if (result) |res| {
             return .{ .result = res };
