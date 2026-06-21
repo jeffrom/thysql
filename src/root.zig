@@ -51,7 +51,7 @@ fn useDatabaseName(line: []const u8) ?[]const u8 {
     return if (name.len == 0) null else name;
 }
 
-fn readOneLine(db: Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
+fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
     const maybeLine = Readline.one("mysql");
     if (maybeLine == null) {
         return true;
@@ -79,7 +79,7 @@ fn readOneLine(db: Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
                     try db.renderLastError(stdout);
                     return false;
                 },
-                else => return true,
+                else => return err,
             }
         };
 
@@ -96,11 +96,8 @@ fn readOneLine(db: Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
                 try db.renderLastError(stdout);
                 return false;
             },
-            // else => {
-            //     return true;
-            // },
+            else => return err,
         }
-        // print error
     };
 
     while (true) {
@@ -124,9 +121,7 @@ fn readOneLine(db: Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
                     try db.renderLastError(stdout);
                     return false;
                 },
-                // else => {
-                //     return true;
-                // },
+                else => return err,
             }
         }) orelse break;
     }
@@ -138,7 +133,7 @@ fn readOneLine(db: Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
 }
 
 pub fn runREPL(allocator: Allocator, io: std.Io, stdout: *std.Io.Writer) !void {
-    const db = try Mysql.DB.init(allocator, .{
+    var db = try Mysql.DB.init(allocator, .{
         .host = "127.0.0.1",
         .user = "root",
         .password = "123456",
@@ -149,7 +144,7 @@ pub fn runREPL(allocator: Allocator, io: std.Io, stdout: *std.Io.Writer) !void {
     try Readline.setup();
 
     while (true) {
-        const done = try readOneLine(db, io, stdout);
+        const done = try readOneLine(&db, io, stdout);
         if (done) {
             break;
         }

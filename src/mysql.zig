@@ -5,6 +5,7 @@ const C = @import("mysql_c");
 const Unicode = @import("unicode.zig");
 
 const maxTableColumnDisplayWidth: usize = 1024;
+const crServerGoneError: u32 = 2006;
 
 pub const DBInfo = struct {
     host: [:0]const u8,
@@ -14,7 +15,7 @@ pub const DBInfo = struct {
     port: u32 = 3306,
 };
 
-pub const DBError = error{ ExecError, StoreResultError };
+pub const DBError = error{ ExecError, StoreResultError, OutOfMemory };
 
 pub const OKResult = struct {
     affected_rows: u64,
@@ -30,54 +31,75 @@ pub const ExecResult = union(enum) {
 pub const DB = struct {
     conn: *C.struct_st_mysql,
     allocator: Allocator,
+    host: [:0]u8,
+    user: [:0]u8,
+    password: [:0]u8,
+    database: [:0]u8,
+    port: u32,
 
     pub fn init(allocator: Allocator, info: DBInfo) !DB {
-        const db = C.mysql_init(null);
+        const host = try allocator.dupeZ(u8, info.host);
+        errdefer allocator.free(host);
+        const user = try allocator.dupeZ(u8, info.user);
+        errdefer allocator.free(user);
+        const password = try allocator.dupeZ(u8, info.password);
+        errdefer allocator.free(password);
+        const database = try allocator.dupeZ(u8, info.database);
+        errdefer allocator.free(database);
 
-        if (db == null) {
-            return error.InitError;
-        }
-
-        const conn_result = C.mysql_real_connect(
-            db,
-            info.host,
-            info.user,
-            info.password,
-            info.database,
-            info.port,
-            null,
-            C.CLIENT_MULTI_STATEMENTS,
-        );
-        if (conn_result == null) {
-            std.debug.print("Connect to database failed: {s}\n", .{C.mysql_error(db)});
-            return error.ConnectError;
-        }
+        const db = try connect(info.host, info.user, info.password, info.database, info.port);
 
         return .{
             .conn = db,
             .allocator = allocator,
+            .host = host,
+            .user = user,
+            .password = password,
+            .database = database,
+            .port = info.port,
         };
     }
 
-    pub fn close(self: DB) void {
+    pub fn close(self: *DB) void {
         C.mysql_close(self.conn);
+        self.allocator.free(self.host);
+        self.allocator.free(self.user);
+        self.allocator.free(self.password);
+        self.allocator.free(self.database);
     }
 
-    pub fn selectDatabase(self: DB, database: [:0]const u8) DBError!void {
+    pub fn selectDatabase(self: *DB, database: [:0]const u8) DBError!void {
         if (C.mysql_select_db(self.conn, database.ptr) != 0) {
-            return DBError.ExecError;
+            if (C.mysql_errno(self.conn) != crServerGoneError) {
+                return error.ExecError;
+            }
+            try self.reconnect();
+            if (C.mysql_select_db(self.conn, database.ptr) != 0) {
+                return error.ExecError;
+            }
+        }
+
+        const owned_database = try self.allocator.dupeZ(u8, database);
+        self.allocator.free(self.database);
+        self.database = owned_database;
+    }
+
+    pub fn exec(self: *DB, query: []const u8) DBError!ExecResult {
+        var retry: usize = 0;
+        while (true) : (retry += 1) {
+            if (C.mysql_real_query(self.conn, query.ptr, query.len) == 0) {
+                return self.currentExecResult();
+            }
+
+            const errno = C.mysql_errno(self.conn);
+            if (!shouldReconnectAfterQueryError(errno, retry)) {
+                return error.ExecError;
+            }
+            try self.reconnect();
         }
     }
 
-    pub fn exec(self: DB, query: []const u8) DBError!ExecResult {
-        if (C.mysql_real_query(self.conn, query.ptr, query.len) != 0) {
-            return DBError.ExecError;
-        }
-
-        return self.currentExecResult();
-    }
-
-    pub fn nextResult(self: DB) DBError!?ExecResult {
+    pub fn nextResult(self: *DB) DBError!?ExecResult {
         const status = C.mysql_next_result(self.conn);
         if (status < 0) {
             return null;
@@ -89,7 +111,7 @@ pub const DB = struct {
         return try self.currentExecResult();
     }
 
-    fn currentExecResult(self: DB) DBError!ExecResult {
+    fn currentExecResult(self: *DB) DBError!ExecResult {
         const result = self.mysqlStoreResultForLazy() catch return DBError.StoreResultError;
         if (result) |res| {
             return .{ .result = res };
@@ -103,7 +125,7 @@ pub const DB = struct {
         } };
     }
 
-    fn mysqlStoreResultForLazy(self: DB) DBError!?[*c]C.struct_st_mysql_res {
+    fn mysqlStoreResultForLazy(self: *DB) DBError!?[*c]C.struct_st_mysql_res {
         if (C.mysql_store_result(self.conn)) |result| {
             return result;
         }
@@ -116,7 +138,7 @@ pub const DB = struct {
         return null;
     }
 
-    pub fn renderLastError(self: DB, out: *std.Io.Writer) !void {
+    pub fn renderLastError(self: *DB, out: *std.Io.Writer) !void {
         const errno = C.mysql_errno(self.conn);
         const sqlstate = C.mysql_sqlstate(self.conn);
         const message = C.mysql_error(self.conn);
@@ -124,10 +146,48 @@ pub const DB = struct {
         try render_error(out, errno, if (sqlstate == null) null else std.mem.sliceTo(sqlstate, 0), std.mem.sliceTo(message, 0));
     }
 
-    pub fn warningCount(self: DB) u32 {
+    pub fn warningCount(self: *DB) u32 {
         return C.mysql_warning_count(self.conn);
     }
+
+    fn reconnect(self: *DB) DBError!void {
+        const db = connect(self.host, self.user, self.password, self.database, self.port) catch {
+            return error.ExecError;
+        };
+        C.mysql_close(self.conn);
+        self.conn = db;
+    }
 };
+
+fn connect(host: [:0]const u8, user: [:0]const u8, password: [:0]const u8, database: [:0]const u8, port: u32) !*C.struct_st_mysql {
+    const db = C.mysql_init(null);
+
+    if (db == null) {
+        return error.InitError;
+    }
+
+    const conn_result = C.mysql_real_connect(
+        db,
+        host,
+        user,
+        password,
+        database,
+        port,
+        null,
+        C.CLIENT_MULTI_STATEMENTS,
+    );
+    if (conn_result == null) {
+        std.debug.print("Connect to database failed: {s}\n", .{C.mysql_error(db)});
+        C.mysql_close(db);
+        return error.ConnectError;
+    }
+
+    return db;
+}
+
+fn shouldReconnectAfterQueryError(errno: u32, retry: usize) bool {
+    return errno == crServerGoneError and retry <= 1;
+}
 
 pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
     C.mysql_free_result(result);
@@ -782,6 +842,14 @@ test "render SQL error" {
         \\ERROR 1064 (42000): You have an error in your SQL syntax
         \\
     );
+}
+
+test "reconnect retry decision follows server gone errors" {
+    try std.testing.expect(shouldReconnectAfterQueryError(crServerGoneError, 0));
+    try std.testing.expect(shouldReconnectAfterQueryError(crServerGoneError, 1));
+    try std.testing.expect(!shouldReconnectAfterQueryError(crServerGoneError, 2));
+    try std.testing.expect(!shouldReconnectAfterQueryError(2013, 0));
+    try std.testing.expect(!shouldReconnectAfterQueryError(1064, 0));
 }
 
 test "render query OK with affected rows" {
