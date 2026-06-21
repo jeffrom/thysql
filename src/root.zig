@@ -20,20 +20,25 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
     try stdout.print("typed: {s}\n", .{line});
     try stdout.flush();
 
-    const result = db.exec(line) catch |err| {
+    const exec_result = db.exec(line) catch |err| {
         switch (err) {
-            Mysql.DBError.ExecError => {
+            Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
+                try db.renderLastError(stdout);
                 return false;
             },
-            else => {
-                return true;
-            },
+            // else => {
+            //     return true;
+            // },
         }
         // print error
     };
-    defer Mysql.freeResult(result);
-
-    try Mysql.render_result(stdout, result);
+    switch (exec_result) {
+        .result => |result| {
+            defer Mysql.freeResult(result);
+            try Mysql.render_result(stdout, result);
+        },
+        .ok => |ok| try Mysql.render_ok(stdout, ok),
+    }
 
     // const affected = C.mysql_affected_rows(self.conn);
     // std.debug.print("{d} row(s) affected\n", .{affected});

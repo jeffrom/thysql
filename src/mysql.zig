@@ -13,6 +13,17 @@ pub const DBInfo = struct {
 
 pub const DBError = error{ ExecError, StoreResultError };
 
+pub const OKResult = struct {
+    affected_rows: u64,
+    warnings: u32,
+    info: ?[]const u8,
+};
+
+pub const ExecResult = union(enum) {
+    result: [*c]C.struct_st_mysql_res,
+    ok: OKResult,
+};
+
 pub const DB = struct {
     conn: *C.struct_st_mysql,
     allocator: Allocator,
@@ -49,23 +60,83 @@ pub const DB = struct {
         C.mysql_close(self.conn);
     }
 
-    pub fn exec(self: DB, query: []const u8) DBError![*c]C.struct_st_mysql_res {
+    pub fn exec(self: DB, query: []const u8) DBError!ExecResult {
         if (C.mysql_real_query(self.conn, query.ptr, query.len) != 0) {
-            std.debug.print("Exec query failed: {s}\n", .{C.mysql_error(self.conn)});
             return DBError.ExecError;
         }
 
-        const result = C.mysql_store_result(self.conn);
-        if (result == null) {
-            std.debug.print("Store result failed: {s}\n", .{C.mysql_error(self.conn)});
+        const result = self.mysqlStoreResultForLazy() catch return DBError.StoreResultError;
+        if (result) |res| {
+            return .{ .result = res };
+        }
+
+        const info = C.mysql_info(self.conn);
+        return .{ .ok = .{
+            .affected_rows = C.mysql_affected_rows(self.conn),
+            .warnings = C.mysql_warning_count(self.conn),
+            .info = if (info == null) null else std.mem.sliceTo(info, 0),
+        } };
+    }
+
+    fn mysqlStoreResultForLazy(self: DB) DBError!?[*c]C.struct_st_mysql_res {
+        if (C.mysql_store_result(self.conn)) |result| {
+            return result;
+        }
+
+        const message = C.mysql_error(self.conn);
+        if (message != null and message[0] != 0) {
             return DBError.StoreResultError;
         }
-        return result;
+
+        return null;
+    }
+
+    pub fn renderLastError(self: DB, out: *std.Io.Writer) !void {
+        const errno = C.mysql_errno(self.conn);
+        const sqlstate = C.mysql_sqlstate(self.conn);
+        const message = C.mysql_error(self.conn);
+
+        try render_error(out, errno, if (sqlstate == null) null else std.mem.sliceTo(sqlstate, 0), std.mem.sliceTo(message, 0));
     }
 };
 
 pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
     C.mysql_free_result(result);
+}
+
+pub fn render_ok(out: *std.Io.Writer, ok: OKResult) !void {
+    if (ok.affected_rows == C.MYSQL_COUNT_ERROR) {
+        try out.print("Query OK", .{});
+    } else {
+        try out.print("Query OK, {} {s} affected", .{
+            ok.affected_rows,
+            if (ok.affected_rows == 1) "row" else "rows",
+        });
+    }
+
+    if (ok.warnings != 0) {
+        try out.print(", {} warning{s}", .{
+            ok.warnings,
+            if (ok.warnings == 1) "" else "s",
+        });
+    }
+
+    try out.print("\n", .{});
+    if (ok.info) |info| {
+        try out.print("{s}\n", .{info});
+    }
+    try out.print("\n", .{});
+}
+
+pub fn render_error(out: *std.Io.Writer, errno: u32, sqlstate: ?[]const u8, message: []const u8) !void {
+    if (errno == 0) {
+        try out.print("ERROR: {s}\n", .{message});
+    } else if (sqlstate) |state| {
+        try out.print("ERROR {} ({s}): {s}\n", .{ errno, state, message });
+    } else {
+        try out.print("ERROR {}: {s}\n", .{ errno, message });
+    }
+    try out.flush();
 }
 
 pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !void {
@@ -309,6 +380,62 @@ fn expectRendered(result: *C.struct_st_mysql_res, expect: []const u8) !void {
     try render_result(&writer.writer, result);
 
     try std.testing.expectEqualStrings(expect, writer.written());
+}
+
+fn expectRenderedOk(ok: OKResult, expect: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+
+    try render_ok(&writer.writer, ok);
+
+    try std.testing.expectEqualStrings(expect, writer.written());
+}
+
+fn expectRenderedError(errno: u32, sqlstate: ?[]const u8, message: []const u8, expect: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+
+    try render_error(&writer.writer, errno, sqlstate, message);
+
+    try std.testing.expectEqualStrings(expect, writer.written());
+}
+
+test "render SQL error" {
+    try expectRenderedError(1064, "42000", "You have an error in your SQL syntax",
+        \\ERROR 1064 (42000): You have an error in your SQL syntax
+        \\
+    );
+}
+
+test "render query OK with affected rows" {
+    try expectRenderedOk(.{
+        .affected_rows = 2,
+        .warnings = 0,
+        .info = null,
+    },
+        \\Query OK, 2 rows affected
+        \\
+        \\
+    );
+}
+
+test "render query OK singular affected row with warnings and info" {
+    try expectRenderedOk(.{
+        .affected_rows = 1,
+        .warnings = 1,
+        .info = "Rows matched: 1  Changed: 1  Warnings: 1",
+    },
+        \\Query OK, 1 row affected, 1 warning
+        \\Rows matched: 1  Changed: 1  Warnings: 1
+        \\
+        \\
+    );
 }
 
 test "render SELECT 1" {
