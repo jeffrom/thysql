@@ -80,7 +80,11 @@ pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !vo
         const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
         const name = field.*.name[0..field.*.name_length];
 
-        try printHeaderCell(out, name, name.len);
+        const maxLength = @max(name.len, field.*.max_length);
+        field.*.max_length = maxLength;
+        // std.debug.print("bonk: {}\n", .{maxLength});
+
+        try printHeaderCell(out, name, maxLength);
     }
     try out.print("|\n", .{});
 
@@ -124,40 +128,40 @@ fn printMysqlRow(
     _ = C.mysql_field_seek(result, 0);
     for (0..numFields) |i| {
         const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
-        const name = field.*.name[0..field.*.name_length];
-        const data_len = if (row[i] == null) "NULL".len else lengths[i];
-        const value = if (row[i] == null) "NULL" else row[i][0..data_len];
+        // const name = field.*.name[0..field.*.name_length];
+        const dataLength = if (row[i] == null) "NULL".len else lengths[i];
+        const value = if (row[i] == null) "NULL" else row[i][0..dataLength];
 
-        try printDataCell(out, value, name.len);
+        try printDataCell(out, value, field.*.max_length);
     }
     try out.print("|\n", .{});
 }
 
-fn printHeader(out: *std.Io.Writer, column_names: []const []const u8) !void {
-    for (column_names) |name| {
-        try printColumnSeparator(out, name.len);
+fn printHeader(out: *std.Io.Writer, column_names: []const []const u8, maxLength: usize) !void {
+    for (column_names) |_| {
+        try printColumnSeparator(out, maxLength);
     }
     try out.print("+\n", .{});
 
     for (column_names) |name| {
-        try printHeaderCell(out, name, name.len);
+        try printHeaderCell(out, name, maxLength);
     }
     try out.print("|\n", .{});
 
-    for (column_names) |name| {
-        try printColumnSeparator(out, name.len);
+    for (column_names) |_| {
+        try printColumnSeparator(out, maxLength);
     }
     try out.print("+\n", .{});
 }
 
-fn printRow(out: *std.Io.Writer, column_names: []const []const u8, row: []const []const u8) !void {
-    for (column_names, row) |name, value| {
-        try printDataCell(out, value, name.len);
+fn printRow(out: *std.Io.Writer, column_names: []const []const u8, row: []const []const u8, maxLength: usize) !void {
+    for (column_names, row) |_, value| {
+        try printDataCell(out, value, maxLength);
     }
     try out.print("|\n", .{});
 
-    for (column_names) |name| {
-        try printColumnSeparator(out, name.len);
+    for (column_names) |_| {
+        try printColumnSeparator(out, maxLength);
     }
     try out.print("+\n", .{});
 }
@@ -178,7 +182,7 @@ fn printHeaderCell(out: *std.Io.Writer, value: []const u8, width: usize) !void {
 fn printDataCell(out: *std.Io.Writer, value: []const u8, width: usize) !void {
     try out.printAsciiChar('|', .{});
     try out.printAsciiChar(' ', .{});
-    try printPadding(out, width - value.len);
+    try printPadding(out, if (width >= value.len) width - value.len else 0);
     try out.print("{s}", .{value});
     try out.printAsciiChar(' ', .{});
 }
@@ -218,8 +222,8 @@ test "render SELECT 1" {
     defer buf = writer.toArrayList();
 
     const columns = [_][]const u8{"1"};
-    try printHeader(&writer.writer, &columns);
-    try printRow(&writer.writer, &columns, &[_][]const u8{"1"});
+    try printHeader(&writer.writer, &columns, 1);
+    try printRow(&writer.writer, &columns, &[_][]const u8{"1"}, 1);
 
     const expect =
         \\+---+
@@ -240,8 +244,8 @@ test "render SELECT 1 AS one" {
     defer buf = writer.toArrayList();
 
     const columns = [_][]const u8{"one"};
-    try printHeader(&writer.writer, &columns);
-    try printRow(&writer.writer, &columns, &[_][]const u8{"1"});
+    try printHeader(&writer.writer, &columns, 3);
+    try printRow(&writer.writer, &columns, &[_][]const u8{"1"}, 3);
 
     const expect =
         \\+-----+
@@ -262,14 +266,14 @@ test "render SELECT 'one' AS '1'" {
     defer buf = writer.toArrayList();
 
     const columns = [_][]const u8{"1"};
-    try printHeader(&writer.writer, &columns);
-    try printRow(&writer.writer, &columns, &[_][]const u8{"one"});
+    try printHeader(&writer.writer, &columns, 3);
+    try printRow(&writer.writer, &columns, &[_][]const u8{"one"}, 3);
 
     const expect =
         \\+-----+
-        \\| one |
+        \\| 1   |
         \\+-----+
-        \\|   1 |
+        \\| one |
         \\+-----+
         \\
     ;
