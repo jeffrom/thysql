@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
 const C = @import("mysql_c");
 const Unicode = @import("unicode.zig");
 
+const maxTableColumnDisplayWidth: usize = 1024;
+
 pub const DBInfo = struct {
     host: [:0]const u8,
     user: [:0]const u8,
@@ -203,7 +205,7 @@ pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !vo
     _ = C.mysql_field_seek(result, 0);
     for (0..numFields) |_| {
         const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
-        field.*.max_length = Unicode.displayWidth(field.*.name[0..field.*.name_length]);
+        field.*.max_length = cappedTableWidth(Unicode.escapedDisplayWidth(field.*.name[0..field.*.name_length]));
         if (field.*.max_length < 4 and (field.*.flags & C.NOT_NULL_FLAG) == 0) {
             field.*.max_length = 4;
         }
@@ -219,8 +221,11 @@ pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !vo
             _ = C.mysql_field_seek(result, 0);
             for (0..numFields) |i| {
                 const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
-                const value = if (row[i] == null) "NULL" else row[i][0..lengths[i]];
-                field.*.max_length = @max(field.*.max_length, Unicode.displayWidth(value));
+                const value_width = if (row[i] == null)
+                    Unicode.escapedDisplayWidth("NULL")
+                else
+                    renderedValueDisplayWidth(field, row[i][0..lengths[i]]);
+                field.*.max_length = @max(field.*.max_length, cappedTableWidth(value_width));
             }
         }
         C.mysql_data_seek(result, 0);
@@ -291,7 +296,7 @@ pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql
     var maxNameLength: usize = 0;
     for (0..numFields) |_| {
         const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
-        maxNameLength = @max(maxNameLength, Unicode.displayWidth(field.*.name[0..field.*.name_length]));
+        maxNameLength = @max(maxNameLength, Unicode.escapedDisplayWidth(field.*.name[0..field.*.name_length]));
     }
 
     C.mysql_data_seek(result, 0);
@@ -308,12 +313,17 @@ pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql
         for (0..numFields) |i| {
             const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
             const name = field.*.name[0..field.*.name_length];
-            try printPadding(out, maxNameLength - Unicode.displayWidth(name));
-            try out.print("{s}: ", .{name});
+            try printPadding(out, maxNameLength - Unicode.escapedDisplayWidth(name));
+            try Unicode.printEscapedValue(out, name, std.math.maxInt(usize));
+            try out.print(": ", .{});
             if (row[i] == null) {
                 try out.print("NULL\n", .{});
+            } else if (isBinaryField(field)) {
+                try Unicode.printHexValue(out, row[i][0..lengths[i]], std.math.maxInt(usize));
+                try out.print("\n", .{});
             } else {
-                try out.print("{s}\n", .{row[i][0..lengths[i]]});
+                try Unicode.printEscapedValue(out, row[i][0..lengths[i]], std.math.maxInt(usize));
+                try out.print("\n", .{});
             }
         }
 
@@ -380,7 +390,7 @@ fn printMysqlRow(
         const dataLength = if (row[i] == null) "NULL".len else lengths[i];
         const value = if (row[i] == null) "NULL" else row[i][0..dataLength];
 
-        try printDataCell(out, value, field.*.max_length, isNumericType(field.*.type));
+        try printDataCell(out, field, value, field.*.max_length, isNumericType(field.*.type), row[i] == null);
     }
     try out.print("|\n", .{});
 }
@@ -404,7 +414,12 @@ fn printHeader(out: *std.Io.Writer, column_names: []const []const u8, maxLength:
 
 fn printRow(out: *std.Io.Writer, column_names: []const []const u8, row: []const []const u8, maxLength: usize) !void {
     for (column_names, row) |_, value| {
-        try printDataCell(out, value, maxLength, true);
+        const value_width = @min(Unicode.escapedDisplayWidth(value), maxLength);
+        try out.printAsciiChar('|', .{});
+        try out.printAsciiChar(' ', .{});
+        try printPadding(out, if (maxLength >= value_width) maxLength - value_width else 0);
+        try Unicode.printEscapedValue(out, value, maxLength);
+        try out.printAsciiChar(' ', .{});
     }
     try out.print("|\n", .{});
 
@@ -422,30 +437,72 @@ fn printColumnSeparator(out: *std.Io.Writer, len: usize) !void {
 fn printHeaderCell(out: *std.Io.Writer, value: []const u8, width: usize) !void {
     try out.printAsciiChar('|', .{});
     try out.printAsciiChar(' ', .{});
-    try out.print("{s}", .{value});
-    const value_width = Unicode.displayWidth(value);
+    const value_width = @min(Unicode.escapedDisplayWidth(value), width);
+    try Unicode.printEscapedValue(out, value, width);
     try printPadding(out, if (width >= value_width) width - value_width else 0);
     try out.printAsciiChar(' ', .{});
 }
 
-fn printDataCell(out: *std.Io.Writer, value: []const u8, width: usize, right_align: bool) !void {
-    const value_width = Unicode.displayWidth(value);
+fn printDataCell(out: *std.Io.Writer, field: *C.struct_st_mysql_field, value: []const u8, width: usize, right_align: bool, is_null: bool) !void {
+    const value_width = @min(if (is_null) Unicode.escapedDisplayWidth(value) else renderedValueDisplayWidth(field, value), width);
     try out.printAsciiChar('|', .{});
     try out.printAsciiChar(' ', .{});
     if (right_align) {
         try printPadding(out, if (width >= value_width) width - value_width else 0);
-        try out.print("{s}", .{value});
+        if (is_null) {
+            try Unicode.printEscapedValue(out, value, width);
+        } else {
+            try printRenderedValue(out, field, value, width);
+        }
     } else {
-        try out.print("{s}", .{value});
+        if (is_null) {
+            try Unicode.printEscapedValue(out, value, width);
+        } else {
+            try printRenderedValue(out, field, value, width);
+        }
         try printPadding(out, if (width >= value_width) width - value_width else 0);
     }
     try out.printAsciiChar(' ', .{});
+}
+
+fn cappedTableWidth(width: usize) usize {
+    return @min(width, maxTableColumnDisplayWidth);
+}
+
+fn renderedValueDisplayWidth(field: *C.struct_st_mysql_field, value: []const u8) usize {
+    if (isBinaryField(field)) {
+        return Unicode.hexDisplayWidth(value);
+    }
+    return Unicode.escapedDisplayWidth(value);
+}
+
+fn printRenderedValue(out: *std.Io.Writer, field: *C.struct_st_mysql_field, value: []const u8, max_width: usize) !void {
+    if (isBinaryField(field)) {
+        try Unicode.printHexValue(out, value, max_width);
+    } else {
+        try Unicode.printEscapedValue(out, value, max_width);
+    }
 }
 
 fn isNumericType(kind: C.enum_enum_field_types) bool {
     return (kind <= C.MYSQL_TYPE_INT24 and kind != C.MYSQL_TYPE_TIMESTAMP) or
         kind == C.MYSQL_TYPE_YEAR or
         kind == C.MYSQL_TYPE_NEWDECIMAL;
+}
+
+fn isBinaryField(field: *C.struct_st_mysql_field) bool {
+    if (field.*.charsetnr != 63) {
+        return false;
+    }
+    return field.*.type == C.MYSQL_TYPE_BIT or
+        field.*.type == C.MYSQL_TYPE_BLOB or
+        field.*.type == C.MYSQL_TYPE_LONG_BLOB or
+        field.*.type == C.MYSQL_TYPE_MEDIUM_BLOB or
+        field.*.type == C.MYSQL_TYPE_TINY_BLOB or
+        field.*.type == C.MYSQL_TYPE_VAR_STRING or
+        field.*.type == C.MYSQL_TYPE_STRING or
+        field.*.type == C.MYSQL_TYPE_VARCHAR or
+        field.*.type == C.MYSQL_TYPE_GEOMETRY;
 }
 
 fn printRowSeparator(out: *std.Io.Writer, len: usize) !void {
@@ -490,6 +547,12 @@ fn mysqlField(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_field_ty
     return mysqlFieldWithFlags(name, max_length, kind, C.NOT_NULL_FLAG);
 }
 
+fn mysqlBinaryField(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_field_types) C.struct_st_mysql_field {
+    var field = mysqlField(name, max_length, kind);
+    field.charsetnr = 63;
+    return field;
+}
+
 const MysqlRowStorage1 = extern struct {
     values: [2][*c]u8,
     bytes: [16]u8,
@@ -506,6 +569,12 @@ const MysqlRowStorage3 = extern struct {
     values: [4][*c]u8,
     bytes: [48]u8,
     lengths: [3]c_ulong,
+};
+
+const MysqlRowStorageLarge = extern struct {
+    values: [2][*c]u8,
+    bytes: [maxTableColumnDisplayWidth + 16]u8,
+    lengths: [1]c_ulong,
 };
 
 // Test-only row fixtures. libmariadb's stored-result mysql_fetch_lengths()
@@ -527,6 +596,18 @@ fn initMysqlRowStorage1(storage: *MysqlRowStorage1, value: ?[]const u8) void {
     } else {
         storage.values[1] = &storage.bytes[0];
     }
+}
+
+fn initMysqlRowStorageLarge(storage: *MysqlRowStorageLarge, value: []const u8) void {
+    storage.* = .{
+        .values = .{ null, null },
+        .bytes = @splat(0),
+        .lengths = .{0},
+    };
+    std.debug.assert(value.len + 1 <= storage.bytes.len);
+    @memcpy(storage.bytes[0..value.len], value);
+    storage.values[0] = &storage.bytes[0];
+    storage.values[1] = &storage.bytes[value.len + 1];
 }
 
 fn initMysqlRowStorage2(storage: *MysqlRowStorage2, value1: []const u8, value2: []const u8) void {
@@ -1030,6 +1111,115 @@ test "render string cells left aligned" {
         \\
     ;
     try expectRendered(&result, expect);
+}
+
+test "render text controls as escaped table data" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("txt", 0, C.MYSQL_TYPE_VAR_STRING),
+    };
+    const bytes = [_]u8{ 'a', 0, 'b', '\n', 'c', '\t', 0x1b };
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, &bytes);
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+---------------+
+        \\| txt           |
+        \\+---------------+
+        \\| a\0b\nc\t\x1B |
+        \\+---------------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render invalid UTF-8 text bytes as hex escapes" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("bad", 0, C.MYSQL_TYPE_VAR_STRING),
+    };
+    const bytes = [_]u8{0xff};
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, &bytes);
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+------+
+        \\| bad  |
+        \\+------+
+        \\| \xFF |
+        \\+------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render binary field as hex" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlBinaryField("blob", 0, C.MYSQL_TYPE_BLOB),
+    };
+    const bytes = [_]u8{ 0, 1, 0xff };
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, &bytes);
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+----------+
+        \\| blob     |
+        \\+----------+
+        \\| 0x0001FF |
+        \\+----------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render table caps very wide values" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("v", 0, C.MYSQL_TYPE_VAR_STRING),
+    };
+    const long_width = maxTableColumnDisplayWidth + 8;
+    var long_value: [long_width]u8 = @splat('a');
+    var row_storage: MysqlRowStorageLarge = undefined;
+    initMysqlRowStorageLarge(&row_storage, &long_value);
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const gpa = std.testing.allocator;
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &expected);
+    defer expected = writer.toArrayList();
+
+    try writer.writer.print("+", .{});
+    for (0..maxTableColumnDisplayWidth + 2) |_| {
+        try writer.writer.print("-", .{});
+    }
+    try writer.writer.print("+\n| v", .{});
+    for (0..maxTableColumnDisplayWidth - 1) |_| {
+        try writer.writer.print(" ", .{});
+    }
+    try writer.writer.print(" |\n+", .{});
+    for (0..maxTableColumnDisplayWidth + 2) |_| {
+        try writer.writer.print("-", .{});
+    }
+    try writer.writer.print("+\n| ", .{});
+    for (0..maxTableColumnDisplayWidth) |_| {
+        try writer.writer.print("a", .{});
+    }
+    try writer.writer.print(" |\n+", .{});
+    for (0..maxTableColumnDisplayWidth + 2) |_| {
+        try writer.writer.print("-", .{});
+    }
+    try writer.writer.print("+\n", .{});
+
+    try expectRendered(&result, writer.written());
 }
 
 test "render accented table using display width" {
