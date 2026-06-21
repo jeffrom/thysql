@@ -21,3 +21,7 @@ pub fn setup() !void {
     // isocline.ic_set_default_completer(wordCompleter, null);
     // isocline.ic_enable_auto_tab(true);
 }
+
+pub fn rebuildCompletions() !void {
+    // Hook for refreshing table and column completions after changing databases.
+}

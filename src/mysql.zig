@@ -60,6 +60,12 @@ pub const DB = struct {
         C.mysql_close(self.conn);
     }
 
+    pub fn selectDatabase(self: DB, database: [:0]const u8) DBError!void {
+        if (C.mysql_select_db(self.conn, database.ptr) != 0) {
+            return DBError.ExecError;
+        }
+    }
+
     pub fn exec(self: DB, query: []const u8) DBError!ExecResult {
         if (C.mysql_real_query(self.conn, query.ptr, query.len) != 0) {
             return DBError.ExecError;
