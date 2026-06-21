@@ -17,9 +17,6 @@ fn readOneLine(db: Mysql.DB, stdout: *std.Io.Writer) !bool {
         return false;
     }
 
-    try stdout.print("typed: {s}\n", .{line});
-    try stdout.flush();
-
     const exec_result = db.exec(line) catch |err| {
         switch (err) {
             Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {

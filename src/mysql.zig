@@ -126,6 +126,7 @@ pub fn render_ok(out: *std.Io.Writer, ok: OKResult) !void {
         try out.print("{s}\n", .{info});
     }
     try out.print("\n", .{});
+    try out.flush();
 }
 
 pub fn render_error(out: *std.Io.Writer, errno: u32, sqlstate: ?[]const u8, message: []const u8) !void {
@@ -141,6 +142,12 @@ pub fn render_error(out: *std.Io.Writer, errno: u32, sqlstate: ?[]const u8, mess
 
 pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !void {
     const numFields: usize = C.mysql_num_fields(result);
+
+    if (C.mysql_num_rows(result) == 0) {
+        try out.print("Empty set\n\n", .{});
+        try out.flush();
+        return;
+    }
 
     _ = C.mysql_field_seek(result, 0);
     for (0..numFields) |_| {
@@ -436,6 +443,22 @@ test "render query OK singular affected row with warnings and info" {
         \\
         \\
     );
+}
+
+test "render empty result set" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("1", 0, C.MYSQL_TYPE_LONG),
+    };
+    var data = mysqlData(null, 0, fields.len);
+    var lengths = [_]c_ulong{0};
+    var result = mysqlResult(&fields, &data, &lengths);
+
+    const expect =
+        \\Empty set
+        \\
+        \\
+    ;
+    try expectRendered(&result, expect);
 }
 
 test "render SELECT 1" {
