@@ -463,6 +463,12 @@ const MysqlRowStorage2 = extern struct {
     lengths: [2]c_ulong,
 };
 
+const MysqlRowStorage3 = extern struct {
+    values: [4][*c]u8,
+    bytes: [24]u8,
+    lengths: [3]c_ulong,
+};
+
 // Test-only row fixtures. libmariadb's stored-result mysql_fetch_lengths()
 // derives lengths from adjacent MYSQL_ROW value pointers, so these fixtures
 // keep contiguous row bytes plus one extra end pointer. They must be initialized
@@ -496,6 +502,34 @@ fn initMysqlRowStorage2(storage: *MysqlRowStorage2, value1: []const u8, value2: 
     storage.values[0] = &storage.bytes[0];
     storage.values[1] = &storage.bytes[value2Offset];
     storage.values[2] = &storage.bytes[endOffset];
+}
+
+fn initMysqlRowStorage3(storage: *MysqlRowStorage3, value1: []const u8, value2: []const u8, value3: ?[]const u8) void {
+    storage.* = .{
+        .values = .{ null, null, null, null },
+        .bytes = @splat(0),
+        .lengths = .{ 0, 0, 0 },
+    };
+
+    var offset: usize = 0;
+    @memcpy(storage.bytes[offset..][0..value1.len], value1);
+    storage.values[0] = &storage.bytes[offset];
+    offset += value1.len + 1;
+
+    @memcpy(storage.bytes[offset..][0..value2.len], value2);
+    storage.values[1] = &storage.bytes[offset];
+    offset += value2.len + 1;
+
+    if (value3) |bytes| {
+        @memcpy(storage.bytes[offset..][0..bytes.len], bytes);
+        storage.values[2] = &storage.bytes[offset];
+        offset += bytes.len + 1;
+    } else {
+        storage.values[2] = null;
+    }
+
+    std.debug.assert(offset < storage.bytes.len);
+    storage.values[3] = &storage.bytes[offset];
 }
 
 fn mysqlRow(storage: anytype, next: [*c]C.struct_st_mysql_rows) C.struct_st_mysql_rows {
@@ -794,6 +828,56 @@ test "render SELECT 1 AS one, 'two' AS two vertically with timed footer" {
         \\
     ;
     try expectRenderedVerticalTimed(&result, 2 * std.time.ns_per_ms, expect);
+}
+
+test "render mixed multi-column table spacing" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("id", 1, C.MYSQL_TYPE_LONG),
+        mysqlField("name", 0, C.MYSQL_TYPE_VAR_STRING),
+        mysqlFieldWithFlags("note", 0, C.MYSQL_TYPE_VAR_STRING, 0),
+    };
+    var row_storage: MysqlRowStorage3 = undefined;
+    initMysqlRowStorage3(&row_storage, "7", "Ada", null);
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+----+------+------+
+        \\| id | name | note |
+        \\+----+------+------+
+        \\|  7 | Ada  | NULL |
+        \\+----+------+------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render multi-column table uses widest row value" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("id", 1, C.MYSQL_TYPE_LONG),
+        mysqlField("name", 0, C.MYSQL_TYPE_VAR_STRING),
+        mysqlFieldWithFlags("note", 0, C.MYSQL_TYPE_VAR_STRING, 0),
+    };
+    var row2_storage: MysqlRowStorage3 = undefined;
+    initMysqlRowStorage3(&row2_storage, "12", "Grace", "ok");
+    var row1_storage: MysqlRowStorage3 = undefined;
+    initMysqlRowStorage3(&row1_storage, "7", "Ada", null);
+    var row2 = mysqlRow(&row2_storage, null);
+    var row1 = mysqlRow(&row1_storage, &row2);
+    var data = mysqlData(&row1, 2, fields.len);
+    var result = mysqlResult(&fields, &data, &row1_storage.lengths);
+
+    const expect =
+        \\+----+-------+------+
+        \\| id | name  | note |
+        \\+----+-------+------+
+        \\|  7 | Ada   | NULL |
+        \\| 12 | Grace | ok   |
+        \\+----+-------+------+
+        \\
+    ;
+    try expectRendered(&result, expect);
 }
 
 test "render SELECT 'one' AS '1'" {
