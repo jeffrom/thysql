@@ -121,6 +121,10 @@ pub const DB = struct {
 
         try render_error(out, errno, if (sqlstate == null) null else std.mem.sliceTo(sqlstate, 0), std.mem.sliceTo(message, 0));
     }
+
+    pub fn warningCount(self: DB) u32 {
+        return C.mysql_warning_count(self.conn);
+    }
 };
 
 pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
@@ -158,12 +162,7 @@ fn render_ok_status(out: *std.Io.Writer, ok: OKResult) !void {
         });
     }
 
-    if (ok.warnings != 0) {
-        try out.print(", {} warning{s}", .{
-            ok.warnings,
-            if (ok.warnings == 1) "" else "s",
-        });
-    }
+    try renderWarningCount(out, ok.warnings);
 }
 
 fn renderElapsed(out: *std.Io.Writer, elapsed_ns: i96) !void {
@@ -262,8 +261,13 @@ pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !vo
 }
 
 pub fn render_result_timed(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96) !void {
+    try render_result_timed_with_warnings(out, result, elapsed_ns, 0);
+}
+
+pub fn render_result_timed_with_warnings(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96, warnings: u32) !void {
     if (C.mysql_num_rows(result) == 0) {
         try out.print("Empty set", .{});
+        try renderWarningCount(out, warnings);
         try renderElapsed(out, elapsed_ns);
         try out.print("\n\n", .{});
         try out.flush();
@@ -271,7 +275,7 @@ pub fn render_result_timed(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_re
     }
 
     try render_result(out, result);
-    try render_result_footer(out, result, elapsed_ns);
+    try render_result_footer(out, result, elapsed_ns, warnings);
 }
 
 pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !void {
@@ -319,8 +323,13 @@ pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql
 }
 
 pub fn render_result_vertical_timed(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96) !void {
+    try render_result_vertical_timed_with_warnings(out, result, elapsed_ns, 0);
+}
+
+pub fn render_result_vertical_timed_with_warnings(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96, warnings: u32) !void {
     if (C.mysql_num_rows(result) == 0) {
         try out.print("Empty set", .{});
+        try renderWarningCount(out, warnings);
         try renderElapsed(out, elapsed_ns);
         try out.print("\n\n", .{});
         try out.flush();
@@ -328,15 +337,26 @@ pub fn render_result_vertical_timed(out: *std.Io.Writer, result: [*c]C.struct_st
     }
 
     try render_result_vertical(out, result);
-    try render_result_footer(out, result, elapsed_ns);
+    try render_result_footer(out, result, elapsed_ns, warnings);
 }
 
-fn render_result_footer(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96) !void {
+fn render_result_footer(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96, warnings: u32) !void {
     const rows = C.mysql_num_rows(result);
     try out.print("{} {s} in set", .{ rows, if (rows == 1) "row" else "rows" });
+    try renderWarningCount(out, warnings);
     try renderElapsed(out, elapsed_ns);
     try out.print("\n\n", .{});
     try out.flush();
+}
+
+fn renderWarningCount(out: *std.Io.Writer, warnings: u32) !void {
+    if (warnings == 0) {
+        return;
+    }
+    try out.print(", {} warning{s}", .{
+        warnings,
+        if (warnings == 1) "" else "s",
+    });
 }
 
 fn printColumnSeparators(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, numFields: usize) !void {
@@ -609,25 +629,33 @@ fn expectRenderedVertical(result: *C.struct_st_mysql_res, expect: []const u8) !v
 }
 
 fn expectRenderedTimed(result: *C.struct_st_mysql_res, elapsed_ns: i96, expect: []const u8) !void {
+    try expectRenderedTimedWithWarnings(result, elapsed_ns, 0, expect);
+}
+
+fn expectRenderedTimedWithWarnings(result: *C.struct_st_mysql_res, elapsed_ns: i96, warnings: u32, expect: []const u8) !void {
     const gpa = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
     var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
     defer buf = writer.toArrayList();
 
-    try render_result_timed(&writer.writer, result, elapsed_ns);
+    try render_result_timed_with_warnings(&writer.writer, result, elapsed_ns, warnings);
 
     try std.testing.expectEqualStrings(expect, writer.written());
 }
 
 fn expectRenderedVerticalTimed(result: *C.struct_st_mysql_res, elapsed_ns: i96, expect: []const u8) !void {
+    try expectRenderedVerticalTimedWithWarnings(result, elapsed_ns, 0, expect);
+}
+
+fn expectRenderedVerticalTimedWithWarnings(result: *C.struct_st_mysql_res, elapsed_ns: i96, warnings: u32, expect: []const u8) !void {
     const gpa = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
     var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
     defer buf = writer.toArrayList();
 
-    try render_result_vertical_timed(&writer.writer, result, elapsed_ns);
+    try render_result_vertical_timed_with_warnings(&writer.writer, result, elapsed_ns, warnings);
 
     try std.testing.expectEqualStrings(expect, writer.written());
 }
@@ -744,6 +772,22 @@ test "render timed empty result set" {
     try expectRenderedTimed(&result, 2 * std.time.ns_per_ms, expect);
 }
 
+test "render timed empty result set with warnings" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("1", 0, C.MYSQL_TYPE_LONG),
+    };
+    var data = mysqlData(null, 0, fields.len);
+    var lengths = [_]c_ulong{0};
+    var result = mysqlResult(&fields, &data, &lengths);
+
+    const expect =
+        \\Empty set, 2 warnings (0.002 sec)
+        \\
+        \\
+    ;
+    try expectRenderedTimedWithWarnings(&result, 2 * std.time.ns_per_ms, 2, expect);
+}
+
 test "render SELECT 1" {
     var fields = [_]C.struct_st_mysql_field{
         mysqlField("1", 1, C.MYSQL_TYPE_LONG),
@@ -786,6 +830,29 @@ test "render SELECT 1 with timed footer" {
         \\
     ;
     try expectRenderedTimed(&result, 2 * std.time.ns_per_ms, expect);
+}
+
+test "render SELECT 1 with timed footer and warning" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("1", 1, C.MYSQL_TYPE_LONG),
+    };
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "1");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+---+
+        \\| 1 |
+        \\+---+
+        \\| 1 |
+        \\+---+
+        \\1 row in set, 1 warning (0.002 sec)
+        \\
+        \\
+    ;
+    try expectRenderedTimedWithWarnings(&result, 2 * std.time.ns_per_ms, 1, expect);
 }
 
 test "render SELECT 1 AS one" {
@@ -849,6 +916,28 @@ test "render SELECT 1 AS one, 'two' AS two vertically with timed footer" {
         \\
     ;
     try expectRenderedVerticalTimed(&result, 2 * std.time.ns_per_ms, expect);
+}
+
+test "render vertical result with timed footer and warnings" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("one", 1, C.MYSQL_TYPE_LONG),
+        mysqlField("two", 3, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row_storage, "1", "two");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\*************************** 1. row ***************************
+        \\one: 1
+        \\two: two
+        \\1 row in set, 2 warnings (0.002 sec)
+        \\
+        \\
+    ;
+    try expectRenderedVerticalTimedWithWarnings(&result, 2 * std.time.ns_per_ms, 2, expect);
 }
 
 test "render mixed multi-column table spacing" {

@@ -108,10 +108,11 @@ fn readOneLine(db: Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
         switch (exec_result) {
             .result => |result| {
                 defer Mysql.freeResult(result);
+                const warnings = db.warningCount();
                 if (query.vertical) {
-                    try Mysql.render_result_vertical_timed(stdout, result, elapsed_ns);
+                    try Mysql.render_result_vertical_timed_with_warnings(stdout, result, elapsed_ns, warnings);
                 } else {
-                    try Mysql.render_result_timed(stdout, result, elapsed_ns);
+                    try Mysql.render_result_timed_with_warnings(stdout, result, elapsed_ns, warnings);
                 }
             },
             .ok => |ok| try Mysql.render_ok_timed(stdout, ok, elapsed_ns),
