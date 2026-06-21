@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const C = @import("mysql_c");
+const Unicode = @import("unicode.zig");
 
 pub const DBInfo = struct {
     host: [:0]const u8,
@@ -203,7 +204,7 @@ pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !vo
     _ = C.mysql_field_seek(result, 0);
     for (0..numFields) |_| {
         const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
-        field.*.max_length = @max(field.*.max_length, field.*.name_length);
+        field.*.max_length = Unicode.displayWidth(field.*.name[0..field.*.name_length]);
         if (field.*.max_length < 4 and (field.*.flags & C.NOT_NULL_FLAG) == 0) {
             field.*.max_length = 4;
         }
@@ -219,8 +220,8 @@ pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !vo
             _ = C.mysql_field_seek(result, 0);
             for (0..numFields) |i| {
                 const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
-                const dataLength = if (row[i] == null) "NULL".len else lengths[i];
-                field.*.max_length = @max(field.*.max_length, dataLength);
+                const value = if (row[i] == null) "NULL" else row[i][0..lengths[i]];
+                field.*.max_length = @max(field.*.max_length, Unicode.displayWidth(value));
             }
         }
         C.mysql_data_seek(result, 0);
@@ -286,7 +287,7 @@ pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql
     var maxNameLength: usize = 0;
     for (0..numFields) |_| {
         const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
-        maxNameLength = @max(maxNameLength, field.*.name_length);
+        maxNameLength = @max(maxNameLength, Unicode.displayWidth(field.*.name[0..field.*.name_length]));
     }
 
     C.mysql_data_seek(result, 0);
@@ -303,7 +304,7 @@ pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql
         for (0..numFields) |i| {
             const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
             const name = field.*.name[0..field.*.name_length];
-            try printPadding(out, maxNameLength - name.len);
+            try printPadding(out, maxNameLength - Unicode.displayWidth(name));
             try out.print("{s}: ", .{name});
             if (row[i] == null) {
                 try out.print("NULL\n", .{});
@@ -402,19 +403,21 @@ fn printHeaderCell(out: *std.Io.Writer, value: []const u8, width: usize) !void {
     try out.printAsciiChar('|', .{});
     try out.printAsciiChar(' ', .{});
     try out.print("{s}", .{value});
-    try printPadding(out, width - value.len);
+    const value_width = Unicode.displayWidth(value);
+    try printPadding(out, if (width >= value_width) width - value_width else 0);
     try out.printAsciiChar(' ', .{});
 }
 
 fn printDataCell(out: *std.Io.Writer, value: []const u8, width: usize, right_align: bool) !void {
+    const value_width = Unicode.displayWidth(value);
     try out.printAsciiChar('|', .{});
     try out.printAsciiChar(' ', .{});
     if (right_align) {
-        try printPadding(out, if (width >= value.len) width - value.len else 0);
+        try printPadding(out, if (width >= value_width) width - value_width else 0);
         try out.print("{s}", .{value});
     } else {
         try out.print("{s}", .{value});
-        try printPadding(out, if (width >= value.len) width - value.len else 0);
+        try printPadding(out, if (width >= value_width) width - value_width else 0);
     }
     try out.printAsciiChar(' ', .{});
 }
@@ -469,19 +472,19 @@ fn mysqlField(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_field_ty
 
 const MysqlRowStorage1 = extern struct {
     values: [2][*c]u8,
-    bytes: [5]u8,
+    bytes: [16]u8,
     lengths: [1]c_ulong,
 };
 
 const MysqlRowStorage2 = extern struct {
     values: [3][*c]u8,
-    bytes: [8]u8,
+    bytes: [24]u8,
     lengths: [2]c_ulong,
 };
 
 const MysqlRowStorage3 = extern struct {
     values: [4][*c]u8,
-    bytes: [24]u8,
+    bytes: [48]u8,
     lengths: [3]c_ulong,
 };
 
@@ -501,6 +504,8 @@ fn initMysqlRowStorage1(storage: *MysqlRowStorage1, value: ?[]const u8) void {
         @memcpy(storage.bytes[0..bytes.len], bytes);
         storage.values[0] = &storage.bytes[0];
         storage.values[1] = &storage.bytes[bytes.len + 1];
+    } else {
+        storage.values[1] = &storage.bytes[0];
     }
 }
 
@@ -932,6 +937,69 @@ test "render string cells left aligned" {
         \\| word |
         \\+------+
         \\| x    |
+        \\+------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render accented table using display width" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("word", 0, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "é");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+------+
+        \\| word |
+        \\+------+
+        \\| é    |
+        \\+------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render decomposed accent table using display width" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("word", 0, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "e\u{301}");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+------+
+        \\| word |
+        \\+------+
+        \\| é    |
+        \\+------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render CJK table using display width" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("city", 0, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "東京");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+------+
+        \\| city |
+        \\+------+
+        \\| 東京 |
         \\+------+
         \\
     ;

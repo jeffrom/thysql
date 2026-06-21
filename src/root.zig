@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 
 const Mysql = @import("mysql.zig");
 const Readline = @import("readline.zig");
+pub const Unicode = @import("unicode.zig");
 
 const QueryInput = struct {
     sql: []const u8,
@@ -188,5 +189,6 @@ test "detect USE database command" {
 test {
     _ = .{
         @import("mysql.zig"),
+        @import("unicode.zig"),
     };
 }
