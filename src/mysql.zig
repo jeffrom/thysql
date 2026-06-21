@@ -555,7 +555,7 @@ fn mysqlBinaryField(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_fi
 
 const MysqlRowStorage1 = extern struct {
     values: [2][*c]u8,
-    bytes: [16]u8,
+    bytes: [32]u8,
     lengths: [1]c_ulong,
 };
 
@@ -1044,6 +1044,72 @@ test "render mixed multi-column table spacing" {
     try expectRendered(&result, expect);
 }
 
+test "render numeric edge types right aligned" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("dec", 0, C.MYSQL_TYPE_NEWDECIMAL),
+        mysqlField("flt", 0, C.MYSQL_TYPE_FLOAT),
+        mysqlField("yr", 0, C.MYSQL_TYPE_YEAR),
+    };
+    var row_storage: MysqlRowStorage3 = undefined;
+    initMysqlRowStorage3(&row_storage, "-1.25", "3.5", "2026");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+-------+-----+------+
+        \\| dec   | flt | yr   |
+        \\+-------+-----+------+
+        \\| -1.25 | 3.5 | 2026 |
+        \\+-------+-----+------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render negative integer and double right aligned" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("big", 0, C.MYSQL_TYPE_LONGLONG),
+        mysqlField("dbl", 0, C.MYSQL_TYPE_DOUBLE),
+    };
+    var row_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row_storage, "-42", "123.75");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+-----+--------+
+        \\| big | dbl    |
+        \\+-----+--------+
+        \\| -42 | 123.75 |
+        \\+-----+--------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render timestamp values left aligned" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("ts", 0, C.MYSQL_TYPE_TIMESTAMP),
+    };
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "2026-06-21 10:11:12");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+---------------------+
+        \\| ts                  |
+        \\+---------------------+
+        \\| 2026-06-21 10:11:12 |
+        \\+---------------------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
 test "render multi-column table uses widest row value" {
     var fields = [_]C.struct_st_mysql_field{
         mysqlField("id", 1, C.MYSQL_TYPE_LONG),
@@ -1066,6 +1132,51 @@ test "render multi-column table uses widest row value" {
         \\|  7 | Ada   | NULL |
         \\| 12 | Grace | ok   |
         \\+----+-------+------+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render nullable metadata reserves NULL width without NULL rows" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("id", 1, C.MYSQL_TYPE_LONG),
+        mysqlFieldWithFlags("n", 0, C.MYSQL_TYPE_VAR_STRING, 0),
+        mysqlField("tag", 0, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage3 = undefined;
+    initMysqlRowStorage3(&row_storage, "7", "x", "ok");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+----+------+-----+
+        \\| id | n    | tag |
+        \\+----+------+-----+
+        \\|  7 | x    | ok  |
+        \\+----+------+-----+
+        \\
+    ;
+    try expectRendered(&result, expect);
+}
+
+test "render nullable numeric metadata reserves NULL width without NULL rows" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlFieldWithFlags("n", 0, C.MYSQL_TYPE_LONG, 0),
+        mysqlField("label", 0, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row_storage, "3", "ok");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const expect =
+        \\+------+-------+
+        \\| n    | label |
+        \\+------+-------+
+        \\|    3 | ok    |
+        \\+------+-------+
         \\
     ;
     try expectRendered(&result, expect);
