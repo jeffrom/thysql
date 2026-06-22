@@ -17,6 +17,8 @@ pub fn one(prompt: ?[:0]const u8) ?[:0]const u8 {
 
 pub fn setup() !void {
     isocline.setupHistory();
+    isocline.disableFilenameCompletion();
+    isocline.disablePromptMarker();
 
     // isocline.ic_set_default_completer(wordCompleter, null);
     // isocline.ic_enable_auto_tab(true);
@@ -24,4 +26,12 @@ pub fn setup() !void {
 
 pub fn rebuildCompletions() !void {
     // Hook for refreshing table and column completions after changing databases.
+}
+
+pub fn removeLastHistory() void {
+    isocline.removeLastHistory();
+}
+
+pub fn addHistory(entry: [:0]const u8) void {
+    isocline.addHistory(entry);
 }

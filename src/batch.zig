@@ -28,10 +28,20 @@ pub fn parseQueryInput(line: []const u8) Query {
 }
 
 pub const Scanner = struct {
+    pub const PromptKind = enum {
+        main,
+        continuation,
+        single_quote,
+        double_quote,
+        backtick,
+        block_comment,
+    };
+
     const State = enum {
         normal,
         maybe_dash_comment,
         maybe_block_comment,
+        maybe_command,
         single_quote,
         double_quote,
         backtick,
@@ -67,6 +77,21 @@ pub const Scanner = struct {
                     try self.buffer.append(allocator, byte);
                     return false;
                 }
+                self.state = .normal;
+                return self.feedNormal(allocator, byte);
+            },
+            .maybe_command => {
+                if (byte == 'G') {
+                    try self.buffer.append(allocator, byte);
+                    self.state = .normal;
+                    return true;
+                }
+                if (byte == 'g') {
+                    _ = self.buffer.pop();
+                    self.state = .normal;
+                    return true;
+                }
+
                 self.state = .normal;
                 return self.feedNormal(allocator, byte);
             },
@@ -126,6 +151,7 @@ pub const Scanner = struct {
             '`' => self.state = .backtick,
             '-' => self.state = .maybe_dash_comment,
             '/' => self.state = .maybe_block_comment,
+            '\\' => self.state = .maybe_command,
             else => {},
         }
         try self.buffer.append(allocator, byte);
@@ -134,6 +160,19 @@ pub const Scanner = struct {
 
     pub fn pendingQuery(self: *Scanner) Query {
         return parseQueryInput(self.buffer.items);
+    }
+
+    pub fn promptKind(self: *const Scanner) PromptKind {
+        return switch (self.state) {
+            .normal, .maybe_dash_comment, .maybe_block_comment, .maybe_command, .line_comment => if (self.buffer.items.len == 0)
+                .main
+            else
+                .continuation,
+            .single_quote => .single_quote,
+            .double_quote => .double_quote,
+            .backtick => .backtick,
+            .block_comment => .block_comment,
+        };
     }
 
     pub fn reset(self: *Scanner) void {
@@ -444,4 +483,69 @@ test "scanner splits statements outside strings and comments" {
     try std.testing.expectEqualStrings("select 'a;b'", statements.items[0]);
     try std.testing.expectEqualStrings("-- ignore this ; in a line comment\nselect \"c;d\"", statements.items[1]);
     try std.testing.expectEqualStrings("/* ignore this ; in a block comment */\nselect `semi;name`", statements.items[2]);
+}
+
+test "scanner splits slash command terminators outside strings" {
+    var scanner: Scanner = .{};
+    defer scanner.deinit(std.testing.allocator);
+
+    var saw_vertical = false;
+    for ("select 1\\G") |byte| {
+        if (try scanner.feed(std.testing.allocator, byte)) {
+            saw_vertical = true;
+            const query = scanner.pendingQuery();
+            try std.testing.expectEqualStrings("select 1", query.sql);
+            try std.testing.expect(query.vertical);
+            scanner.reset();
+        }
+    }
+    try std.testing.expect(saw_vertical);
+
+    var saw_regular = false;
+    for ("select 2\\g") |byte| {
+        if (try scanner.feed(std.testing.allocator, byte)) {
+            saw_regular = true;
+            const query = scanner.pendingQuery();
+            try std.testing.expectEqualStrings("select 2", query.sql);
+            try std.testing.expect(!query.vertical);
+            scanner.reset();
+        }
+    }
+    try std.testing.expect(saw_regular);
+}
+
+test "scanner reports interactive prompt state" {
+    var scanner: Scanner = .{};
+    defer scanner.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Scanner.PromptKind.main, scanner.promptKind());
+
+    for ("select 1") |byte| {
+        _ = try scanner.feed(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqual(Scanner.PromptKind.continuation, scanner.promptKind());
+    scanner.reset();
+
+    for ("select 'unterminated") |byte| {
+        _ = try scanner.feed(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqual(Scanner.PromptKind.single_quote, scanner.promptKind());
+    scanner.reset();
+
+    for ("select \"unterminated") |byte| {
+        _ = try scanner.feed(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqual(Scanner.PromptKind.double_quote, scanner.promptKind());
+    scanner.reset();
+
+    for ("select `unterminated") |byte| {
+        _ = try scanner.feed(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqual(Scanner.PromptKind.backtick, scanner.promptKind());
+    scanner.reset();
+
+    for ("select /* unterminated") |byte| {
+        _ = try scanner.feed(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqual(Scanner.PromptKind.block_comment, scanner.promptKind());
 }

@@ -28,9 +28,9 @@ const CliOptions = struct {
 fn connectionPrompt(allocator: Allocator, user: []const u8, host: []const u8, port: u32, database: []const u8) ![:0]u8 {
     const db_name = if (database.len == 0) "(none)" else database;
     if (user.len == 0) {
-        return try std.fmt.allocPrintSentinel(allocator, "{s}:{}/{s}", .{ host, port, db_name }, 0);
+        return try std.fmt.allocPrintSentinel(allocator, "{s}:{}/{s}> ", .{ host, port, db_name }, 0);
     }
-    return try std.fmt.allocPrintSentinel(allocator, "{s}@{s}:{}/{s}", .{ user, host, port, db_name }, 0);
+    return try std.fmt.allocPrintSentinel(allocator, "{s}@{s}:{}/{s}> ", .{ user, host, port, db_name }, 0);
 }
 
 fn envValue(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
@@ -317,8 +317,73 @@ fn executeQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.
     return true;
 }
 
-fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
-    const prompt = try connectionPrompt(db.allocator, db.user, db.host, db.port, db.database);
+fn interactivePrompt(allocator: Allocator, db: *Mysql.DB, scanner: *const Batch.Scanner) ![:0]u8 {
+    return switch (scanner.promptKind()) {
+        .main => connectionPrompt(allocator, db.user, db.host, db.port, db.database),
+        .continuation => try allocator.dupeZ(u8, "    -> "),
+        .single_quote => try allocator.dupeZ(u8, "    '> "),
+        .double_quote => try allocator.dupeZ(u8, "    \"> "),
+        .backtick => try allocator.dupeZ(u8, "    `> "),
+        .block_comment => try allocator.dupeZ(u8, "   /*> "),
+    };
+}
+
+fn appendHistoryChar(entry: *std.ArrayList(u8), allocator: Allocator, byte: u8, in_string: *u8, escaped: *bool) !void {
+    switch (byte) {
+        '\n' => try entry.append(allocator, if (in_string.* == 0) ' ' else '\n'),
+        '\\' => {
+            try entry.append(allocator, byte);
+            if (in_string.* != 0) {
+                escaped.* = !escaped.*;
+            }
+        },
+        '\'', '"', '`' => {
+            if (escaped.*) {
+                escaped.* = false;
+            } else if (in_string.* == 0) {
+                in_string.* = byte;
+            } else if (in_string.* == byte) {
+                in_string.* = 0;
+            }
+            try entry.append(allocator, byte);
+        },
+        else => {
+            escaped.* = false;
+            try entry.append(allocator, byte);
+        },
+    }
+}
+
+fn formatHistoryEntry(allocator: Allocator, query: Batch.Query) ![:0]u8 {
+    var entry: std.ArrayList(u8) = .empty;
+    errdefer entry.deinit(allocator);
+
+    var in_string: u8 = 0;
+    var escaped = false;
+    for (query.sql) |byte| {
+        try appendHistoryChar(&entry, allocator, byte, &in_string, &escaped);
+    }
+    if (query.vertical) {
+        try entry.appendSlice(allocator, "\\G");
+    } else {
+        try entry.append(allocator, ';');
+    }
+
+    return try entry.toOwnedSliceSentinel(allocator, 0);
+}
+
+fn addQueryToHistory(allocator: Allocator, query: Batch.Query) !void {
+    if (query.sql.len == 0) {
+        return;
+    }
+
+    const entry = try formatHistoryEntry(allocator, query);
+    defer allocator.free(entry);
+    Readline.addHistory(entry);
+}
+
+fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, scanner: *Batch.Scanner) !bool {
+    const prompt = try interactivePrompt(db.allocator, db, scanner);
     defer db.allocator.free(prompt);
 
     const maybeLine = Readline.one(prompt);
@@ -328,11 +393,27 @@ fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
     defer Readline.freeLine(@ptrCast(@constCast(maybeLine)));
 
     const line = maybeLine.?;
-    if (line.len == 0) {
+    if (line.len > 1) {
+        Readline.removeLastHistory();
+    }
+    if (line.len == 0 and scanner.pendingQuery().sql.len == 0) {
         return false;
     }
 
-    _ = try executeQuery(db, io, stdout, Batch.parseQueryInput(line), true);
+    var completed_statement = false;
+    for (line) |byte| {
+        if (try scanner.feed(db.allocator, byte)) {
+            completed_statement = true;
+            const query = scanner.pendingQuery();
+            try addQueryToHistory(db.allocator, query);
+            _ = try executeQuery(db, io, stdout, query, true);
+            scanner.reset();
+        }
+    }
+
+    if (!completed_statement or scanner.pendingQuery().sql.len != 0) {
+        _ = try scanner.feed(db.allocator, '\n');
+    }
     return false;
 }
 
@@ -463,8 +544,10 @@ pub fn runREPL(
 
     try Readline.setup();
 
+    var interactive_scanner: Batch.Scanner = .{};
+    defer interactive_scanner.deinit(allocator);
     while (true) {
-        const done = try readOneLine(&db, io, stdout);
+        const done = try readOneLine(&db, io, stdout, &interactive_scanner);
         if (done) {
             break;
         }
@@ -493,11 +576,31 @@ test "detect USE database command" {
 test "connection prompt shows connection and database" {
     const with_database = try connectionPrompt(std.testing.allocator, "root", "db.example", 3307, "app");
     defer std.testing.allocator.free(with_database);
-    try std.testing.expectEqualStrings("root@db.example:3307/app", with_database);
+    try std.testing.expectEqualStrings("root@db.example:3307/app> ", with_database);
 
     const without_database = try connectionPrompt(std.testing.allocator, "", "localhost", 3306, "");
     defer std.testing.allocator.free(without_database);
-    try std.testing.expectEqualStrings("localhost:3306/(none)", without_database);
+    try std.testing.expectEqualStrings("localhost:3306/(none)> ", without_database);
+}
+
+test "history entry folds multiline query outside strings" {
+    const entry = try formatHistoryEntry(std.testing.allocator, .{
+        .sql = "select\n'kept\nnewline'\nfrom dual",
+        .vertical = false,
+    });
+    defer std.testing.allocator.free(entry);
+
+    try std.testing.expectEqualStrings("select 'kept\nnewline' from dual;", entry);
+}
+
+test "history entry keeps vertical terminator" {
+    const entry = try formatHistoryEntry(std.testing.allocator, .{
+        .sql = "select 1",
+        .vertical = true,
+    });
+    defer std.testing.allocator.free(entry);
+
+    try std.testing.expectEqualStrings("select 1\\G", entry);
 }
 
 test "connection options default from environment" {

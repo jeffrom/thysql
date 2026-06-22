@@ -19,3 +19,19 @@ pub fn readline(prompt: ?[:0]const u8) ?[:0]const u8 {
 pub fn setupHistory() void {
     C.ic_set_history("/Users/jeff/.local/state/thysql/history.txt", 5000);
 }
+
+pub fn disableFilenameCompletion() void {
+    C.ic_set_default_completer(null, null);
+}
+
+pub fn disablePromptMarker() void {
+    C.ic_set_prompt_marker("", "");
+}
+
+pub fn removeLastHistory() void {
+    C.ic_history_remove_last();
+}
+
+pub fn addHistory(entry: [:0]const u8) void {
+    C.ic_history_add(entry.ptr);
+}
