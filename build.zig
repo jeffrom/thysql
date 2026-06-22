@@ -46,11 +46,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    const isocline_dep = b.dependency("isocline", .{
+    const isocline_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
-    const isocline_artifact = isocline_dep.artifact("isocline");
+    isocline_mod.addCSourceFile(.{
+        .file = b.path("deps/isocline/src/isocline.c"),
+        .flags = &.{},
+    });
+    const isocline_artifact = b.addLibrary(.{
+        .name = "isocline",
+        .linkage = .static,
+        .root_module = isocline_mod,
+    });
 
     const mysql_c_translate = b.addTranslateC(.{
         .root_source_file = b.path("src/mysql_c.h"),
@@ -65,22 +74,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    isocline_c_translate.addIncludePath(isocline_artifact.getEmittedIncludeTree());
+    isocline_c_translate.addIncludePath(b.path("deps/isocline/include"));
     const isocline_c = isocline_c_translate.createModule();
 
     mod.addImport("mysql_c", mysql_c);
     mod.addImport("isocline_c", isocline_c);
 
-    // std.debug.print("hi {} \n", .{isocline_dep.builder.modules.count()});
-
     mod.link_libc = true;
     mod.linkLibrary(isocline_artifact);
-
-    // const isocline_mod = b.createModule(.{
-    //     .name = "isocline",
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
 
     mod.linkSystemLibrary("mysqlclient", .{});
 

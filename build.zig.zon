@@ -26,20 +26,11 @@
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
     .minimum_zig_version = "0.15.2",
-    // This field is optional.
-    // Each dependency must either provide a `url` and `hash`, or a `path`.
-    // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
-    // Once all dependencies are fetched, `zig build` no longer requires
-    // internet connectivity.
-    .dependencies = .{
-        .isocline = .{
-            .url = "git+https://github.com/allyourcodebase/isocline.git#7b3a7cc98a96e07bb9c13e0a8f809daddf8a3fb9",
-            .hash = "isocline-1.0.9-KI8xIxALAACazh_WgdBt2YDGq6LnFzjIs-k98KXTvf9_",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "deps/isocline",
         "src",
         // For example...
         //"LICENSE",

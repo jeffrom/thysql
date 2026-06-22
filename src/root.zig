@@ -546,9 +546,9 @@ fn readOneLine(
     if (maybeLine == null) {
         return true;
     }
-    defer Readline.freeLine(@ptrCast(@constCast(maybeLine)));
 
     const line = maybeLine.?;
+    defer Readline.freeLine(@ptrCast(@constCast(line.ptr)));
     if (line.len > 1) {
         Readline.removeLastHistory();
     }
