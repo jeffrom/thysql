@@ -154,6 +154,19 @@ pub const DB = struct {
         return @intCast(C.mysql_thread_id(self.conn));
     }
 
+    pub fn killRunningQuery(self: *DB) DBError!void {
+        const killer = connect(self.host, self.user, self.password, self.database, self.port) catch {
+            return error.ExecError;
+        };
+        defer C.mysql_close(killer);
+
+        var command_buffer: [64]u8 = undefined;
+        const command = std.fmt.bufPrint(&command_buffer, "KILL QUERY {}", .{self.connectionId()}) catch unreachable;
+        if (C.mysql_real_query(killer, command.ptr, command.len) != 0) {
+            return error.ExecError;
+        }
+    }
+
     pub fn serverName(self: *DB) []const u8 {
         const name = C.mysql_get_server_name(self.conn);
         return if (name == null) "" else std.mem.sliceTo(name, 0);

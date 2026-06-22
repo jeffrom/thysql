@@ -8,6 +8,9 @@ const Completion = @import("completion.zig");
 const Readline = @import("readline.zig");
 pub const Unicode = @import("unicode.zig");
 
+var sigint_requested = std.atomic.Value(bool).init(false);
+var query_executing = std.atomic.Value(bool).init(false);
+
 const CliError = error{
     MissingOptionValue,
     InvalidPort,
@@ -190,6 +193,70 @@ fn renderCliError(out: *std.Io.Writer, err: CliError) !void {
     }
 }
 
+fn handleSigint(_: std.posix.SIG) callconv(.c) void {
+    if (query_executing.load(.monotonic)) {
+        sigint_requested.store(true, .release);
+    }
+}
+
+const QueryInterruptWorker = struct {
+    db: *Mysql.DB,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+    old_sigint: std.posix.Sigaction = undefined,
+
+    fn start(self: *QueryInterruptWorker) !void {
+        self.running.store(true, .release);
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = handleSigint },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.INT, &action, &self.old_sigint);
+        errdefer {
+            self.running.store(false, .release);
+            std.posix.sigaction(.INT, &self.old_sigint, null);
+        }
+        self.thread = try std.Thread.spawn(.{}, QueryInterruptWorker.run, .{self});
+    }
+
+    fn stop(self: *QueryInterruptWorker) void {
+        self.running.store(false, .release);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        std.posix.sigaction(.INT, &self.old_sigint, null);
+    }
+
+    fn run(self: *QueryInterruptWorker) void {
+        while (self.running.load(.acquire)) {
+            if (sigint_requested.swap(false, .acq_rel) and query_executing.load(.acquire)) {
+                self.db.killRunningQuery() catch {};
+            }
+            pollSleep();
+        }
+    }
+
+    fn pollSleep() void {
+        const request: std.c.timespec = .{
+            .sec = 0,
+            .nsec = 10_000_000,
+        };
+        _ = std.c.nanosleep(&request, null);
+    }
+};
+
+fn beginInterruptibleQuery() void {
+    sigint_requested.store(false, .release);
+    query_executing.store(true, .release);
+}
+
+fn endInterruptibleQuery() void {
+    query_executing.store(false, .release);
+    sigint_requested.store(false, .release);
+}
+
 fn readHiddenLine(allocator: Allocator, io: std.Io, stderr: *std.Io.Writer, prompt: []const u8) ![]u8 {
     try stderr.print("{s}", .{prompt});
     try stderr.flush();
@@ -275,6 +342,9 @@ fn executeQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.
     }
 
     const start = std.Io.Clock.Timestamp.now(io, .awake);
+    beginInterruptibleQuery();
+    defer endInterruptibleQuery();
+
     var exec_result = db.exec(query.sql) catch |err| {
         switch (err) {
             Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
@@ -699,6 +769,10 @@ pub fn runREPL(
 
     try Readline.setup();
     try renderConnectionBanner(stdout, db.serverName(), db.connectionId(), db.serverVersion(), Mysql.clientInfo());
+
+    var interrupt_worker = QueryInterruptWorker{ .db = &db };
+    try interrupt_worker.start();
+    defer interrupt_worker.stop();
 
     var interactive_scanner: Batch.Scanner = .{};
     defer interactive_scanner.deinit(allocator);
