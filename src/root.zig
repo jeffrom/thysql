@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Mysql = @import("mysql.zig");
+const Batch = @import("batch.zig");
 const Readline = @import("readline.zig");
 pub const Unicode = @import("unicode.zig");
 
@@ -21,11 +22,6 @@ const CliOptions = struct {
     database: []const u8,
     port: u32,
     prompt_password: bool = false,
-};
-
-const QueryInput = struct {
-    sql: []const u8,
-    vertical: bool,
 };
 
 fn connectionPrompt(allocator: Allocator, user: []const u8, host: []const u8, port: u32, database: []const u8) ![:0]u8 {
@@ -224,21 +220,6 @@ fn readHiddenLine(allocator: Allocator, io: std.Io, stderr: *std.Io.Writer, prom
     return line.toOwnedSlice(allocator);
 }
 
-fn parseQueryInput(line: []const u8) QueryInput {
-    var sql = std.mem.trim(u8, line, " \t\r\n");
-    var vertical = false;
-
-    if (sql.len >= 2 and sql[sql.len - 2] == '\\' and sql[sql.len - 1] == 'G') {
-        vertical = true;
-        sql = std.mem.trim(u8, sql[0 .. sql.len - 2], " \t\r\n");
-    }
-
-    return .{
-        .sql = sql,
-        .vertical = vertical,
-    };
-}
-
 fn useDatabaseName(line: []const u8) ?[]const u8 {
     var remaining = std.mem.trim(u8, line, " \t\r\n");
     if (remaining.len == 0) {
@@ -264,25 +245,9 @@ fn useDatabaseName(line: []const u8) ?[]const u8 {
     return if (name.len == 0) null else name;
 }
 
-fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
-    const prompt = try connectionPrompt(db.allocator, db.user, db.host, db.port, db.database);
-    defer db.allocator.free(prompt);
-
-    const maybeLine = Readline.one(prompt);
-    if (maybeLine == null) {
-        return true;
-    }
-    defer Readline.freeLine(@ptrCast(@constCast(maybeLine)));
-
-    const line = maybeLine.?;
-    if (line.len == 0) {
-        return false;
-    }
-
-    const query = parseQueryInput(line);
-
+fn executeQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.Query, interactive: bool) !bool {
     if (query.sql.len == 0) {
-        return false;
+        return true;
     }
 
     if (useDatabaseName(query.sql)) |database| {
@@ -299,10 +264,12 @@ fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
             }
         };
 
-        try Readline.rebuildCompletions();
-        try stdout.print("Database changed\n", .{});
-        try stdout.flush();
-        return false;
+        if (interactive) {
+            try Readline.rebuildCompletions();
+            try stdout.print("Database changed\n", .{});
+            try stdout.flush();
+        }
+        return true;
     }
 
     const start = std.Io.Clock.Timestamp.now(io, .awake);
@@ -345,7 +312,30 @@ fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
     // const affected = C.mysql_affected_rows(self.conn);
     // std.debug.print("{d} row(s) affected\n", .{affected});
 
+    return true;
+}
+
+fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
+    const prompt = try connectionPrompt(db.allocator, db.user, db.host, db.port, db.database);
+    defer db.allocator.free(prompt);
+
+    const maybeLine = Readline.one(prompt);
+    if (maybeLine == null) {
+        return true;
+    }
+    defer Readline.freeLine(@ptrCast(@constCast(maybeLine)));
+
+    const line = maybeLine.?;
+    if (line.len == 0) {
+        return false;
+    }
+
+    _ = try executeQuery(db, io, stdout, Batch.parseQueryInput(line), true);
     return false;
+}
+
+fn executeBatchQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.Query) !bool {
+    return executeQuery(db, io, stdout, query, false);
 }
 
 pub fn runREPL(
@@ -371,9 +361,16 @@ pub fn runREPL(
         return 1;
     };
 
+    const stdin = std.Io.File.stdin();
+    const stdin_is_tty = try stdin.isTty(io);
+
     var prompted_password: ?[]u8 = null;
     defer if (prompted_password) |password| allocator.free(password);
     if (options.prompt_password) {
+        if (!stdin_is_tty) {
+            try stderr.print("Cannot prompt for a password while reading SQL from stdin; use MYSQL_PWD.\n", .{});
+            return 1;
+        }
         prompted_password = try readHiddenLine(allocator, io, stderr, "Enter password: ");
         options.password = prompted_password.?;
     }
@@ -386,6 +383,10 @@ pub fn runREPL(
         .port = options.port,
     });
     defer db.close();
+
+    if (!stdin_is_tty) {
+        return try Batch.run(db.allocator, io, stdin, stdout, stderr, &db, executeBatchQuery);
+    }
 
     try Readline.setup();
 
@@ -405,20 +406,6 @@ pub fn add(a: i32, b: i32) i32 {
 
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
-}
-
-test "parse vertical query terminator" {
-    var query = parseQueryInput("select 1\\G");
-    try std.testing.expectEqualStrings("select 1", query.sql);
-    try std.testing.expect(query.vertical);
-
-    query = parseQueryInput("  select 1  \\G  ");
-    try std.testing.expectEqualStrings("select 1", query.sql);
-    try std.testing.expect(query.vertical);
-
-    query = parseQueryInput("select 1;");
-    try std.testing.expectEqualStrings("select 1;", query.sql);
-    try std.testing.expect(!query.vertical);
 }
 
 test "detect USE database command" {
@@ -513,6 +500,7 @@ test "command-line password values are rejected" {
 
 test {
     _ = .{
+        @import("batch.zig"),
         @import("mysql.zig"),
         @import("unicode.zig"),
     };
