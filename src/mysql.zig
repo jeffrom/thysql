@@ -150,6 +150,20 @@ pub const DB = struct {
         return C.mysql_warning_count(self.conn);
     }
 
+    pub fn connectionId(self: *DB) u64 {
+        return @intCast(C.mysql_thread_id(self.conn));
+    }
+
+    pub fn serverName(self: *DB) []const u8 {
+        const name = C.mysql_get_server_name(self.conn);
+        return if (name == null) "" else std.mem.sliceTo(name, 0);
+    }
+
+    pub fn serverVersion(self: *DB) []const u8 {
+        const version = C.mysql_get_server_info(self.conn);
+        return if (version == null) "" else std.mem.sliceTo(version, 0);
+    }
+
     pub fn renderDatabaseCompletions(self: *DB, out: *std.Io.Writer, prefix: []const u8) DBError!void {
         const exec_result = try self.exec("SHOW DATABASES");
         switch (exec_result) {
@@ -217,6 +231,11 @@ pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
 
 pub fn affectedRows(ok: OKResult) ?u64 {
     return if (ok.affected_rows == C.MYSQL_COUNT_ERROR) null else ok.affected_rows;
+}
+
+pub fn clientInfo() []const u8 {
+    const info = C.mysql_get_client_info();
+    return if (info == null) "" else std.mem.sliceTo(info, 0);
 }
 
 pub fn render_ok(out: *std.Io.Writer, ok: OKResult) !void {

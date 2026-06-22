@@ -328,6 +328,25 @@ fn interactivePrompt(allocator: Allocator, db: *Mysql.DB, scanner: *const Batch.
     };
 }
 
+fn renderConnectionBanner(
+    stdout: *std.Io.Writer,
+    server_name: []const u8,
+    connection_id: u64,
+    server_version: []const u8,
+    client_info: []const u8,
+) !void {
+    const display_server_name = if (server_name.len == 0) "MySQL" else server_name;
+    try stdout.print(
+        \\Welcome to thysql.  Commands end with ; or \g.
+        \\Your {s} connection id is {}
+        \\Server version: {s}
+        \\Client library version: {s}
+        \\
+        \\
+    , .{ display_server_name, connection_id, server_version, client_info });
+    try stdout.flush();
+}
+
 fn appendHistoryChar(entry: *std.ArrayList(u8), allocator: Allocator, byte: u8, in_string: *u8, escaped: *bool) !void {
     switch (byte) {
         '\n' => try entry.append(allocator, if (in_string.* == 0) ' ' else '\n'),
@@ -679,6 +698,7 @@ pub fn runREPL(
     }
 
     try Readline.setup();
+    try renderConnectionBanner(stdout, db.serverName(), db.connectionId(), db.serverVersion(), Mysql.clientInfo());
 
     var interactive_scanner: Batch.Scanner = .{};
     defer interactive_scanner.deinit(allocator);
@@ -717,6 +737,23 @@ test "connection prompt shows connection and database" {
     const without_database = try connectionPrompt(std.testing.allocator, "", "localhost", 3306, "");
     defer std.testing.allocator.free(without_database);
     try std.testing.expectEqualStrings("localhost:3306/(none)> ", without_database);
+}
+
+test "connection banner shows connection and version details" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    defer buf = writer.toArrayList();
+
+    try renderConnectionBanner(&writer.writer, "MariaDB", 42, "12.3.2-MariaDB", "3.4.9");
+    try std.testing.expectEqualStrings(
+        \\Welcome to thysql.  Commands end with ; or \g.
+        \\Your MariaDB connection id is 42
+        \\Server version: 12.3.2-MariaDB
+        \\Client library version: 3.4.9
+        \\
+        \\
+    , writer.written());
 }
 
 test "history entry folds multiline query outside strings" {
