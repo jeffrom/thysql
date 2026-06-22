@@ -8,10 +8,10 @@ const maxTableColumnDisplayWidth: usize = 1024;
 const crServerGoneError: u32 = 2006;
 
 pub const DBInfo = struct {
-    host: [:0]const u8,
-    user: [:0]const u8,
-    password: [:0]const u8,
-    database: [:0]const u8,
+    host: []const u8,
+    user: []const u8,
+    password: []const u8,
+    database: []const u8,
     port: u32 = 3306,
 };
 
@@ -47,7 +47,7 @@ pub const DB = struct {
         const database = try allocator.dupeZ(u8, info.database);
         errdefer allocator.free(database);
 
-        const db = try connect(info.host, info.user, info.password, info.database, info.port);
+        const db = try connect(host, user, password, database, info.port);
 
         return .{
             .conn = db,

@@ -4,18 +4,23 @@ const thysql = @import("thysql");
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
-    // var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    // defer arena.deinit();
-
-    // const allocator = arena.allocator();
 
     var stdoutBuffer: [1024]u8 = undefined;
     var stdoutWriter = std.Io.File.stdout().writer(io, &stdoutBuffer);
     const stdout = &stdoutWriter.interface;
 
-    try thysql.runREPL(gpa, io, stdout);
+    var stderrBuffer: [1024]u8 = undefined;
+    var stderrWriter = std.Io.File.stderr().writer(io, &stderrBuffer);
+    const stderr = &stderrWriter.interface;
+
+    const status = try thysql.runREPL(gpa, io, stdout, stderr, init.minimal.args, init.environ_map);
 
     try stdout.flush();
+    try stderr.flush();
+
+    if (status != 0) {
+        std.process.exit(status);
+    }
 }
 
 test "simple test" {
