@@ -6,6 +6,12 @@ pub const Query = struct {
     vertical: bool,
 };
 
+pub const QueryResult = struct {
+    success: bool = true,
+    rows_affected: u64 = 0,
+    elapsed_ns: u64 = 0,
+};
+
 pub fn parseQueryInput(line: []const u8) Query {
     var sql = std.mem.trim(u8, line, " \t\r\n");
     var vertical = false;
@@ -146,38 +152,177 @@ fn stdinProgressTotal(stdin: std.Io.File, io: std.Io) ?u64 {
     return stat.size;
 }
 
-fn renderProgress(stderr: *std.Io.Writer, bytes_read: u64, total_bytes: ?u64, query_count: u64, final: bool) !void {
-    if (total_bytes) |total| {
-        const percent = @divTrunc(bytes_read * 100, total);
-        try stderr.print("\rProcessed {}/{} bytes ({}%), {} quer{s}", .{
-            bytes_read,
-            total,
-            percent,
-            query_count,
-            if (query_count == 1) "y" else "ies",
-        });
-    } else {
-        try stderr.print("\r{} quer{s}", .{
-            query_count,
-            if (query_count == 1) "y" else "ies",
-        });
+const Progress = struct {
+    total_bytes: ?u64,
+    last_width: usize = 0,
+
+    const bar_width = 30;
+
+    fn render(self: *Progress, stderr: *std.Io.Writer, bytes_read: u64, query_count: u64, final: bool) !void {
+        var line_buffer: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&line_buffer);
+
+        if (self.total_bytes) |total| {
+            const bounded_read = @min(bytes_read, total);
+            const percent: u8 = @intCast(@divTrunc(@as(u128, bounded_read) * 100, total));
+            const filled = @divTrunc(@as(usize, percent) * bar_width, 100);
+
+            try writer.print("[", .{});
+            for (0..bar_width) |i| {
+                const char: u8 = if (i < filled)
+                    '='
+                else if (i == filled and percent < 100)
+                    '>'
+                else
+                    '-';
+                try writer.print("{c}", .{char});
+            }
+            try writer.print("] {}% {} quer{s}", .{
+                percent,
+                query_count,
+                if (query_count == 1) "y" else "ies",
+            });
+        } else {
+            try writer.print("{} bytes, {} quer{s}", .{
+                bytes_read,
+                query_count,
+                if (query_count == 1) "y" else "ies",
+            });
+        }
+
+        const rendered = writer.buffered();
+        try stderr.print("\r{s}", .{rendered});
+        if (self.last_width > rendered.len) {
+            for (0..self.last_width - rendered.len) |_| {
+                try stderr.print(" ", .{});
+            }
+        }
+        if (final) {
+            try stderr.print("\n", .{});
+            self.last_width = 0;
+        } else {
+            self.last_width = rendered.len;
+        }
+        try stderr.flush();
     }
-    if (final) {
+};
+
+const Summary = struct {
+    query_count: u64 = 0,
+    rows_affected: u64 = 0,
+    timings: std.ArrayList(u64) = .empty,
+    started_at: std.Io.Clock.Timestamp,
+
+    const histogram_width = 30;
+
+    fn deinit(self: *Summary, allocator: Allocator) void {
+        self.timings.deinit(allocator);
+    }
+
+    fn record(self: *Summary, allocator: Allocator, result: QueryResult) !void {
+        self.query_count += 1;
+        self.rows_affected += result.rows_affected;
+        try self.timings.append(allocator, result.elapsed_ns);
+    }
+
+    fn render(self: *Summary, stderr: *std.Io.Writer, io: std.Io) !void {
+        const total_ns: u64 = @intCast(self.started_at.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
+        try stderr.print("Batch summary\n", .{});
+        try stderr.print("  Queries: {}\n", .{self.query_count});
+        try stderr.print("  Rows affected: {}\n", .{self.rows_affected});
+        try stderr.print("  Total time: ", .{});
+        try renderDuration(stderr, total_ns);
+        try stderr.print("\n", .{});
+
+        if (self.timings.items.len == 0) {
+            try stderr.flush();
+            return;
+        }
+
+        std.mem.sort(u64, self.timings.items, {}, comptime std.sort.asc(u64));
+
+        var sum: u128 = 0;
+        for (self.timings.items) |timing| {
+            sum += timing;
+        }
+
+        const average: u64 = @intCast(@divTrunc(sum, self.timings.items.len));
+        const p95 = percentile(self.timings.items, 95);
+        const p99 = percentile(self.timings.items, 99);
+        const max = self.timings.items[self.timings.items.len - 1];
+
+        try stderr.print("  Query timings:\n", .{});
+        try renderTimingBar(stderr, "avg", average, max);
+        try renderTimingBar(stderr, "p95", p95, max);
+        try renderTimingBar(stderr, "p99", p99, max);
+        try renderTimingBar(stderr, "max", max, max);
+        try stderr.flush();
+    }
+
+    fn percentile(sorted_timings: []const u64, comptime percentile_value: u64) u64 {
+        std.debug.assert(sorted_timings.len > 0);
+        const numerator = percentile_value * sorted_timings.len;
+        const index = @min(sorted_timings.len - 1, @divTrunc(numerator + 99, 100) - 1);
+        return sorted_timings[index];
+    }
+
+    fn renderTimingBar(stderr: *std.Io.Writer, label: []const u8, value: u64, max: u64) !void {
+        const filled = if (max == 0)
+            0
+        else
+            @max(@as(usize, 1), @min(histogram_width, @as(usize, @intCast(@divTrunc(@as(u128, value) * histogram_width, max)))));
+
+        try stderr.print("    {s: >3} [", .{label});
+        for (0..histogram_width) |i| {
+            const char: u8 = if (i < filled) '=' else ' ';
+            try stderr.print("{c}", .{char});
+        }
+        try stderr.print("] ", .{});
+        try renderDuration(stderr, value);
         try stderr.print("\n", .{});
     }
-    try stderr.flush();
-}
+
+    fn renderDuration(stderr: *std.Io.Writer, ns: u64) !void {
+        if (ns < std.time.ns_per_s) {
+            const rounded_us = @divTrunc(ns + 500, std.time.ns_per_us);
+            const millis = @divTrunc(rounded_us, 1000);
+            const micros = @rem(rounded_us, 1000);
+            try stderr.print("{}.", .{millis});
+            if (micros < 100) {
+                try stderr.print("0", .{});
+            }
+            if (micros < 10) {
+                try stderr.print("0", .{});
+            }
+            try stderr.print("{} ms", .{micros});
+            return;
+        }
+
+        const rounded_ms = @divTrunc(ns + std.time.ns_per_ms / 2, std.time.ns_per_ms);
+        const seconds = @divTrunc(rounded_ms, 1000);
+        const millis = @rem(rounded_ms, 1000);
+        try stderr.print("{}.", .{seconds});
+        if (millis < 100) {
+            try stderr.print("0", .{});
+        }
+        if (millis < 10) {
+            try stderr.print("0", .{});
+        }
+        try stderr.print("{} s", .{millis});
+    }
+};
 
 fn executeStatement(
+    allocator: Allocator,
     io: std.Io,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     scanner: *Scanner,
     bytes_read: u64,
-    total_bytes: ?u64,
-    query_count: *u64,
+    progress: *Progress,
+    summary: *Summary,
     context: anytype,
-    comptime execute: fn (@TypeOf(context), std.Io, *std.Io.Writer, Query) anyerror!bool,
+    comptime execute: fn (@TypeOf(context), std.Io, *std.Io.Writer, Query) anyerror!QueryResult,
 ) !bool {
     const query = scanner.pendingQuery();
     defer scanner.reset();
@@ -185,11 +330,12 @@ fn executeStatement(
         return true;
     }
 
-    if (!try execute(context, io, stdout, query)) {
+    const result = try execute(context, io, stdout, query);
+    if (!result.success) {
         return false;
     }
-    query_count.* += 1;
-    try renderProgress(stderr, bytes_read, total_bytes, query_count.*, false);
+    try summary.record(allocator, result);
+    try progress.render(stderr, bytes_read, summary.query_count, false);
     return true;
 }
 
@@ -200,9 +346,9 @@ pub fn run(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     context: anytype,
-    comptime execute: fn (@TypeOf(context), std.Io, *std.Io.Writer, Query) anyerror!bool,
+    comptime execute: fn (@TypeOf(context), std.Io, *std.Io.Writer, Query) anyerror!QueryResult,
 ) !u8 {
-    const total_bytes = stdinProgressTotal(stdin, io);
+    var progress = Progress{ .total_bytes = stdinProgressTotal(stdin, io) };
     var stdin_buffer: [8192]u8 = undefined;
     var stdin_reader = stdin.reader(io, &stdin_buffer);
     var read_buffer: [8192]u8 = undefined;
@@ -210,8 +356,9 @@ pub fn run(
     defer scanner.deinit(allocator);
 
     var bytes_read: u64 = 0;
-    var query_count: u64 = 0;
-    try renderProgress(stderr, bytes_read, total_bytes, query_count, false);
+    var summary = Summary{ .started_at = std.Io.Clock.Timestamp.now(io, .awake) };
+    defer summary.deinit(allocator);
+    try progress.render(stderr, bytes_read, summary.query_count, false);
 
     while (true) {
         const read = try stdin_reader.interface.readSliceShort(&read_buffer);
@@ -222,24 +369,27 @@ pub fn run(
         bytes_read += read;
         for (read_buffer[0..read]) |byte| {
             if (try scanner.feed(allocator, byte)) {
-                if (!try executeStatement(io, stdout, stderr, &scanner, bytes_read, total_bytes, &query_count, context, execute)) {
-                    try renderProgress(stderr, bytes_read, total_bytes, query_count, true);
+                if (!try executeStatement(allocator, io, stdout, stderr, &scanner, bytes_read, &progress, &summary, context, execute)) {
+                    try progress.render(stderr, bytes_read, summary.query_count, true);
+                    try summary.render(stderr, io);
                     return 1;
                 }
             }
         }
-        try renderProgress(stderr, bytes_read, total_bytes, query_count, false);
+        try progress.render(stderr, bytes_read, summary.query_count, false);
     }
 
     const trailing_query = scanner.pendingQuery();
     if (trailing_query.sql.len != 0) {
-        if (!try executeStatement(io, stdout, stderr, &scanner, bytes_read, total_bytes, &query_count, context, execute)) {
-            try renderProgress(stderr, bytes_read, total_bytes, query_count, true);
+        if (!try executeStatement(allocator, io, stdout, stderr, &scanner, bytes_read, &progress, &summary, context, execute)) {
+            try progress.render(stderr, bytes_read, summary.query_count, true);
+            try summary.render(stderr, io);
             return 1;
         }
     }
 
-    try renderProgress(stderr, bytes_read, total_bytes, query_count, true);
+    try progress.render(stderr, bytes_read, summary.query_count, true);
+    try summary.render(stderr, io);
     return 0;
 }
 

@@ -193,6 +193,10 @@ pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
     C.mysql_free_result(result);
 }
 
+pub fn affectedRows(ok: OKResult) ?u64 {
+    return if (ok.affected_rows == C.MYSQL_COUNT_ERROR) null else ok.affected_rows;
+}
+
 pub fn render_ok(out: *std.Io.Writer, ok: OKResult) !void {
     try render_ok_status(out, ok);
     try out.print("\n", .{});

@@ -334,8 +334,75 @@ fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
     return false;
 }
 
-fn executeBatchQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.Query) !bool {
-    return executeQuery(db, io, stdout, query, false);
+fn executeBatchQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.Query) !Batch.QueryResult {
+    if (query.sql.len == 0) {
+        return .{};
+    }
+
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+
+    if (useDatabaseName(query.sql)) |database| {
+        const database_z = try db.allocator.dupeZ(u8, database);
+        defer db.allocator.free(database_z);
+
+        db.selectDatabase(database_z) catch |err| {
+            switch (err) {
+                Mysql.DBError.ExecError => {
+                    try db.renderLastError(stdout);
+                    return .{ .success = false };
+                },
+                else => return err,
+            }
+        };
+
+        return .{
+            .elapsed_ns = @intCast(start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds),
+        };
+    }
+
+    var rows_affected: u64 = 0;
+    var exec_result = db.exec(query.sql) catch |err| {
+        switch (err) {
+            Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
+                try db.renderLastError(stdout);
+                return .{ .success = false };
+            },
+            else => return err,
+        }
+    };
+
+    while (true) {
+        switch (exec_result) {
+            .result => |result| {
+                defer Mysql.freeResult(result);
+                if (query.vertical) {
+                    try Mysql.render_result_vertical(stdout, result);
+                } else {
+                    try Mysql.render_result(stdout, result);
+                }
+            },
+            .ok => |ok| {
+                if (Mysql.affectedRows(ok)) |affected| {
+                    rows_affected += affected;
+                }
+            },
+        }
+
+        exec_result = (db.nextResult() catch |err| {
+            switch (err) {
+                Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
+                    try db.renderLastError(stdout);
+                    return .{ .success = false };
+                },
+                else => return err,
+            }
+        }) orelse break;
+    }
+
+    return .{
+        .rows_affected = rows_affected,
+        .elapsed_ns = @intCast(start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds),
+    };
 }
 
 pub fn runREPL(
