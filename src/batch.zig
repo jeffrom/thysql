@@ -81,6 +81,11 @@ pub const Scanner = struct {
                 return self.feedNormal(allocator, byte);
             },
             .maybe_command => {
+                if (byte == 'c') {
+                    _ = self.buffer.pop();
+                    self.reset();
+                    return false;
+                }
                 if (byte == 'G') {
                     try self.buffer.append(allocator, byte);
                     self.state = .normal;
@@ -591,6 +596,44 @@ test "scanner splits slash command terminators outside strings" {
         }
     }
     try std.testing.expect(saw_regular);
+}
+
+test "scanner clears pending input with slash clear command" {
+    var scanner: Scanner = .{};
+    defer scanner.deinit(std.testing.allocator);
+
+    for ("select 1\\c") |byte| {
+        _ = try scanner.feed(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqualStrings("", scanner.buffer.items);
+    try std.testing.expectEqual(Scanner.PromptKind.main, scanner.promptKind());
+
+    var saw_query = false;
+    for ("select 2;") |byte| {
+        if (try scanner.feed(std.testing.allocator, byte)) {
+            saw_query = true;
+            const query = scanner.pendingQuery();
+            try std.testing.expectEqualStrings("select 2", query.sql);
+            scanner.reset();
+        }
+    }
+    try std.testing.expect(saw_query);
+}
+
+test "scanner keeps slash clear command inside strings" {
+    var scanner: Scanner = .{};
+    defer scanner.deinit(std.testing.allocator);
+
+    var saw_query = false;
+    for ("select '\\c';") |byte| {
+        if (try scanner.feed(std.testing.allocator, byte)) {
+            saw_query = true;
+            const query = scanner.pendingQuery();
+            try std.testing.expectEqualStrings("select '\\c'", query.sql);
+            scanner.reset();
+        }
+    }
+    try std.testing.expect(saw_query);
 }
 
 test "scanner reports interactive prompt state" {

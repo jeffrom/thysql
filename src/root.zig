@@ -389,6 +389,13 @@ fn isEditCommand(line: []const u8) bool {
         std.ascii.eqlIgnoreCase(trimmed, "edit;");
 }
 
+fn isClearCommand(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    return std.mem.eql(u8, trimmed, "\\c") or
+        std.ascii.eqlIgnoreCase(trimmed, "clear") or
+        std.ascii.eqlIgnoreCase(trimmed, "clear;");
+}
+
 fn tempSqlPath(allocator: Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]u8 {
     const tmp_dir = envValue(env, "TMPDIR") orelse "/tmp";
     const timestamp = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
@@ -525,6 +532,10 @@ fn readOneLine(
     const line = maybeLine.?;
     if (line.len > 1) {
         Readline.removeLastHistory();
+    }
+    if (isClearCommand(line)) {
+        scanner.reset();
+        return false;
     }
     if (isEditCommand(line)) {
         const edited = try openEditorForQuery(db.allocator, io, stderr, env, scanner.buffer.items);
@@ -734,6 +745,14 @@ test "detect edit client command" {
     try std.testing.expect(isEditCommand("edit;"));
     try std.testing.expect(!isEditCommand("select '\\e';"));
     try std.testing.expect(!isEditCommand("edited"));
+}
+
+test "detect clear client command" {
+    try std.testing.expect(isClearCommand("\\c"));
+    try std.testing.expect(isClearCommand(" clear "));
+    try std.testing.expect(isClearCommand("clear;"));
+    try std.testing.expect(!isClearCommand("select '\\c';"));
+    try std.testing.expect(!isClearCommand("cleared"));
 }
 
 test "editor command falls back past empty environment values" {
