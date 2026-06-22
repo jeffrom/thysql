@@ -181,6 +181,85 @@ pub const Scanner = struct {
         self.escaped = false;
         self.block_comment_star = false;
     }
+
+    pub fn replacePending(self: *Scanner, allocator: Allocator, input: []const u8) !void {
+        self.reset();
+        try self.buffer.appendSlice(allocator, input);
+        self.state = .normal;
+        self.escaped = false;
+        self.block_comment_star = false;
+        for (input) |byte| {
+            self.scanPromptState(byte);
+        }
+    }
+
+    fn scanPromptState(self: *Scanner, byte: u8) void {
+        switch (self.state) {
+            .normal => switch (byte) {
+                '\'' => {
+                    self.state = .single_quote;
+                    self.escaped = false;
+                },
+                '"' => {
+                    self.state = .double_quote;
+                    self.escaped = false;
+                },
+                '`' => self.state = .backtick,
+                '-' => self.state = .maybe_dash_comment,
+                '/' => self.state = .maybe_block_comment,
+                else => {},
+            },
+            .maybe_dash_comment => {
+                if (byte == '-') {
+                    self.state = .line_comment;
+                } else {
+                    self.state = .normal;
+                    self.scanPromptState(byte);
+                }
+            },
+            .maybe_block_comment => {
+                if (byte == '*') {
+                    self.state = .block_comment;
+                    self.block_comment_star = false;
+                } else {
+                    self.state = .normal;
+                    self.scanPromptState(byte);
+                }
+            },
+            .maybe_command => self.state = .normal,
+            .single_quote, .double_quote => {
+                if (self.escaped) {
+                    self.escaped = false;
+                    return;
+                }
+                if (byte == '\\') {
+                    self.escaped = true;
+                } else if ((self.state == .single_quote and byte == '\'') or
+                    (self.state == .double_quote and byte == '"'))
+                {
+                    self.state = .normal;
+                }
+            },
+            .backtick => {
+                if (byte == '`') {
+                    self.state = .normal;
+                }
+            },
+            .line_comment => {
+                if (byte == '\n') {
+                    self.state = .normal;
+                }
+            },
+            .block_comment => {
+                if (self.block_comment_star and byte == '/') {
+                    self.state = .normal;
+                    self.block_comment_star = false;
+                } else {
+                    self.block_comment_star = byte == '*';
+                }
+            },
+        }
+    }
 };
 
 fn stdinProgressTotal(stdin: std.Io.File, io: std.Io) ?u64 {
@@ -548,4 +627,21 @@ test "scanner reports interactive prompt state" {
         _ = try scanner.feed(std.testing.allocator, byte);
     }
     try std.testing.expectEqual(Scanner.PromptKind.block_comment, scanner.promptKind());
+}
+
+test "scanner replaces pending editor buffer and recomputes prompt state" {
+    var scanner: Scanner = .{};
+    defer scanner.deinit(std.testing.allocator);
+
+    try scanner.replacePending(std.testing.allocator, "select 'unterminated");
+    try std.testing.expectEqualStrings("select 'unterminated", scanner.buffer.items);
+    try std.testing.expectEqual(Scanner.PromptKind.single_quote, scanner.promptKind());
+
+    try scanner.replacePending(std.testing.allocator, "select /* comment");
+    try std.testing.expectEqualStrings("select /* comment", scanner.buffer.items);
+    try std.testing.expectEqual(Scanner.PromptKind.block_comment, scanner.promptKind());
+
+    try scanner.replacePending(std.testing.allocator, "select 1;");
+    try std.testing.expectEqualStrings("select 1;", scanner.buffer.items);
+    try std.testing.expectEqual(Scanner.PromptKind.continuation, scanner.promptKind());
 }

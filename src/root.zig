@@ -382,7 +382,137 @@ fn addQueryToHistory(allocator: Allocator, query: Batch.Query) !void {
     Readline.addHistory(entry);
 }
 
-fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, scanner: *Batch.Scanner) !bool {
+fn isEditCommand(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    return std.mem.eql(u8, trimmed, "\\e") or
+        std.ascii.eqlIgnoreCase(trimmed, "edit") or
+        std.ascii.eqlIgnoreCase(trimmed, "edit;");
+}
+
+fn tempSqlPath(allocator: Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]u8 {
+    const tmp_dir = envValue(env, "TMPDIR") orelse "/tmp";
+    const timestamp = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+    const filename = try std.fmt.allocPrint(allocator, "thysql-{}-{}.sql", .{ std.c.getpid(), timestamp });
+    defer allocator.free(filename);
+    return try std.fs.path.join(allocator, &.{ tmp_dir, filename });
+}
+
+fn appendEditorArgv(allocator: Allocator, argv: *std.ArrayList([]const u8), editor: []const u8, path: []const u8) !void {
+    var parts = std.mem.tokenizeAny(u8, editor, " \t\r\n");
+    while (parts.next()) |part| {
+        try argv.append(allocator, part);
+    }
+    try argv.append(allocator, path);
+}
+
+fn editorCommand(env: *const std.process.Environ.Map) []const u8 {
+    if (envValue(env, "EDITOR")) |editor| {
+        if (std.mem.trim(u8, editor, " \t\r\n").len != 0) {
+            return editor;
+        }
+    }
+    if (envValue(env, "VISUAL")) |visual| {
+        if (std.mem.trim(u8, visual, " \t\r\n").len != 0) {
+            return visual;
+        }
+    }
+    return "vi";
+}
+
+fn trimRightBytes(input: []const u8, values: []const u8) []const u8 {
+    var end = input.len;
+    while (end > 0 and std.mem.indexOfScalar(u8, values, input[end - 1]) != null) {
+        end -= 1;
+    }
+    return input[0..end];
+}
+
+fn openEditorForQuery(
+    allocator: Allocator,
+    io: std.Io,
+    stderr: *std.Io.Writer,
+    env: *const std.process.Environ.Map,
+    query: []const u8,
+) !?[]u8 {
+    const editor = editorCommand(env);
+    const path = try tempSqlPath(allocator, io, env);
+    defer allocator.free(path);
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    try std.Io.Dir.writeFile(.cwd(), io, .{
+        .sub_path = path,
+        .data = query,
+        .flags = .{ .exclusive = true },
+    });
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try appendEditorArgv(allocator, &argv, editor, path);
+
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
+        try stderr.print("Editor command failed: {s}: {}\n", .{ editor, err });
+        return null;
+    };
+
+    const term = child.wait(io) catch |err| {
+        try stderr.print("Editor command failed: {s}: {}\n", .{ editor, err });
+        return null;
+    };
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            try stderr.print("Editor command exited with status {}: {s}\n", .{ code, editor });
+            return null;
+        },
+        .signal => |signal| {
+            try stderr.print("Editor command terminated by signal {}: {s}\n", .{ signal, editor });
+            return null;
+        },
+        .stopped => |signal| {
+            try stderr.print("Editor command stopped by signal {}: {s}\n", .{ signal, editor });
+            return null;
+        },
+        .unknown => |status| {
+            try stderr.print("Editor command failed with status {}: {s}\n", .{ status, editor });
+            return null;
+        },
+    }
+
+    return try std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .limited(16 * 1024 * 1024));
+}
+
+fn feedInteractiveInput(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, scanner: *Batch.Scanner, input: []const u8, append_newline_if_pending: bool) !void {
+    var completed_statement = false;
+    for (input) |byte| {
+        if (try scanner.feed(db.allocator, byte)) {
+            completed_statement = true;
+            const query = scanner.pendingQuery();
+            try addQueryToHistory(db.allocator, query);
+            _ = try executeQuery(db, io, stdout, query, true);
+            scanner.reset();
+        }
+    }
+
+    if (append_newline_if_pending and (!completed_statement or scanner.pendingQuery().sql.len != 0)) {
+        _ = try scanner.feed(db.allocator, '\n');
+    }
+    if (scanner.pendingQuery().sql.len == 0) {
+        scanner.reset();
+    }
+}
+
+fn readOneLine(
+    db: *Mysql.DB,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    env: *const std.process.Environ.Map,
+    scanner: *Batch.Scanner,
+) !bool {
     const prompt = try interactivePrompt(db.allocator, db, scanner);
     defer db.allocator.free(prompt);
 
@@ -396,24 +526,19 @@ fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, scanner: *Batc
     if (line.len > 1) {
         Readline.removeLastHistory();
     }
+    if (isEditCommand(line)) {
+        const edited = try openEditorForQuery(db.allocator, io, stderr, env, scanner.buffer.items);
+        if (edited) |contents| {
+            defer db.allocator.free(contents);
+            try scanner.replacePending(db.allocator, trimRightBytes(contents, "\r\n"));
+        }
+        return false;
+    }
     if (line.len == 0 and scanner.pendingQuery().sql.len == 0) {
         return false;
     }
 
-    var completed_statement = false;
-    for (line) |byte| {
-        if (try scanner.feed(db.allocator, byte)) {
-            completed_statement = true;
-            const query = scanner.pendingQuery();
-            try addQueryToHistory(db.allocator, query);
-            _ = try executeQuery(db, io, stdout, query, true);
-            scanner.reset();
-        }
-    }
-
-    if (!completed_statement or scanner.pendingQuery().sql.len != 0) {
-        _ = try scanner.feed(db.allocator, '\n');
-    }
+    try feedInteractiveInput(db, io, stdout, scanner, line, true);
     return false;
 }
 
@@ -547,7 +672,7 @@ pub fn runREPL(
     var interactive_scanner: Batch.Scanner = .{};
     defer interactive_scanner.deinit(allocator);
     while (true) {
-        const done = try readOneLine(&db, io, stdout, &interactive_scanner);
+        const done = try readOneLine(&db, io, stdout, stderr, env, &interactive_scanner);
         if (done) {
             break;
         }
@@ -601,6 +726,31 @@ test "history entry keeps vertical terminator" {
     defer std.testing.allocator.free(entry);
 
     try std.testing.expectEqualStrings("select 1\\G", entry);
+}
+
+test "detect edit client command" {
+    try std.testing.expect(isEditCommand("\\e"));
+    try std.testing.expect(isEditCommand(" edit "));
+    try std.testing.expect(isEditCommand("edit;"));
+    try std.testing.expect(!isEditCommand("select '\\e';"));
+    try std.testing.expect(!isEditCommand("edited"));
+}
+
+test "editor command falls back past empty environment values" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    try std.testing.expectEqualStrings("vi", editorCommand(&env));
+    try env.put("EDITOR", "");
+    try env.put("VISUAL", "code -w");
+    try std.testing.expectEqualStrings("code -w", editorCommand(&env));
+    try env.put("EDITOR", "vim -f");
+    try std.testing.expectEqualStrings("vim -f", editorCommand(&env));
+}
+
+test "trim right bytes keeps leading whitespace" {
+    try std.testing.expectEqualStrings("  select 1", trimRightBytes("  select 1\r\n", "\r\n"));
+    try std.testing.expectEqualStrings("  \nselect 1", trimRightBytes("  \nselect 1", "\r\n"));
 }
 
 test "connection options default from environment" {
