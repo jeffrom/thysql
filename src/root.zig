@@ -28,6 +28,14 @@ const QueryInput = struct {
     vertical: bool,
 };
 
+fn connectionPrompt(allocator: Allocator, user: []const u8, host: []const u8, port: u32, database: []const u8) ![:0]u8 {
+    const db_name = if (database.len == 0) "(none)" else database;
+    if (user.len == 0) {
+        return try std.fmt.allocPrintSentinel(allocator, "{s}:{}/{s}", .{ host, port, db_name }, 0);
+    }
+    return try std.fmt.allocPrintSentinel(allocator, "{s}@{s}:{}/{s}", .{ user, host, port, db_name }, 0);
+}
+
 fn envValue(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
     return env.get(name);
 }
@@ -257,7 +265,10 @@ fn useDatabaseName(line: []const u8) ?[]const u8 {
 }
 
 fn readOneLine(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer) !bool {
-    const maybeLine = Readline.one("mysql");
+    const prompt = try connectionPrompt(db.allocator, db.user, db.host, db.port, db.database);
+    defer db.allocator.free(prompt);
+
+    const maybeLine = Readline.one(prompt);
     if (maybeLine == null) {
         return true;
     }
@@ -417,6 +428,16 @@ test "detect USE database command" {
     try std.testing.expectEqualStrings("my-db", useDatabaseName("use `my-db`;").?);
     try std.testing.expect(useDatabaseName("user test") == null);
     try std.testing.expect(useDatabaseName("select 1") == null);
+}
+
+test "connection prompt shows connection and database" {
+    const with_database = try connectionPrompt(std.testing.allocator, "root", "db.example", 3307, "app");
+    defer std.testing.allocator.free(with_database);
+    try std.testing.expectEqualStrings("root@db.example:3307/app", with_database);
+
+    const without_database = try connectionPrompt(std.testing.allocator, "", "localhost", 3306, "");
+    defer std.testing.allocator.free(without_database);
+    try std.testing.expectEqualStrings("localhost:3306/(none)", without_database);
 }
 
 test "connection options default from environment" {

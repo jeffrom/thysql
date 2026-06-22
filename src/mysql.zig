@@ -407,6 +407,7 @@ pub fn render_result_vertical_timed_with_warnings(out: *std.Io.Writer, result: [
     }
 
     try render_result_vertical(out, result);
+    try out.print("\n", .{});
     try render_result_footer(out, result, elapsed_ns, warnings);
 }
 
@@ -1060,6 +1061,7 @@ test "render SELECT 1 AS one, 'two' AS two vertically with timed footer" {
         \\*************************** 1. row ***************************
         \\one: 1
         \\two: two
+        \\
         \\1 row in set (0.002 sec)
         \\
         \\
@@ -1082,6 +1084,7 @@ test "render vertical result with timed footer and warnings" {
         \\*************************** 1. row ***************************
         \\one: 1
         \\two: two
+        \\
         \\1 row in set, 2 warnings (0.002 sec)
         \\
         \\

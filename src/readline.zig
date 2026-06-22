@@ -6,7 +6,7 @@ pub fn freeLine(ptr: ?*anyopaque) void {
     isocline.freeMemory(ptr);
 }
 
-pub fn one(prompt: ?[]const u8) ?[:0]const u8 {
+pub fn one(prompt: ?[:0]const u8) ?[:0]const u8 {
     return isocline.readline(prompt);
 }
 
