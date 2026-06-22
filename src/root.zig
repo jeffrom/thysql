@@ -471,6 +471,25 @@ fn addQueryToHistory(allocator: Allocator, query: Batch.Query) !void {
     Readline.addHistory(entry);
 }
 
+fn rememberLastQuery(allocator: Allocator, last_query: *std.ArrayList(u8), query: Batch.Query) !void {
+    if (query.sql.len == 0) {
+        return;
+    }
+
+    last_query.clearRetainingCapacity();
+    try last_query.appendSlice(allocator, query.sql);
+    if (query.vertical) {
+        try last_query.appendSlice(allocator, "\\G");
+    }
+}
+
+fn editorInitialQuery(scanner: *const Batch.Scanner, last_query: *const std.ArrayList(u8)) []const u8 {
+    return if (scanner.buffer.items.len == 0 and last_query.items.len != 0)
+        last_query.items
+    else
+        scanner.buffer.items;
+}
+
 fn isEditCommand(line: []const u8) bool {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     return std.mem.eql(u8, trimmed, "\\e") or
@@ -581,12 +600,21 @@ fn openEditorForQuery(
     return try std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .limited(16 * 1024 * 1024));
 }
 
-fn feedInteractiveInput(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, scanner: *Batch.Scanner, input: []const u8, append_newline_if_pending: bool) !void {
+fn feedInteractiveInput(
+    db: *Mysql.DB,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    scanner: *Batch.Scanner,
+    last_query: *std.ArrayList(u8),
+    input: []const u8,
+    append_newline_if_pending: bool,
+) !void {
     var completed_statement = false;
     for (input) |byte| {
         if (try scanner.feed(db.allocator, byte)) {
             completed_statement = true;
             const query = scanner.pendingQuery();
+            try rememberLastQuery(db.allocator, last_query, query);
             try addQueryToHistory(db.allocator, query);
             _ = try executeQuery(db, io, stdout, query, true);
             scanner.reset();
@@ -608,6 +636,7 @@ fn readOneLine(
     stderr: *std.Io.Writer,
     env: *const std.process.Environ.Map,
     scanner: *Batch.Scanner,
+    last_query: *std.ArrayList(u8),
 ) !bool {
     const prompt = try interactivePrompt(db.allocator, db, scanner);
     defer db.allocator.free(prompt);
@@ -627,7 +656,7 @@ fn readOneLine(
         return false;
     }
     if (isEditCommand(line)) {
-        const edited = try openEditorForQuery(db.allocator, io, stderr, env, scanner.buffer.items);
+        const edited = try openEditorForQuery(db.allocator, io, stderr, env, editorInitialQuery(scanner, last_query));
         if (edited) |contents| {
             defer db.allocator.free(contents);
             try scanner.replacePending(db.allocator, trimRightBytes(contents, "\r\n"));
@@ -638,7 +667,7 @@ fn readOneLine(
         return false;
     }
 
-    try feedInteractiveInput(db, io, stdout, scanner, line, true);
+    try feedInteractiveInput(db, io, stdout, scanner, last_query, line, true);
     return false;
 }
 
@@ -776,8 +805,10 @@ pub fn runREPL(
 
     var interactive_scanner: Batch.Scanner = .{};
     defer interactive_scanner.deinit(allocator);
+    var last_query: std.ArrayList(u8) = .empty;
+    defer last_query.deinit(allocator);
     while (true) {
-        const done = try readOneLine(&db, io, stdout, stderr, env, &interactive_scanner);
+        const done = try readOneLine(&db, io, stdout, stderr, env, &interactive_scanner, &last_query);
         if (done) {
             break;
         }
@@ -848,6 +879,20 @@ test "history entry keeps vertical terminator" {
     defer std.testing.allocator.free(entry);
 
     try std.testing.expectEqualStrings("select 1\\G", entry);
+}
+
+test "editor initial query prefers pending input over last query" {
+    var scanner: Batch.Scanner = .{};
+    defer scanner.deinit(std.testing.allocator);
+
+    var last_query: std.ArrayList(u8) = .empty;
+    defer last_query.deinit(std.testing.allocator);
+    try last_query.appendSlice(std.testing.allocator, "select 1");
+
+    try std.testing.expectEqualStrings("select 1", editorInitialQuery(&scanner, &last_query));
+
+    try scanner.replacePending(std.testing.allocator, "select 2");
+    try std.testing.expectEqualStrings("select 2", editorInitialQuery(&scanner, &last_query));
 }
 
 test "detect edit client command" {
