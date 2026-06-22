@@ -150,6 +150,28 @@ pub const DB = struct {
         return C.mysql_warning_count(self.conn);
     }
 
+    pub fn renderDatabaseCompletions(self: *DB, out: *std.Io.Writer, prefix: []const u8) DBError!void {
+        const exec_result = try self.exec("SHOW DATABASES");
+        switch (exec_result) {
+            .result => |result| {
+                defer freeResult(result);
+                while (C.mysql_fetch_row(result)) |row| {
+                    if (row == null) {
+                        break;
+                    }
+
+                    const lengths = C.mysql_fetch_lengths(result);
+                    const database = row[0][0..lengths[0]];
+                    if (std.mem.startsWith(u8, database, prefix)) {
+                        out.print("{s}\n", .{database}) catch return error.ExecError;
+                    }
+                }
+            },
+            .ok => {},
+        }
+        out.flush() catch return error.ExecError;
+    }
+
     fn reconnect(self: *DB) DBError!void {
         const db = connect(self.host, self.user, self.password, self.database, self.port) catch {
             return error.ExecError;

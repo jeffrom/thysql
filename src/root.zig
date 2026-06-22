@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 
 const Mysql = @import("mysql.zig");
 const Batch = @import("batch.zig");
+const Completion = @import("completion.zig");
 const Readline = @import("readline.zig");
 pub const Unicode = @import("unicode.zig");
 
@@ -165,6 +166,7 @@ fn parseConnectionOptions(args: []const []const u8, env: *const std.process.Envi
 fn renderUsage(out: *std.Io.Writer) !void {
     try out.print(
         \\Usage: thysql [OPTIONS] [database]
+        \\       thysql complete [OPTIONS] -D[prefix]
         \\
         \\Connection options:
         \\  -h, --host=name       Connect to host. Defaults to $MARIADB_HOST, $MYSQL_HOST, then localhost.
@@ -422,6 +424,10 @@ pub fn runREPL(
         try args.append(allocator, arg);
     }
 
+    if (args.items.len > 1 and std.mem.eql(u8, args.items[1], "complete")) {
+        return try Completion.run(allocator, stdout, stderr, args.items, env, parseConnectionOptions, renderCliError);
+    }
+
     var options = parseConnectionOptions(args.items, env) catch |err| {
         try renderCliError(stderr, err);
         try renderUsage(stderr);
@@ -568,6 +574,7 @@ test "command-line password values are rejected" {
 test {
     _ = .{
         @import("batch.zig"),
+        @import("completion.zig"),
         @import("mysql.zig"),
         @import("unicode.zig"),
     };
