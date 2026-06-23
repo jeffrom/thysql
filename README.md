@@ -47,3 +47,9 @@ MYSQL_PWD=foo zig build run -- -h 127.0.0.1 -uroot hi
 select concat('line1', char(10), 'line2') as text_value, cast(unhex('0001FF') as binary) as binary_value;
 select concat('safe ', '東京', char(9), 'end') as mixed;
 ```
+
+```sh
+docker build --target build -t thysql-build .
+docker build -t thysql-release .
+docker run --rm --entrypoint ldd thysql-release /usr/local/bin/thysql
+```
