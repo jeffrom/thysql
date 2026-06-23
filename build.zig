@@ -227,12 +227,27 @@ fn linkMariaDbSystemLibraries(module: *std.Build.Module, target: std.Build.Resol
     }
     module.linkSystemLibrary("ssl", .{});
     module.linkSystemLibrary("crypto", .{});
+    module.linkSystemLibrary("zstd", .{});
 
     switch (target.result.os.tag) {
-        .linux, .freebsd, .openbsd, .netbsd, .dragonfly => {
+        .macos => {
+            module.linkSystemLibrary("krb5", .{});
+        },
+        .linux => {
             module.linkSystemLibrary("m", .{});
             module.linkSystemLibrary("pthread", .{});
             module.linkSystemLibrary("dl", .{});
+            module.linkSystemLibrary("gssapi_krb5", .{});
+            module.linkSystemLibrary("krb5", .{});
+        },
+        .freebsd, .openbsd, .netbsd, .dragonfly => {
+            module.linkSystemLibrary("m", .{});
+            module.linkSystemLibrary("pthread", .{});
+            module.linkSystemLibrary("dl", .{});
+            module.linkSystemLibrary("krb5", .{});
+        },
+        .windows => {
+            module.linkSystemLibrary("secur32", .{});
         },
         else => {},
     }

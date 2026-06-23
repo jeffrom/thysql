@@ -19,7 +19,13 @@ cmake -S "$source_dir" -B "$build_dir" \
   -DWITH_SSL=OPENSSL \
   -DWITH_EXTERNAL_ZLIB=OFF \
   -DPLUGIN_CACHING_SHA2_PASSWORD=STATIC \
-  -DPLUGIN_SHA256_PASSWORD=STATIC
+  -DPLUGIN_SHA256_PASSWORD=STATIC \
+  -DPLUGIN_DIALOG=STATIC \
+  -DPLUGIN_CLIENT_ED25519=STATIC \
+  -DPLUGIN_PARSEC=STATIC \
+  -DPLUGIN_AUTH_GSSAPI_CLIENT=STATIC \
+  -DPLUGIN_MYSQL_CLEAR_PASSWORD=STATIC \
+  -DPLUGIN_ZSTD=STATIC
 
 cmake --build "$build_dir" --target mariadbclient
 ln -sf libmariadbclient.a "$build_dir/libmariadb/libmysqlclient.a"

@@ -11,6 +11,8 @@ Also needed:
 
 - CMake
 - OpenSSL headers/libs
+- zstd headers/libs
+- GSSAPI/Kerberos headers/libs
 - Git submodules initialized
 
 On macOS with Homebrew OpenSSL, the default build looks in `/opt/homebrew/lib`.
@@ -26,8 +28,10 @@ zig build test
 
 The build compiles MariaDB Connector/C from `deps/mariadb-connector-c` and links
 its static `libmysqlclient.a` into `thysql`. MySQL 8 auth plugins
-`caching_sha2_password` and `sha256_password` are built into the static client,
-so no MariaDB plugin directory is required at runtime.
+`caching_sha2_password` and `sha256_password`, plus `dialog`,
+`client_ed25519`, `parsec`, `auth_gssapi_client`, `mysql_clear_password`, and
+`zstd` are built into the static client, so no MariaDB plugin directory is
+required at runtime for those plugins.
 
 Run the app:
 

@@ -14,7 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     curl \
     git \
+    libkrb5-dev \
     libssl-dev \
+    libzstd-dev \
     make \
     xz-utils \
   && rm -rf /var/lib/apt/lists/*
@@ -42,7 +44,10 @@ FROM ubuntu:${UBUNTU_VERSION} AS release
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libgssapi-krb5-2 \
+    libkrb5-3 \
     libssl3 \
+    libzstd1 \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/zig-out/bin/thysql /usr/local/bin/thysql
