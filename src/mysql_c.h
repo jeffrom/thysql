@@ -1,1 +1,1 @@
-#include <mysql/mysql.h>
+#include <mysql.h>

@@ -16,11 +16,15 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
-    const mysql_include_dir = b.option(
+    const openssl_lib_dir = b.option(
         []const u8,
-        "mysql-include-dir",
-        "Directory containing mysql/mysql.h",
-    ) orelse "/opt/homebrew/opt/mariadb/include";
+        "openssl-lib-dir",
+        "Directory containing OpenSSL libraries used by the static MariaDB client",
+    ) orelse switch (target.result.os.tag) {
+        .macos => @as(?[]const u8, "/opt/homebrew/lib"),
+        else => @as(?[]const u8, null),
+    };
+    const mariadb = addMariaDbConnectorC(b);
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -66,7 +70,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    mysql_c_translate.addSystemIncludePath(.{ .cwd_relative = mysql_include_dir });
+    mysql_c_translate.addIncludePath(mariadb.generated_include_dir);
+    mysql_c_translate.addIncludePath(b.path("deps/mariadb-connector-c/include"));
     const mysql_c = mysql_c_translate.createModule();
 
     const isocline_c_translate = b.addTranslateC(.{
@@ -82,8 +87,8 @@ pub fn build(b: *std.Build) void {
 
     mod.link_libc = true;
     mod.linkLibrary(isocline_artifact);
-
-    mod.linkSystemLibrary("mysqlclient", .{});
+    mod.addObjectFile(mariadb.static_library);
+    linkMariaDbSystemLibraries(mod, target, openssl_lib_dir);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -165,8 +170,6 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
-    // mod_tests.root_module.addIncludePath(b.path("/opt/homebrew/include"));
-    mod_tests.root_module.linkSystemLibrary("mysqlclient", .{});
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -199,4 +202,38 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+const MariaDbConnectorC = struct {
+    generated_include_dir: std.Build.LazyPath,
+    static_library: std.Build.LazyPath,
+};
+
+fn addMariaDbConnectorC(b: *std.Build) MariaDbConnectorC {
+    const build_cmd = b.addSystemCommand(&.{"sh"});
+    build_cmd.addFileArg(b.path("tools/build_mariadb_static.sh"));
+    build_cmd.addDirectoryArg(b.path("deps/mariadb-connector-c"));
+    const build_dir = build_cmd.addOutputDirectoryArg("mariadb-connector-c");
+
+    return .{
+        .generated_include_dir = build_dir.path(b, "include"),
+        .static_library = build_dir.path(b, "libmariadb/libmysqlclient.a"),
+    };
+}
+
+fn linkMariaDbSystemLibraries(module: *std.Build.Module, target: std.Build.ResolvedTarget, openssl_lib_dir: ?[]const u8) void {
+    if (openssl_lib_dir) |lib_dir| {
+        module.addLibraryPath(.{ .cwd_relative = lib_dir });
+    }
+    module.linkSystemLibrary("ssl", .{});
+    module.linkSystemLibrary("crypto", .{});
+
+    switch (target.result.os.tag) {
+        .linux, .freebsd, .openbsd, .netbsd, .dragonfly => {
+            module.linkSystemLibrary("m", .{});
+            module.linkSystemLibrary("pthread", .{});
+            module.linkSystemLibrary("dl", .{});
+        },
+        else => {},
+    }
 }
