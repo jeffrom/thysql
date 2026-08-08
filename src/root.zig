@@ -40,6 +40,32 @@ pub const Repl = struct {
         const c = self.cfg.in.takeByte();
         return c;
     }
+
+    pub fn debugMode(self: Repl) ReplError!void {
+        //
+        var quit: [4]u8 = undefined;
+        @memset(&quit, ' ');
+        try self.cfg.out.print("key code debugging mode.\n\rPress keys to see codes. Type 'quit' to exit\n\r", .{});
+        try self.cfg.out.flush();
+
+        while (true) {
+            const c = self.cfg.in.takeByte() catch |err| switch (err) {
+                Io.Reader.Error.EndOfStream => {
+                    continue;
+                },
+                else => return err,
+            };
+
+            // shift string to left
+            std.mem.rotate(u8, &quit, 1);
+            quit[quit.len - 1] = c;
+            if (std.mem.eql(u8, &quit, "quit")) break;
+
+            try self.cfg.out.print("'{c}' 0x{2x} ({d}) (type quit to exit)\n", .{ if (std.ascii.isPrint(c)) c else '?', c, c });
+            try self.cfg.out.print("\r", .{}); // go to left edge manually
+            try self.cfg.out.flush();
+        }
+    }
 };
 
 pub const TermState = struct {
@@ -84,6 +110,8 @@ pub const TermState = struct {
 
         try posix.tcsetattr(fd, posix.TCSA.FLUSH, raw);
 
+        // Ask the terminal to wrap paste input between ESC[200~ and ESC[201~.
+        // if (write(rawmode_output, "\x1b[?2004h", 8) == -1) {}
         return .{
             .orig = termios,
             .fd = fd,
@@ -94,66 +122,6 @@ pub const TermState = struct {
         posix.tcsetattr(self.fd, posix.TCSA.FLUSH, self.orig) catch {};
     }
 };
-
-// assumeTty skips terminal setup so testing can be done via pipes
-pub fn setupTerminal(gpa: std.mem.Allocator, io: Io, f: Io.File, assumeTty: bool) !void {
-    std.debug.print("gpa: {}\nf: {}\n", .{ gpa, f });
-    if (assumeTty) {
-        return;
-    }
-
-    if (try f.isTty(io)) {
-        //
-    }
-    // var termios: linux.termios = std.mem.zeroes(linux.termios);
-    const termios: posix.termios = try posix.tcgetattr(f.handle);
-    // if (linux.tcgetattr(f.handle, &termios) == -1) {
-    //     @panic("tcgetattr() failed");
-    // }
-    std.debug.print("setupTerminal: termios for handle {}: {}\n", .{ f.handle, termios });
-
-    // TODO store the original somewhere so it can be restored at exit
-    var raw = termios;
-
-    // input modes: no break, no CR to NL, no parity check, no strip char,
-    // no start/stop output control.
-    raw.iflag.BRKINT = false;
-    raw.iflag.ICRNL = false;
-    raw.iflag.INPCK = false;
-    raw.iflag.ISTRIP = false;
-    raw.iflag.IXON = false;
-
-    // output modes - disable post processing
-    raw.oflag.OPOST = false;
-
-    // control modes - set 8 bit chars
-    raw.cflag.CSIZE = posix.CSIZE.CS8;
-
-    // local modes - choing off, canonical off, no extended functions,
-    // no signal chars (^Z,^C)
-    raw.lflag.ECHO = false;
-    raw.lflag.ICANON = false;
-    raw.lflag.IEXTEN = false;
-    raw.lflag.ISIG = false;
-
-    // control chars - set return condition: min number of bytes and timer.
-    // We want read to return every single byte, without timeout.
-    raw.cc[@intFromEnum(posix.V.MIN)] = 1; // 1 byte
-    raw.cc[@intFromEnum(posix.V.TIME)] = 0; // no timer
-
-    try posix.tcsetattr(f.handle, posix.TCSA.FLUSH, raw);
-    // if (posix.tcsetattr(f.handle, posix.TCSA.FLUSH, raw)) {
-    //     @panic("tcsetattr() failed");
-    // }
-
-    // Ask the terminal to wrap paste input between ESC[200~ and ESC[201~.
-    // if (write(rawmode_output, "\x1b[?2004h", 8) == -1) {}
-}
-
-pub fn onExit() void {
-    // disableRawMode
-    // freeHistory
-}
 
 // test "basic add functionality" {
 //     try std.testing.expect(add(3, 7) == 10);

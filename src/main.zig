@@ -43,7 +43,8 @@ pub fn main(init: std.process.Init) !void {
     const term = try replar.TermState.enable(stdin_file_reader.file.handle);
     defer term.disable();
 
-    try repl.loop();
+    // try repl.loop();
+    try repl.debugMode();
 }
 
 // TODO print keys mode
