@@ -61,7 +61,7 @@ pub const Repl = struct {
             quit[quit.len - 1] = c;
             if (std.mem.eql(u8, &quit, "quit")) break;
 
-            try self.cfg.out.print("'{c}' 0x{2x} ({d}) (type quit to exit)\n", .{ if (std.ascii.isPrint(c)) c else '?', c, c });
+            try self.cfg.out.print("'{c}' 0x{x} ({d: >3}) (type quit to exit)\n", .{ if (std.ascii.isPrint(c)) c else '?', c, c });
             try self.cfg.out.print("\r", .{}); // go to left edge manually
             try self.cfg.out.flush();
         }
