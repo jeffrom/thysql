@@ -2,17 +2,52 @@
 const std = @import("std");
 const Io = std.Io;
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
+pub const ReplConfig = struct {
+    prompt: []const u8,
+    in: *Io.Reader,
+    out: *Io.Writer,
+};
+
+const ReplContext = struct {
+    cfg: *const ReplConfig,
+    charbuf: []u8,
+};
+
+const ReplError = Io.Writer.Error || Io.Reader.Error || std.mem.Allocator.Error;
+
+pub fn repl_loop(allocator: std.mem.Allocator, cfg: *const ReplConfig) ReplError!void {
+    const ctx = ReplContext{
+        .cfg = cfg,
+        .charbuf = try allocator.alloc(u8, 512),
+    };
+    try cfg.out.printAscii(cfg.prompt, .{});
+    try cfg.out.flush();
+
+    const c = try read_key(&ctx);
+    std.debug.print("key: {}\n", .{c});
 }
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
+fn read_key(ctx: *const ReplContext) Io.Reader.Error!u8 {
+    const c = ctx.cfg.in.takeByte();
+
+    return c;
 }
 
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+// passes through regular keypresses, handles commands, EOF, etc.
+fn read_input(cfg: *const ReplConfig) ReplError!void {
+    // var char: u8 = undefined;
+    while (cfg.in.takeByte()) |c| {
+        std.debug.print("uhh {}\n", .{c});
+    } else |err| {
+        if (err == Io.Reader.Error.EndOfStream) {
+            try cfg.out.printAsciiChar('\n', .{});
+            try cfg.out.flush();
+            return;
+        }
+        return err;
+    }
 }
+
+// test "basic add functionality" {
+//     try std.testing.expect(add(3, 7) == 10);
+// }

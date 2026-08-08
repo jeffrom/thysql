@@ -26,9 +26,16 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
 
-    try replar.printAnotherMessage(stdout_writer);
+    var stdin_buffer: [1024]u8 = undefined;
+    var stdin_file_reader: Io.File.Reader = .init(.stdin(), io, &stdin_buffer);
+    const stdin_reader = &stdin_file_reader.interface;
 
-    try stdout_writer.flush(); // Don't forget to flush!
+    const cfg = replar.ReplConfig{
+        .prompt = "hello# ",
+        .in = stdin_reader,
+        .out = stdout_writer,
+    };
+    try replar.repl_loop(arena, &cfg);
 }
 
 test "simple test" {
