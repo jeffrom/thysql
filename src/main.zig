@@ -40,8 +40,9 @@ pub fn main(init: std.process.Init) !void {
     const repl = try replar.Repl.init(init.gpa, &cfg);
     defer repl.deinit();
 
-    try replar.setupTerminal(arena, io, stdin_file_reader.file, false);
-    defer replar.onExit();
+    const term = try replar.TermState.enable(stdin_file_reader.file.handle);
+    defer term.disable();
+
     try repl.loop();
 }
 

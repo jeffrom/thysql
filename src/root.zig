@@ -42,6 +42,59 @@ pub const Repl = struct {
     }
 };
 
+pub const TermState = struct {
+    orig: posix.termios,
+    fd: i32,
+
+    pub fn enable(fd: i32) !TermState {
+        // TODO test passthrough
+        // if (assumeTty) {
+        //     return;
+        // }
+        // TODO isatty
+
+        const termios: posix.termios = try posix.tcgetattr(fd);
+        var raw = termios;
+
+        // input modes: no break, no CR to NL, no parity check, no strip char,
+        // no start/stop output control.
+        raw.iflag.BRKINT = false;
+        raw.iflag.ICRNL = false;
+        raw.iflag.INPCK = false;
+        raw.iflag.ISTRIP = false;
+        raw.iflag.IXON = false;
+
+        // output modes - disable post processing
+        raw.oflag.OPOST = false;
+
+        // control modes - set 8 bit chars
+        raw.cflag.CSIZE = posix.CSIZE.CS8;
+
+        // local modes - choing off, canonical off, no extended functions,
+        // no signal chars (^Z,^C)
+        raw.lflag.ECHO = false;
+        raw.lflag.ICANON = false;
+        raw.lflag.IEXTEN = false;
+        raw.lflag.ISIG = false;
+
+        // control chars - set return condition: min number of bytes and timer.
+        // We want read to return every single byte, without timeout.
+        raw.cc[@intFromEnum(posix.V.MIN)] = 1; // 1 byte
+        raw.cc[@intFromEnum(posix.V.TIME)] = 0; // no timer
+
+        try posix.tcsetattr(fd, posix.TCSA.FLUSH, raw);
+
+        return .{
+            .orig = termios,
+            .fd = fd,
+        };
+    }
+
+    pub fn disable(self: TermState) void {
+        posix.tcsetattr(self.fd, posix.TCSA.FLUSH, self.orig) catch {};
+    }
+};
+
 // assumeTty skips terminal setup so testing can be done via pipes
 pub fn setupTerminal(gpa: std.mem.Allocator, io: Io, f: Io.File, assumeTty: bool) !void {
     std.debug.print("gpa: {}\nf: {}\n", .{ gpa, f });
