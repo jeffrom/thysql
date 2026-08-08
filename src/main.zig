@@ -30,14 +30,22 @@ pub fn main(init: std.process.Init) !void {
     var stdin_file_reader: Io.File.Reader = .init(.stdin(), io, &stdin_buffer);
     const stdin_reader = &stdin_file_reader.interface;
 
+    // need to get stdin's fileno here to put the terminal in raw mode
+    // stdin_file_reader.file.handle
     const cfg = replar.ReplConfig{
         .prompt = "hello# ",
         .in = stdin_reader,
         .out = stdout_writer,
     };
-    const repl = try replar.Repl.init(arena, &cfg);
+    const repl = try replar.Repl.init(init.gpa, &cfg);
+    defer repl.deinit();
+
+    try replar.setupTerminal(arena, io, stdin_file_reader.file, false);
+    defer replar.onExit();
     try repl.loop();
 }
+
+// TODO print keys mode
 
 test "simple test" {
     const gpa = std.testing.allocator;
