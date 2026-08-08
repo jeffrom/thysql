@@ -2,36 +2,40 @@
 const std = @import("std");
 const Io = std.Io;
 
+const ReplError = Io.Writer.Error || Io.Reader.Error || std.mem.Allocator.Error;
+
 pub const ReplConfig = struct {
     prompt: []const u8,
     in: *Io.Reader,
     out: *Io.Writer,
 };
 
-const ReplContext = struct {
+pub const Repl = struct {
+    allocator: std.mem.Allocator,
     cfg: *const ReplConfig,
     charbuf: []u8,
+
+    pub fn init(allocator: std.mem.Allocator, cfg: *const ReplConfig) std.mem.Allocator.Error!Repl {
+        return .{
+            .allocator = allocator,
+            .cfg = cfg,
+            .charbuf = try allocator.alloc(u8, 512),
+        };
+    }
+
+    pub fn loop(self: Repl) ReplError!void {
+        try self.cfg.out.printAscii(self.cfg.prompt, .{});
+        try self.cfg.out.flush();
+
+        const c = try self.readKey();
+        std.debug.print("key: {}\n", .{c});
+    }
+
+    fn readKey(self: Repl) Io.Reader.Error!u8 {
+        const c = self.cfg.in.takeByte();
+        return c;
+    }
 };
-
-const ReplError = Io.Writer.Error || Io.Reader.Error || std.mem.Allocator.Error;
-
-pub fn repl_loop(allocator: std.mem.Allocator, cfg: *const ReplConfig) ReplError!void {
-    const ctx = ReplContext{
-        .cfg = cfg,
-        .charbuf = try allocator.alloc(u8, 512),
-    };
-    try cfg.out.printAscii(cfg.prompt, .{});
-    try cfg.out.flush();
-
-    const c = try read_key(&ctx);
-    std.debug.print("key: {}\n", .{c});
-}
-
-fn read_key(ctx: *const ReplContext) Io.Reader.Error!u8 {
-    const c = ctx.cfg.in.takeByte();
-
-    return c;
-}
 
 // passes through regular keypresses, handles commands, EOF, etc.
 fn read_input(cfg: *const ReplConfig) ReplError!void {

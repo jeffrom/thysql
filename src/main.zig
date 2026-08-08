@@ -35,7 +35,8 @@ pub fn main(init: std.process.Init) !void {
         .in = stdin_reader,
         .out = stdout_writer,
     };
-    try replar.repl_loop(arena, &cfg);
+    const repl = try replar.Repl.init(arena, &cfg);
+    try repl.loop();
 }
 
 test "simple test" {
