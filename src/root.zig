@@ -128,8 +128,16 @@ pub const Repl = struct {
                 try self.editStartOfLine();
                 return ReadEditState.More;
             },
+            @intFromEnum(KeyCode.CTRL_B) => {
+                try self.editMoveLeft();
+                return ReadEditState.More;
+            },
             @intFromEnum(KeyCode.CTRL_E) => {
                 try self.editEndOfLine();
+                return ReadEditState.More;
+            },
+            @intFromEnum(KeyCode.CTRL_F) => {
+                try self.editMoveRight();
                 return ReadEditState.More;
             },
             else => {
@@ -194,6 +202,20 @@ pub const Repl = struct {
     fn editEndOfLine(self: *Repl) !void {
         if (self.pos != self.buf.items.len) {
             self.pos = self.buf.items.len;
+            try self.refreshLine();
+        }
+    }
+
+    fn editMoveLeft(self: *Repl) !void {
+        if (self.pos > 0) {
+            self.pos = unicode.codepointStartBefore(self.buf.items, self.pos);
+            try self.refreshLine();
+        }
+    }
+
+    fn editMoveRight(self: *Repl) !void {
+        if (self.pos < self.buf.items.len) {
+            self.pos += unicode.codepointLenAt(self.buf.items, self.pos);
             try self.refreshLine();
         }
     }
@@ -283,4 +305,30 @@ test "backspace removes one UTF-8 codepoint and refreshes the cursor" {
     try std.testing.expectEqualStrings("aéz", repl.buf.items);
     try std.testing.expectEqual(@as(usize, 3), repl.pos);
     try std.testing.expectEqualStrings("\r> aéz\x1b[0K\r\x1b[4C", output.written());
+}
+
+test "move left and right across UTF-8 codepoints" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("");
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    repl.cols = 80;
+    try repl.buf.appendSlice(allocator, "aé界🙂");
+    repl.pos = repl.buf.items.len;
+
+    try repl.editMoveLeft();
+    try std.testing.expectEqual(@as(usize, 6), repl.pos);
+    try repl.editMoveLeft();
+    try std.testing.expectEqual(@as(usize, 3), repl.pos);
+    try repl.editMoveRight();
+    try std.testing.expectEqual(@as(usize, 6), repl.pos);
+    try repl.editMoveRight();
+    try std.testing.expectEqual(repl.buf.items.len, repl.pos);
 }
