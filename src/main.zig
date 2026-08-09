@@ -53,11 +53,16 @@ pub fn main(init: std.process.Init) !void {
                     try stdout_writer.flush();
                     return;
                 },
-                else => return err,
+                else => {
+                    try stdout_writer.printAscii("\r\n", .{});
+                    try stdout_writer.flush();
+                    return err;
+                },
             };
 
-            try stdout_writer.printAscii("\r\nreceived line:\r\n", .{});
-            try stdout_writer.printAscii(line, .{});
+            if (line.len > 0) {
+                try stdout_writer.print("\r\nreceived line: '{s}'", .{line});
+            }
             try stdout_writer.printAscii("\r\n", .{});
             try stdout_writer.flush();
         }

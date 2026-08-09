@@ -79,8 +79,7 @@ pub const Repl = struct {
                     try self.editStart();
                 },
                 ReadEditState.Done => {
-                    // TODO submit
-                    return self.buf.items[0..self.pos];
+                    return self.buf.items;
                 },
                 ReadEditState.More => {
                     continue;
@@ -100,10 +99,6 @@ pub const Repl = struct {
         try self.cfg.out.flush();
     }
 
-    fn editSubmit(_: *Repl) !void {
-        // const line = self.buf.items;
-    }
-
     fn readEditKey(self: *Repl) !ReadEditState {
         const c = try self.cfg.in.takeByte();
         // std.debug.print("readEditKey c: {c}\n", .{c});
@@ -121,16 +116,20 @@ pub const Repl = struct {
             },
             @intFromEnum(KeyCode.BACKSPACE), @intFromEnum(KeyCode.CTRL_H) => {
                 // backspace
+                return ReadEditState.More;
             },
             else => {
                 var utf8: [4]u8 = undefined;
                 const utf8len = try std.unicode.utf8ByteSequenceLength(c);
                 utf8[0] = c;
                 if (utf8len > 1) {
-                    // XXX could read these all at once
+                    // TODO read these all at once
                     for (1..utf8len) |i| {
                         utf8[i] = try self.cfg.in.takeByte();
                     }
+                } else if (!std.ascii.isPrint(c)) {
+                    std.debug.print("\r\nunprintable unhandled character: 0x{x}\r\n", .{c});
+                    return ReadEditState.More;
                 }
 
                 try self.editInsert(utf8, utf8len);
@@ -152,11 +151,22 @@ pub const Repl = struct {
         self.pos += utf8len;
     }
 
+    fn editBackspace(self: *Repl) !void {
+        if (self.pos == 0 or self.buf.items.len == 0) {
+            return;
+        }
+        // const clen = self.pos
+    }
+
+    // fn refreshLine(self: *Repl) !void {
+    //     //
+    // }
+
     pub fn debugMode(self: Repl) ReplError!void {
         //
         var quit: [4]u8 = undefined;
         @memset(&quit, ' ');
-        try self.cfg.out.print("key code debugging mode.\n\rPress keys to see codes. Type 'quit' to exit\n\r", .{});
+        try self.cfg.out.print("key code debugging mode.\r\nPress keys to see codes. Type 'quit' to exit\r\n", .{});
         try self.cfg.out.flush();
 
         while (true) {
