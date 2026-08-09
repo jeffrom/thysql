@@ -124,6 +124,14 @@ pub const Repl = struct {
                 try self.editBackspace();
                 return ReadEditState.More;
             },
+            @intFromEnum(KeyCode.CTRL_A) => {
+                try self.editStartOfLine();
+                return ReadEditState.More;
+            },
+            @intFromEnum(KeyCode.CTRL_E) => {
+                try self.editEndOfLine();
+                return ReadEditState.More;
+            },
             else => {
                 var utf8: [4]u8 = undefined;
                 const utf8len = try std.unicode.utf8ByteSequenceLength(c);
@@ -174,6 +182,20 @@ pub const Repl = struct {
         self.pos = newPos;
 
         try self.refreshLine();
+    }
+
+    fn editStartOfLine(self: *Repl) !void {
+        if (self.pos != 0) {
+            self.pos = 0;
+            try self.refreshLine();
+        }
+    }
+
+    fn editEndOfLine(self: *Repl) !void {
+        if (self.pos != self.buf.items.len) {
+            self.pos = self.buf.items.len;
+            try self.refreshLine();
+        }
     }
 
     fn refreshLine(self: *Repl) !void {
