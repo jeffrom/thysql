@@ -38,7 +38,6 @@ pub fn main(init: std.process.Init) !void {
         .out = stdout_writer,
     };
     var repl = try replar.Repl.init(init.gpa, &cfg);
-    var replp: *replar.Repl = &repl;
     defer repl.deinit();
 
     const term = try replar.TermState.enable(stdin_file_reader.file.handle);
@@ -47,7 +46,21 @@ pub fn main(init: std.process.Init) !void {
     if (args.len > 1 and std.mem.eql(u8, args[1], "--debug")) {
         try repl.debugMode();
     } else {
-        try replp.loop();
+        while (true) {
+            const line = repl.readline() catch |err| switch (err) {
+                Io.Reader.Error.EndOfStream => {
+                    try stdout_writer.printAscii("\r\n", .{});
+                    try stdout_writer.flush();
+                    return;
+                },
+                else => return err,
+            };
+
+            try stdout_writer.printAscii("\r\nreceived line:\r\n", .{});
+            try stdout_writer.printAscii(line, .{});
+            try stdout_writer.printAscii("\r\n", .{});
+            try stdout_writer.flush();
+        }
     }
 }
 

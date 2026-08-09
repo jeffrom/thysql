@@ -1,4 +1,5 @@
 //! By convention, root.zig is the root source file when making a package.
+const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 const posix = std.posix;
@@ -8,7 +9,7 @@ const ReplError = Io.Writer.Error || Io.Reader.Error || std.mem.Allocator.Error;
 const ReadEditState = enum {
     More,
     Done,
-    CtrlC,
+    Cancel,
     EOF,
 };
 
@@ -34,6 +35,8 @@ const KeyCode = enum(u8) {
     BACKSPACE = 127,
 };
 
+const MaxLine = 1024 * 1024;
+
 pub const ReplConfig = struct {
     prompt: []const u8,
     in: *Io.Reader,
@@ -43,7 +46,7 @@ pub const ReplConfig = struct {
 pub const Repl = struct {
     allocator: std.mem.Allocator,
     cfg: *const ReplConfig,
-    buf: []u8,
+    buf: std.ArrayList(u8),
     pos: usize,
     cols: usize,
 
@@ -51,43 +54,54 @@ pub const Repl = struct {
         return .{
             .allocator = allocator,
             .cfg = cfg,
-            .buf = try allocator.alloc(u8, 512),
+            .buf = try std.ArrayList(u8).initCapacity(allocator, 1024),
             .pos = 0,
             .cols = 0,
         };
     }
 
-    pub fn deinit(self: Repl) void {
-        self.allocator.free(self.buf);
+    pub fn deinit(self: *Repl) void {
+        self.buf.deinit(self.allocator);
+        // self.allocator.free(self.buf);
     }
 
-    pub fn loop(self: *Repl) !void {
-        try self.cfg.out.printAscii(self.cfg.prompt, .{});
-        try self.cfg.out.flush();
+    pub fn readline(self: *Repl) ![]u8 {
+        try self.editStart();
 
         while (true) {
             const state: ReadEditState = try self.readEditKey();
             switch (state) {
                 ReadEditState.EOF => {
-                    std.debug.print("EOF!\n", .{});
-                    return;
+                    return Io.Reader.Error.EndOfStream;
                 },
 
-                ReadEditState.CtrlC => {},
+                ReadEditState.Cancel => {
+                    try self.editStart();
+                },
                 ReadEditState.Done => {
-                    std.debug.print("done!\n", .{});
+                    // TODO submit
+                    return self.buf.items[0..self.pos];
                 },
                 ReadEditState.More => {
                     continue;
                 },
             }
         }
-        // const c = try self.cfg.in.takeByte();
         // std.debug.print("key: {}\n", .{c});
     }
 
-    fn editStart() void {
-        //
+    fn editStart(self: *Repl) !void {
+        self.buf.clearRetainingCapacity();
+        self.pos = 0;
+        self.cols = getTermColumns();
+        // std.debug.print("\r\neditStart: {} cols, line buffer {}/{}\r\n", .{ self.cols, self.pos, self.buf.capacity });
+
+        try self.cfg.out.printAscii(self.cfg.prompt, .{});
+        try self.cfg.out.flush();
+    }
+
+    fn editSubmit(_: *Repl) !void {
+        // const line = self.buf.items;
     }
 
     fn readEditKey(self: *Repl) !ReadEditState {
@@ -98,7 +112,7 @@ pub const Repl = struct {
                 return ReadEditState.Done;
             },
             @intFromEnum(KeyCode.CTRL_C) => {
-                return ReadEditState.CtrlC;
+                return ReadEditState.Cancel;
             },
             @intFromEnum(KeyCode.CTRL_D) => {
                 // TODO only if the line is empty should we exit
@@ -128,15 +142,15 @@ pub const Repl = struct {
     }
 
     fn editInsert(self: *Repl, utf8: [4]u8, utf8len: usize) !void {
-        // std.debug.print("editInsert: {s} {}\n", .{ utf8, utf8len });
+        if (self.pos + utf8len >= MaxLine) {
+            return error.LineTooLong;
+        }
+        try self.buf.appendSlice(self.allocator, utf8[0..utf8len]);
+
         try self.cfg.out.writeAll(utf8[0..utf8len]);
         try self.cfg.out.flush();
         self.pos += utf8len;
     }
-
-    // fn editStart(self: Repl) void {
-    //     //
-    // }
 
     pub fn debugMode(self: Repl) ReplError!void {
         //
@@ -219,6 +233,34 @@ pub const TermState = struct {
         posix.tcsetattr(self.fd, posix.TCSA.FLUSH, self.orig) catch {};
     }
 };
+
+fn getTermColumns() u16 {
+    const default = 80;
+    if (builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        const stdout_handle = windows.GetStdHandle(windows.STD_OUTPUT_HANDLE) catch return default;
+
+        var info: windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+        if (windows.kernel32.GetConsoleScreenBufferInfo(stdout_handle, &info) != 0) {
+            const cols = @as(u16, @intCast(info.srWindow.Right - info.srWindow.Left + 1));
+            return cols;
+        } else {
+            const stdout_fd = std.io.getStdout().handle;
+            var winsize: posix.winsize = .{
+                .row = 0,
+                .col = 0,
+                .xpixel = 0,
+                .ypixel = 0,
+            };
+
+            const err = posix.system.ioctl(stdout_fd, posix.T.IOCGWINSZ, @intFromPtr(&winsize));
+            if (posix.errno(err) == .SUCCESS) {
+                return winsize.col;
+            }
+        }
+    }
+    return default;
+}
 
 // test "basic add functionality" {
 //     try std.testing.expect(add(3, 7) == 10);
