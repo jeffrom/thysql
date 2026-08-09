@@ -53,6 +53,11 @@ pub fn main(init: std.process.Init) !void {
                     try stdout_writer.flush();
                     return;
                 },
+                replar.ReplError.Cancelled => {
+                    try stdout_writer.printAscii("\r\n^C\r\n", .{});
+                    try stdout_writer.flush();
+                    continue;
+                },
                 else => {
                     try stdout_writer.printAscii("\r\n", .{});
                     try stdout_writer.flush();
