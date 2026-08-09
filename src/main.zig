@@ -37,14 +37,18 @@ pub fn main(init: std.process.Init) !void {
         .in = stdin_reader,
         .out = stdout_writer,
     };
-    const repl = try replar.Repl.init(init.gpa, &cfg);
+    var repl = try replar.Repl.init(init.gpa, &cfg);
+    var replp: *replar.Repl = &repl;
     defer repl.deinit();
 
     const term = try replar.TermState.enable(stdin_file_reader.file.handle);
     defer term.disable();
 
-    // try repl.loop();
-    try repl.debugMode();
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--debug")) {
+        try repl.debugMode();
+    } else {
+        try replp.loop();
+    }
 }
 
 // TODO print keys mode

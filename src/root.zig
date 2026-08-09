@@ -5,6 +5,35 @@ const posix = std.posix;
 
 const ReplError = Io.Writer.Error || Io.Reader.Error || std.mem.Allocator.Error;
 
+const ReadEditState = enum {
+    More,
+    Done,
+    CtrlC,
+    EOF,
+};
+
+const KeyCode = enum(u8) {
+    KEY_NULL = 0,
+    CTRL_A = 1,
+    CTRL_B = 2,
+    CTRL_C = 3,
+    CTRL_D = 4,
+    CTRL_E = 5,
+    CTRL_F = 6,
+    CTRL_H = 8,
+    TAB = 9,
+    CTRL_K = 11,
+    CTRL_L = 12,
+    ENTER = 13,
+    CTRL_N = 14,
+    CTRL_P = 16,
+    CTRL_T = 20,
+    CTRL_U = 21,
+    CTRL_W = 23,
+    ESC = 27,
+    BACKSPACE = 127,
+};
+
 pub const ReplConfig = struct {
     prompt: []const u8,
     in: *Io.Reader,
@@ -14,32 +43,100 @@ pub const ReplConfig = struct {
 pub const Repl = struct {
     allocator: std.mem.Allocator,
     cfg: *const ReplConfig,
-    charbuf: []u8,
+    buf: []u8,
+    pos: usize,
+    cols: usize,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: *const ReplConfig) std.mem.Allocator.Error!Repl {
+    pub fn init(allocator: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
         return .{
             .allocator = allocator,
             .cfg = cfg,
-            .charbuf = try allocator.alloc(u8, 512),
+            .buf = try allocator.alloc(u8, 512),
+            .pos = 0,
+            .cols = 0,
         };
     }
 
     pub fn deinit(self: Repl) void {
-        self.allocator.free(self.charbuf);
+        self.allocator.free(self.buf);
     }
 
-    pub fn loop(self: Repl) ReplError!void {
+    pub fn loop(self: *Repl) !void {
         try self.cfg.out.printAscii(self.cfg.prompt, .{});
         try self.cfg.out.flush();
 
-        const c = try self.readKey();
-        std.debug.print("key: {}\n", .{c});
+        while (true) {
+            const state: ReadEditState = try self.readEditKey();
+            switch (state) {
+                ReadEditState.EOF => {
+                    std.debug.print("EOF!\n", .{});
+                    return;
+                },
+
+                ReadEditState.CtrlC => {},
+                ReadEditState.Done => {
+                    std.debug.print("done!\n", .{});
+                },
+                ReadEditState.More => {
+                    continue;
+                },
+            }
+        }
+        // const c = try self.cfg.in.takeByte();
+        // std.debug.print("key: {}\n", .{c});
     }
 
-    fn readKey(self: Repl) Io.Reader.Error!u8 {
-        const c = self.cfg.in.takeByte();
-        return c;
+    fn editStart() void {
+        //
     }
+
+    fn readEditKey(self: *Repl) !ReadEditState {
+        const c = try self.cfg.in.takeByte();
+        // std.debug.print("readEditKey c: {c}\n", .{c});
+        switch (c) {
+            @intFromEnum(KeyCode.ENTER) => {
+                return ReadEditState.Done;
+            },
+            @intFromEnum(KeyCode.CTRL_C) => {
+                return ReadEditState.CtrlC;
+            },
+            @intFromEnum(KeyCode.CTRL_D) => {
+                // TODO only if the line is empty should we exit
+                // otherwise remove the char to the right of the cursor
+                return ReadEditState.EOF;
+            },
+            @intFromEnum(KeyCode.BACKSPACE), @intFromEnum(KeyCode.CTRL_H) => {
+                // backspace
+            },
+            else => {
+                var utf8: [4]u8 = undefined;
+                const utf8len = try std.unicode.utf8ByteSequenceLength(c);
+                utf8[0] = c;
+                if (utf8len > 1) {
+                    // XXX could read these all at once
+                    for (1..utf8len) |i| {
+                        utf8[i] = try self.cfg.in.takeByte();
+                    }
+                }
+
+                try self.editInsert(utf8, utf8len);
+                return ReadEditState.More;
+            },
+        }
+
+        return ReadEditState.Done;
+    }
+
+    fn editInsert(self: *Repl, utf8: [4]u8, utf8len: usize) !void {
+        // std.debug.print("editInsert: {s} {}\n", .{ utf8, utf8len });
+        try self.cfg.out.writeAll(utf8[0..utf8len]);
+        try self.cfg.out.flush();
+        self.pos += utf8len;
+    }
+
+    // fn editStart(self: Repl) void {
+    //     //
+    // }
 
     pub fn debugMode(self: Repl) ReplError!void {
         //
