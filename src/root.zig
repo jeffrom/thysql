@@ -1,8 +1,10 @@
 //! By convention, root.zig is the root source file when making a package.
-const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
-const posix = std.posix;
+const terminal = @import("terminal.zig");
+const unicode = @import("unicode.zig");
+
+pub const TermState = terminal.TermState;
 
 pub const ReplError = Io.Writer.Error || Io.Reader.Error || std.mem.Allocator.Error || error{
     Cancelled,
@@ -96,7 +98,7 @@ pub const Repl = struct {
     fn editStart(self: *Repl) !void {
         self.buf.clearRetainingCapacity();
         self.pos = 0;
-        self.cols = getTermColumns();
+        self.cols = terminal.columns();
         // std.debug.print("\r\neditStart: {} cols, line buffer {}/{}\r\n", .{ self.cols, self.pos, self.buf.capacity });
 
         try self.cfg.out.printAscii(self.cfg.prompt, .{});
@@ -160,7 +162,7 @@ pub const Repl = struct {
             return;
         }
 
-        const newPos = utf8CodepointStartBefore(self.buf.items, self.pos);
+        const newPos = unicode.codepointStartBefore(self.buf.items, self.pos);
         const removedLen = self.pos - newPos;
 
         const tailLen = self.buf.items.len - self.pos;
@@ -175,23 +177,23 @@ pub const Repl = struct {
     }
 
     fn refreshLine(self: *Repl) !void {
-        const promptWidth = utf8DisplayWidth(self.cfg.prompt);
+        const promptWidth = unicode.displayWidth(self.cfg.prompt);
         var start: usize = 0;
-        var cursorWidth = utf8DisplayWidth(self.buf.items[0..self.pos]);
+        var cursorWidth = unicode.displayWidth(self.buf.items[0..self.pos]);
 
         // horizontally scroll by whole codepoints until the cursor fits.
         while (start < self.pos and promptWidth + cursorWidth >= self.cols) {
-            const codepointLen = utf8CodepointLenAt(self.buf.items, start);
+            const codepointLen = unicode.codepointLenAt(self.buf.items, start);
             start += codepointLen;
-            cursorWidth = utf8DisplayWidth(self.buf.items[start..self.pos]);
+            cursorWidth = unicode.displayWidth(self.buf.items[start..self.pos]);
         }
 
         var end = self.buf.items.len;
-        var lineWidth = utf8DisplayWidth(self.buf.items[start..end]);
+        var lineWidth = unicode.displayWidth(self.buf.items[start..end]);
         while (end > self.pos and promptWidth + lineWidth > self.cols) {
-            const newEnd = utf8CodepointStartBefore(self.buf.items, end);
+            const newEnd = unicode.codepointStartBefore(self.buf.items, end);
             end = newEnd;
-            lineWidth = utf8DisplayWidth(self.buf.items[start..end]);
+            lineWidth = unicode.displayWidth(self.buf.items[start..end]);
         }
 
         // CR moves the cursor to column zero without advancing to a new line.
@@ -237,190 +239,6 @@ pub const Repl = struct {
         }
     }
 };
-
-pub const TermState = struct {
-    orig: posix.termios,
-    fd: i32,
-
-    pub fn enable(fd: i32) !TermState {
-        // TODO test passthrough
-        // if (assumeTty) {
-        //     return;
-        // }
-        // TODO isatty
-
-        const termios: posix.termios = try posix.tcgetattr(fd);
-        var raw = termios;
-
-        // input modes: no break, no CR to NL, no parity check, no strip char,
-        // no start/stop output control.
-        raw.iflag.BRKINT = false;
-        raw.iflag.ICRNL = false;
-        raw.iflag.INPCK = false;
-        raw.iflag.ISTRIP = false;
-        raw.iflag.IXON = false;
-
-        // output modes - disable post processing
-        raw.oflag.OPOST = false;
-
-        // control modes - set 8 bit chars
-        raw.cflag.CSIZE = posix.CSIZE.CS8;
-
-        // local modes - choing off, canonical off, no extended functions,
-        // no signal chars (^Z,^C)
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.IEXTEN = false;
-        raw.lflag.ISIG = false;
-
-        // control chars - set return condition: min number of bytes and timer.
-        // We want read to return every single byte, without timeout.
-        raw.cc[@intFromEnum(posix.V.MIN)] = 1; // 1 byte
-        raw.cc[@intFromEnum(posix.V.TIME)] = 0; // no timer
-
-        try posix.tcsetattr(fd, posix.TCSA.FLUSH, raw);
-
-        // Ask the terminal to wrap paste input between ESC[200~ and ESC[201~.
-        // if (write(rawmode_output, "\x1b[?2004h", 8) == -1) {}
-        return .{
-            .orig = termios,
-            .fd = fd,
-        };
-    }
-
-    pub fn disable(self: TermState) void {
-        posix.tcsetattr(self.fd, posix.TCSA.FLUSH, self.orig) catch {};
-    }
-};
-
-fn utf8CodepointStartBefore(buf: []const u8, pos: usize) usize {
-    std.debug.assert(pos > 0 and pos <= buf.len);
-
-    var start = pos - 1;
-    while (start > 0 and buf[start] & 0xc0 == 0x80) : (start -= 1) {}
-    return start;
-}
-
-fn utf8CodepointLenAt(buf: []const u8, pos: usize) usize {
-    std.debug.assert(pos < buf.len);
-
-    const len = std.unicode.utf8ByteSequenceLength(buf[pos]) catch return 1;
-    if (pos + len > buf.len) return 1;
-    _ = std.unicode.utf8Decode(buf[pos .. pos + len]) catch return 1;
-    return len;
-}
-
-fn isZeroWidthCodepoint(cp: u21) bool {
-    return cp == 0x200d or // Zero-width joiner
-        cp == 0xfe0e or cp == 0xfe0f or // Variation selectors
-        (cp >= 0x0300 and cp <= 0x036f) or
-        (cp >= 0x1ab0 and cp <= 0x1aff) or
-        (cp >= 0x1dc0 and cp <= 0x1dff) or
-        (cp >= 0x20d0 and cp <= 0x20ff) or
-        (cp >= 0xfe20 and cp <= 0xfe2f) or
-        (cp >= 0x1f3fb and cp <= 0x1f3ff); // Emoji skin tones
-}
-
-fn isWideCodepoint(cp: u21) bool {
-    return cp >= 0x1100 and
-        (cp <= 0x115f or
-            cp == 0x2329 or cp == 0x232a or
-            (cp >= 0x2e80 and cp <= 0xa4cf and cp != 0x303f) or
-            (cp >= 0xac00 and cp <= 0xd7a3) or
-            (cp >= 0xf900 and cp <= 0xfaff) or
-            (cp >= 0xfe10 and cp <= 0xfe19) or
-            (cp >= 0xfe30 and cp <= 0xfe6f) or
-            (cp >= 0xff00 and cp <= 0xff60) or
-            (cp >= 0xffe0 and cp <= 0xffe6) or
-            (cp >= 0x1f1e6 and cp <= 0x1f1ff) or
-            (cp >= 0x1f300 and cp <= 0x1faff) or
-            (cp >= 0x20000 and cp <= 0x2ffff));
-}
-
-fn ansiCsiLen(bytes: []const u8) usize {
-    if (bytes.len < 2 or bytes[0] != 0x1b or bytes[1] != '[') return 0;
-
-    var i: usize = 2;
-    while (i < bytes.len and bytes[i] >= 0x30 and bytes[i] <= 0x3f) : (i += 1) {}
-    while (i < bytes.len and bytes[i] >= 0x20 and bytes[i] <= 0x2f) : (i += 1) {}
-    if (i == bytes.len or bytes[i] < 0x40 or bytes[i] > 0x7e) return 0;
-    return i + 1;
-}
-
-fn utf8DisplayWidth(bytes: []const u8) usize {
-    var width: usize = 0;
-    var i: usize = 0;
-    var afterZwj = false;
-
-    while (i < bytes.len) {
-        if (bytes[i] == 0x1b) {
-            const escapeLen = ansiCsiLen(bytes[i..]);
-            if (escapeLen > 0) {
-                i += escapeLen;
-                continue;
-            }
-        }
-
-        const codepointLen = utf8CodepointLenAt(bytes, i);
-        const cp = std.unicode.utf8Decode(bytes[i .. i + codepointLen]) catch {
-            width += 1;
-            i += 1;
-            continue;
-        };
-
-        if (afterZwj) {
-            afterZwj = false;
-        } else if (!isZeroWidthCodepoint(cp)) {
-            width += if (isWideCodepoint(cp)) 2 else 1;
-        }
-        if (cp == 0x200d) afterZwj = true;
-        i += codepointLen;
-    }
-    return width;
-}
-
-fn getTermColumns() u16 {
-    const default = 80;
-    if (builtin.os.tag == .windows) {
-        const windows = std.os.windows;
-        const stdout_handle = windows.GetStdHandle(windows.STD_OUTPUT_HANDLE) catch return default;
-
-        var info: windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
-        if (windows.kernel32.GetConsoleScreenBufferInfo(stdout_handle, &info) != 0) {
-            const cols = @as(u16, @intCast(info.srWindow.Right - info.srWindow.Left + 1));
-            return cols;
-        } else {
-            const stdout_fd = std.io.getStdout().handle;
-            var winsize: posix.winsize = .{
-                .row = 0,
-                .col = 0,
-                .xpixel = 0,
-                .ypixel = 0,
-            };
-
-            const err = posix.system.ioctl(stdout_fd, posix.T.IOCGWINSZ, @intFromPtr(&winsize));
-            if (posix.errno(err) == .SUCCESS) {
-                return winsize.col;
-            }
-        }
-    }
-    return default;
-}
-
-// test "basic add functionality" {
-//     try std.testing.expect(add(3, 7) == 10);
-// }
-
-test "UTF-8 codepoint boundaries and display widths" {
-    const text = "aé界🙂";
-    try std.testing.expectEqual(@as(usize, 6), utf8CodepointStartBefore(text, text.len));
-    try std.testing.expectEqual(@as(usize, 3), utf8CodepointStartBefore(text, 6));
-    try std.testing.expectEqual(@as(usize, 2), utf8DisplayWidth("界"));
-    try std.testing.expectEqual(@as(usize, 2), utf8DisplayWidth("🙂"));
-    try std.testing.expectEqual(@as(usize, 1), utf8DisplayWidth("e\u{301}"));
-    try std.testing.expectEqual(@as(usize, 2), utf8DisplayWidth("👩\u{200d}💻"));
-    try std.testing.expectEqual(@as(usize, 3), utf8DisplayWidth("\x1b[32m好\x1b[0m!"));
-}
 
 test "backspace removes one UTF-8 codepoint and refreshes the cursor" {
     const allocator = std.testing.allocator;
