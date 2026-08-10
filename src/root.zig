@@ -118,6 +118,10 @@ pub const Repl = struct {
             @intFromEnum(KeyCode.CTRL_D) => {
                 // TODO only if the line is empty should we exit
                 // otherwise remove the char to the right of the cursor
+                if (self.buf.items.len > 0) {
+                    try self.editDelete();
+                    return ReadEditState.More;
+                }
                 return ReadEditState.EOF;
             },
             @intFromEnum(KeyCode.BACKSPACE), @intFromEnum(KeyCode.CTRL_H) => {
@@ -138,6 +142,10 @@ pub const Repl = struct {
             },
             @intFromEnum(KeyCode.CTRL_F) => {
                 try self.editMoveRight();
+                return ReadEditState.More;
+            },
+            @intFromEnum(KeyCode.ESC) => {
+                try self.editEscapeSequence();
                 return ReadEditState.More;
             },
             else => {
@@ -217,6 +225,84 @@ pub const Repl = struct {
         if (self.pos < self.buf.items.len) {
             self.pos += unicode.codepointLenAt(self.buf.items, self.pos);
             try self.refreshLine();
+        }
+    }
+
+    fn editDelete(self: *Repl) !void {
+        if (self.pos < self.buf.items.len) {
+            const removedLen = unicode.codepointLenAt(self.buf.items, self.pos);
+            const tailStart = self.pos + removedLen;
+            const tailLen = self.buf.items.len - tailStart;
+            @memmove(
+                self.buf.items[self.pos..][0..tailLen],
+                self.buf.items[tailStart..],
+            );
+            self.buf.items.len -= removedLen;
+            try self.refreshLine();
+        }
+    }
+
+    fn takeEscapeByte(self: *Repl) Io.Reader.Error!?u8 {
+        return self.cfg.in.takeByte() catch |err| switch (err) {
+            Io.Reader.Error.EndOfStream => null,
+            else => return err,
+        };
+    }
+
+    fn editEscapeSequence(self: *Repl) !void {
+        const introducer = (try self.takeEscapeByte()) orelse return;
+
+        switch (introducer) {
+            '[' => try self.editCsiSequence(),
+            'O' => {
+                const final = (try self.takeEscapeByte()) orelse return;
+                try self.editEscapeFinal(final, null);
+            },
+            else => {},
+        }
+    }
+
+    fn editCsiSequence(self: *Repl) !void {
+        var parameter: usize = 0;
+        var hasParameter = false;
+        var parsingFirstParameter = true;
+
+        // A CSI sequence ends with a byte in the 0x40-0x7e range. Only the
+        // first numeric parameter selects an editing action; later parameters
+        // are usually key modifiers, such as the 5 in ESC [ 1 ; 5 D.
+        var sequenceLen: usize = 0;
+        while (sequenceLen < 32) : (sequenceLen += 1) {
+            const byte = (try self.takeEscapeByte()) orelse return;
+            if (byte >= 0x40 and byte <= 0x7e) {
+                try self.editEscapeFinal(
+                    byte,
+                    if (hasParameter) parameter else null,
+                );
+                return;
+            }
+
+            if (parsingFirstParameter and byte >= '0' and byte <= '9') {
+                hasParameter = true;
+                if (parameter < 1000) parameter = parameter * 10 + byte - '0';
+            } else if (byte == ';') {
+                parsingFirstParameter = false;
+            }
+        }
+    }
+
+    fn editEscapeFinal(self: *Repl, final: u8, parameter: ?usize) !void {
+        switch (final) {
+            'C' => try self.editMoveRight(),
+            'D' => try self.editMoveLeft(),
+            'H' => try self.editStartOfLine(),
+            'F' => try self.editEndOfLine(),
+            '~' => switch (parameter orelse return) {
+                1, 7 => try self.editStartOfLine(),
+                3 => try self.editDelete(),
+                4, 8 => try self.editEndOfLine(),
+                else => {},
+            },
+            else => {},
         }
     }
 
@@ -331,4 +417,53 @@ test "move left and right across UTF-8 codepoints" {
     try std.testing.expectEqual(@as(usize, 6), repl.pos);
     try repl.editMoveRight();
     try std.testing.expectEqual(repl.buf.items.len, repl.pos);
+}
+
+test "escape sequences move across UTF-8 codepoints" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("\x1b[D\x1b[1;5D\x1b[C\x1b[H\x1bOF");
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    repl.cols = 80;
+    try repl.buf.appendSlice(allocator, "aé界🙂");
+    repl.pos = repl.buf.items.len;
+
+    try std.testing.expectEqual(ReadEditState.More, try repl.readEditKey());
+    try std.testing.expectEqual(@as(usize, 6), repl.pos);
+    try std.testing.expectEqual(ReadEditState.More, try repl.readEditKey());
+    try std.testing.expectEqual(@as(usize, 3), repl.pos);
+    try std.testing.expectEqual(ReadEditState.More, try repl.readEditKey());
+    try std.testing.expectEqual(@as(usize, 6), repl.pos);
+    try std.testing.expectEqual(ReadEditState.More, try repl.readEditKey());
+    try std.testing.expectEqual(@as(usize, 0), repl.pos);
+    try std.testing.expectEqual(ReadEditState.More, try repl.readEditKey());
+    try std.testing.expectEqual(repl.buf.items.len, repl.pos);
+}
+
+test "delete escape sequence removes one UTF-8 codepoint" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("\x1b[3~");
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    repl.cols = 80;
+    try repl.buf.appendSlice(allocator, "aé界");
+    repl.pos = 1;
+
+    try std.testing.expectEqual(ReadEditState.More, try repl.readEditKey());
+    try std.testing.expectEqualStrings("a界", repl.buf.items);
+    try std.testing.expectEqual(@as(usize, 1), repl.pos);
 }
