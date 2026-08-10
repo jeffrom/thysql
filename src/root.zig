@@ -45,6 +45,9 @@ pub const ReplConfig = struct {
     prompt: []const u8,
     in: *Io.Reader,
     out: *Io.Writer,
+    /// Override the detected terminal width. Intended for embedders and tests
+    /// that do not have a real terminal attached.
+    columns: ?usize = null,
 };
 
 pub const Repl = struct {
@@ -98,7 +101,7 @@ pub const Repl = struct {
     fn editStart(self: *Repl) !void {
         self.buf.clearRetainingCapacity();
         self.pos = 0;
-        self.cols = terminal.columns();
+        self.cols = self.cfg.columns orelse terminal.columns();
         // std.debug.print("\r\neditStart: {} cols, line buffer {}/{}\r\n", .{ self.cols, self.pos, self.buf.capacity });
 
         try self.cfg.out.printAscii(self.cfg.prompt, .{});
@@ -171,14 +174,26 @@ pub const Repl = struct {
     }
 
     fn editInsert(self: *Repl, utf8: [4]u8, utf8len: usize) !void {
-        if (self.pos + utf8len >= MaxLine) {
+        if (self.buf.items.len + utf8len > MaxLine) {
             return error.LineTooLong;
         }
-        try self.buf.appendSlice(self.allocator, utf8[0..utf8len]);
 
-        try self.cfg.out.writeAll(utf8[0..utf8len]);
-        try self.cfg.out.flush();
+        const oldLen = self.buf.items.len;
+        const insertingAtEnd = self.pos == oldLen;
+        try self.buf.resize(self.allocator, oldLen + utf8len);
+        @memmove(
+            self.buf.items[self.pos + utf8len ..],
+            self.buf.items[self.pos..oldLen],
+        );
+        @memcpy(self.buf.items[self.pos..][0..utf8len], utf8[0..utf8len]);
         self.pos += utf8len;
+
+        if (insertingAtEnd) {
+            try self.cfg.out.writeAll(utf8[0..utf8len]);
+            try self.cfg.out.flush();
+        } else {
+            try self.refreshLine();
+        }
     }
 
     fn editBackspace(self: *Repl) !void {
@@ -369,6 +384,96 @@ pub const Repl = struct {
         }
     }
 };
+
+const testKeys = struct {
+    const enter = "\r";
+    const backspace = "\x7f";
+    const ctrl_c = "\x03";
+    const ctrl_d = "\x04";
+    const left = "\x1b[D";
+    const home = "\x1b[H";
+    const end = "\x1b[F";
+};
+
+fn expectReadline(inputBytes: []const u8, columns: usize, expectedLine: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed(inputBytes);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = columns,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings(expectedLine, try repl.readline());
+}
+
+test "readline reads an ordinary line" {
+    try expectReadline("hello" ++ testKeys.enter, 80, "hello");
+}
+
+test "readline backspace removes the previous character" {
+    try expectReadline("hello!" ++ testKeys.backspace ++ testKeys.enter, 80, "hello");
+}
+
+test "readline home and end reposition the cursor" {
+    try expectReadline(
+        "middle" ++ testKeys.home ++ "before-" ++ testKeys.end ++ "-after" ++ testKeys.enter,
+        80,
+        "before-middle-after",
+    );
+}
+
+test "readline left arrow allows insertion in the middle" {
+    try expectReadline("ac" ++ testKeys.left ++ "b" ++ testKeys.enter, 80, "abc");
+}
+
+test "readline editing respects UTF-8 boundaries" {
+    try expectReadline(
+        "aé界" ++ testKeys.left ++ testKeys.backspace ++ testKeys.enter,
+        80,
+        "a界",
+    );
+}
+
+test "readline ctrl-c cancels the current line" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("partial" ++ testKeys.ctrl_c);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectError(ReplError.Cancelled, repl.readline());
+}
+
+test "readline ctrl-d on an empty line returns EOF" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed(testKeys.ctrl_d);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectError(Io.Reader.Error.EndOfStream, repl.readline());
+}
 
 test "backspace removes one UTF-8 codepoint and refreshes the cursor" {
     const allocator = std.testing.allocator;

@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     // need to get stdin's fileno here to put the terminal in raw mode
     // stdin_file_reader.file.handle
     const cfg = replar.ReplConfig{
-        .prompt = "hello# ",
+        .prompt = "> ",
         .in = stdin_reader,
         .out = stdout_writer,
     };
