@@ -20,8 +20,9 @@ pub const TermState = struct {
         raw.iflag.ISTRIP = false;
         raw.iflag.IXON = false;
 
-        // output modes - disable post processing
-        raw.oflag.OPOST = false;
+        // Preserve output post-processing. In particular, the terminal's
+        // ONLCR setting makes newlines printed by the caller return to column
+        // zero. GNU Readline leaves the output flags unchanged as well.
 
         // control modes - set 8 bit chars
         raw.cflag.CSIZE = posix.CSIZE.CS8;
@@ -50,18 +51,26 @@ pub const TermState = struct {
     }
 };
 
-pub fn columns() u16 {
-    const default = 80;
+pub const Size = struct {
+    columns: usize,
+    rows: usize,
+};
+
+pub fn size() Size {
+    const default: Size = .{ .columns = 80, .rows = 24 };
     if (builtin.os.tag == .windows) {
         const windows = std.os.windows;
         const stdout_handle = windows.GetStdHandle(windows.STD_OUTPUT_HANDLE) catch return default;
 
         var info: windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
         if (windows.kernel32.GetConsoleScreenBufferInfo(stdout_handle, &info) != 0) {
-            return @intCast(info.srWindow.Right - info.srWindow.Left + 1);
+            return .{
+                .columns = @intCast(info.srWindow.Right - info.srWindow.Left + 1),
+                .rows = @intCast(info.srWindow.Bottom - info.srWindow.Top + 1),
+            };
         }
-
-        const stdout_fd = std.io.getStdout().handle;
+    } else {
+        const stdout_fd = std.Io.File.stdout().handle;
         var winsize: posix.winsize = .{
             .row = 0,
             .col = 0,
@@ -70,7 +79,13 @@ pub fn columns() u16 {
         };
 
         const err = posix.system.ioctl(stdout_fd, posix.T.IOCGWINSZ, @intFromPtr(&winsize));
-        if (posix.errno(err) == .SUCCESS) return winsize.col;
+        if (posix.errno(err) == .SUCCESS and winsize.col > 0 and winsize.row > 0) {
+            return .{ .columns = winsize.col, .rows = winsize.row };
+        }
     }
     return default;
+}
+
+pub fn columns() usize {
+    return size().columns;
 }

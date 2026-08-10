@@ -1,6 +1,7 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
 const Io = std.Io;
+const display = @import("display.zig");
 const terminal = @import("terminal.zig");
 const unicode = @import("unicode.zig");
 
@@ -32,8 +33,10 @@ const KeyCode = enum(u8) {
     ENTER = 13,
     CTRL_N = 14,
     CTRL_P = 16,
+    CTRL_Q = 17,
     CTRL_T = 20,
     CTRL_U = 21,
+    CTRL_V = 22,
     CTRL_W = 23,
     ESC = 27,
     BACKSPACE = 127,
@@ -48,6 +51,11 @@ pub const ReplConfig = struct {
     /// Override the detected terminal width. Intended for embedders and tests
     /// that do not have a real terminal attached.
     columns: ?usize = null,
+    /// Override the detected terminal height. Intended for embedders and tests.
+    rows: ?usize = null,
+    /// Ask the terminal to delimit pasted text so it can be inserted without
+    /// executing editing commands. Matches GNU Readline's default.
+    bracketed_paste: bool = true,
 };
 
 pub const Repl = struct {
@@ -56,6 +64,11 @@ pub const Repl = struct {
     buf: std.ArrayList(u8),
     pos: usize,
     cols: usize,
+    rows: usize,
+    rendered_rows: usize,
+    rendered_cursor_row: usize,
+    quoted_next: bool,
+    bracketed_paste_enabled: bool,
 
     pub fn init(allocator: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
         return .{
@@ -64,6 +77,11 @@ pub const Repl = struct {
             .buf = try std.ArrayList(u8).initCapacity(allocator, 1024),
             .pos = 0,
             .cols = 0,
+            .rows = 0,
+            .rendered_rows = 0,
+            .rendered_cursor_row = 0,
+            .quoted_next = false,
+            .bracketed_paste_enabled = false,
         };
     }
 
@@ -73,21 +91,28 @@ pub const Repl = struct {
     }
 
     pub fn readline(self: *Repl) ![]u8 {
+        errdefer {
+            self.disableBracketedPaste() catch {};
+            self.cfg.out.flush() catch {};
+        }
         try self.editStart();
 
         while (true) {
             const state: ReadEditState = try self.readEditKey();
             switch (state) {
                 ReadEditState.EOF => {
+                    try self.finishAtBottom();
                     return Io.Reader.Error.EndOfStream;
                 },
 
                 ReadEditState.Cancel => {
+                    try self.finishAtBottom();
                     return ReplError.Cancelled;
                     // try self.editStart();
                     // try self.refreshLine();
                 },
                 ReadEditState.Done => {
+                    try self.finishAtBottom();
                     return self.buf.items;
                 },
                 ReadEditState.More => {
@@ -101,15 +126,28 @@ pub const Repl = struct {
     fn editStart(self: *Repl) !void {
         self.buf.clearRetainingCapacity();
         self.pos = 0;
-        self.cols = self.cfg.columns orelse terminal.columns();
+        const size = terminal.size();
+        self.cols = self.cfg.columns orelse size.columns;
+        self.rows = self.cfg.rows orelse size.rows;
+        self.rendered_rows = 0;
+        self.rendered_cursor_row = 0;
+        self.quoted_next = false;
         // std.debug.print("\r\neditStart: {} cols, line buffer {}/{}\r\n", .{ self.cols, self.pos, self.buf.capacity });
 
-        try self.cfg.out.printAscii(self.cfg.prompt, .{});
-        try self.cfg.out.flush();
+        if (self.cfg.bracketed_paste) {
+            try self.cfg.out.writeAll("\x1b[?2004h");
+            self.bracketed_paste_enabled = true;
+        }
+        try self.refreshLine();
     }
 
     fn readEditKey(self: *Repl) !ReadEditState {
         const c = try self.cfg.in.takeByte();
+        if (self.quoted_next) {
+            self.quoted_next = false;
+            try self.editInputByte(c, true);
+            return ReadEditState.More;
+        }
         // std.debug.print("readEditKey c: {c}\n", .{c});
         switch (c) {
             @intFromEnum(KeyCode.ENTER) => {
@@ -147,25 +185,16 @@ pub const Repl = struct {
                 try self.editMoveRight();
                 return ReadEditState.More;
             },
+            @intFromEnum(KeyCode.CTRL_Q), @intFromEnum(KeyCode.CTRL_V) => {
+                self.quoted_next = true;
+                return ReadEditState.More;
+            },
             @intFromEnum(KeyCode.ESC) => {
                 try self.editEscapeSequence();
                 return ReadEditState.More;
             },
             else => {
-                var utf8: [4]u8 = undefined;
-                const utf8len = try std.unicode.utf8ByteSequenceLength(c);
-                utf8[0] = c;
-                if (utf8len > 1) {
-                    // TODO read these all at once
-                    for (1..utf8len) |i| {
-                        utf8[i] = try self.cfg.in.takeByte();
-                    }
-                } else if (!std.ascii.isPrint(c)) {
-                    std.debug.print("\r\nunprintable unhandled character: 0x{x}\r\n", .{c});
-                    return ReadEditState.More;
-                }
-
-                try self.editInsert(utf8, utf8len);
+                try self.editInputByte(c, false);
                 return ReadEditState.More;
             },
         }
@@ -173,27 +202,36 @@ pub const Repl = struct {
         return ReadEditState.Done;
     }
 
+    fn editInputByte(self: *Repl, first: u8, quoted: bool) !void {
+        var utf8: [4]u8 = undefined;
+        const utf8len = std.unicode.utf8ByteSequenceLength(first) catch 1;
+        utf8[0] = first;
+        if (utf8len > 1) {
+            for (1..utf8len) |i| utf8[i] = try self.cfg.in.takeByte();
+        } else if (!quoted and !std.ascii.isPrint(first)) {
+            return;
+        }
+        try self.editInsert(utf8, utf8len);
+    }
+
     fn editInsert(self: *Repl, utf8: [4]u8, utf8len: usize) !void {
-        if (self.buf.items.len + utf8len > MaxLine) {
+        try self.editInsertSlice(utf8[0..utf8len]);
+    }
+
+    fn editInsertSlice(self: *Repl, bytes: []const u8) !void {
+        if (self.buf.items.len + bytes.len > MaxLine) {
             return error.LineTooLong;
         }
 
         const oldLen = self.buf.items.len;
-        const insertingAtEnd = self.pos == oldLen;
-        try self.buf.resize(self.allocator, oldLen + utf8len);
+        try self.buf.resize(self.allocator, oldLen + bytes.len);
         @memmove(
-            self.buf.items[self.pos + utf8len ..],
+            self.buf.items[self.pos + bytes.len ..],
             self.buf.items[self.pos..oldLen],
         );
-        @memcpy(self.buf.items[self.pos..][0..utf8len], utf8[0..utf8len]);
-        self.pos += utf8len;
-
-        if (insertingAtEnd) {
-            try self.cfg.out.writeAll(utf8[0..utf8len]);
-            try self.cfg.out.flush();
-        } else {
-            try self.refreshLine();
-        }
+        @memcpy(self.buf.items[self.pos..][0..bytes.len], bytes);
+        self.pos += bytes.len;
+        try self.refreshLine();
     }
 
     fn editBackspace(self: *Repl) !void {
@@ -315,47 +353,111 @@ pub const Repl = struct {
                 1, 7 => try self.editStartOfLine(),
                 3 => try self.editDelete(),
                 4, 8 => try self.editEndOfLine(),
+                200 => try self.editBracketedPaste(),
                 else => {},
             },
             else => {},
         }
     }
 
+    fn editBracketedPaste(self: *Repl) !void {
+        const suffix = "\x1b[201~";
+        var pasted: std.ArrayList(u8) = .empty;
+        defer pasted.deinit(self.allocator);
+
+        while (true) {
+            var byte = try self.cfg.in.takeByte();
+            if (byte == '\r') byte = '\n';
+            try pasted.append(self.allocator, byte);
+
+            if (pasted.items.len >= suffix.len and std.mem.endsWith(u8, pasted.items, suffix)) {
+                pasted.items.len -= suffix.len;
+                break;
+            }
+        }
+
+        try self.editInsertSlice(pasted.items);
+    }
+
     fn refreshLine(self: *Repl) !void {
-        const promptWidth = unicode.displayWidth(self.cfg.prompt);
-        var start: usize = 0;
-        var cursorWidth = unicode.displayWidth(self.buf.items[0..self.pos]);
+        if (self.cfg.columns == null or self.cfg.rows == null) {
+            const current_size = terminal.size();
+            if (self.cfg.columns == null) self.cols = current_size.columns;
+            if (self.cfg.rows == null) self.rows = current_size.rows;
+        }
+        var next = try display.layout(
+            self.allocator,
+            self.cfg.prompt,
+            self.buf.items,
+            self.pos,
+            self.cols,
+        );
+        defer next.deinit(self.allocator);
 
-        // horizontally scroll by whole codepoints until the cursor fits.
-        while (start < self.pos and promptWidth + cursorWidth >= self.cols) {
-            const codepointLen = unicode.codepointLenAt(self.buf.items, start);
-            start += codepointLen;
-            cursorWidth = unicode.displayWidth(self.buf.items[start..self.pos]);
+        const visible_rows = @min(next.rows.items.len, @max(self.rows, 1));
+        var first_row: usize = 0;
+        if (next.cursor_row >= visible_rows) {
+            first_row = next.cursor_row - visible_rows + 1;
+        }
+        if (first_row + visible_rows > next.rows.items.len) {
+            first_row = next.rows.items.len - visible_rows;
+        }
+        const cursor_row = next.cursor_row - first_row;
+
+        if (self.rendered_rows > 0) {
+            try self.cfg.out.writeAll("\r");
+            if (self.rendered_cursor_row > 0) {
+                try self.cfg.out.print("\x1b[{d}A", .{self.rendered_cursor_row});
+            }
         }
 
-        var end = self.buf.items.len;
-        var lineWidth = unicode.displayWidth(self.buf.items[start..end]);
-        while (end > self.pos and promptWidth + lineWidth > self.cols) {
-            const newEnd = unicode.codepointStartBefore(self.buf.items, end);
-            end = newEnd;
-            lineWidth = unicode.displayWidth(self.buf.items[start..end]);
+        const paint_rows = @max(self.rendered_rows, visible_rows);
+        for (0..paint_rows) |row| {
+            if (row < visible_rows) try self.cfg.out.writeAll(next.row(first_row + row));
+            try self.cfg.out.writeAll("\x1b[0K");
+            if (row + 1 < paint_rows) try self.cfg.out.writeAll("\r\n");
         }
 
-        // CR moves the cursor to column zero without advancing to a new line.
+        const bottom_row = paint_rows - 1;
+        if (bottom_row > cursor_row) {
+            try self.cfg.out.print("\x1b[{d}A", .{bottom_row - cursor_row});
+        }
         try self.cfg.out.writeAll("\r");
-        try self.cfg.out.writeAll(self.cfg.prompt);
-        try self.cfg.out.writeAll(self.buf.items[start..end]);
-
-        // CSI 0 K erases from the cursor to the end of the line. Then CR
-        // again.
-        try self.cfg.out.writeAll("\x1b[0K\r");
-
-        const cursorColumn = promptWidth + cursorWidth;
-        if (cursorColumn > 0) {
-            // CSI n C moves the cursor n display columns to the right.
-            try self.cfg.out.print("\x1b[{d}C", .{cursorColumn});
+        if (next.cursor_col > 0) {
+            try self.cfg.out.print("\x1b[{d}C", .{next.cursor_col});
         }
         try self.cfg.out.flush();
+
+        self.rendered_rows = visible_rows;
+        self.rendered_cursor_row = cursor_row;
+    }
+
+    fn finishAtBottom(self: *Repl) !void {
+        // If point is in an earlier viewport, display the final viewport before
+        // handing control back to the caller. This leaves subsequent output
+        // below the complete accepted or cancelled input, as Readline does.
+        if (self.pos != self.buf.items.len) {
+            const saved_pos = self.pos;
+            self.pos = self.buf.items.len;
+            defer self.pos = saved_pos;
+            try self.refreshLine();
+        }
+        if (self.rendered_rows > 0) {
+            const bottom_row = self.rendered_rows - 1;
+            if (bottom_row > self.rendered_cursor_row) {
+                try self.cfg.out.print("\x1b[{d}B", .{bottom_row - self.rendered_cursor_row});
+            }
+            try self.cfg.out.writeAll("\r");
+            self.rendered_cursor_row = bottom_row;
+        }
+        try self.disableBracketedPaste();
+        try self.cfg.out.flush();
+    }
+
+    fn disableBracketedPaste(self: *Repl) !void {
+        if (!self.bracketed_paste_enabled) return;
+        try self.cfg.out.writeAll("\x1b[?2004l");
+        self.bracketed_paste_enabled = false;
     }
 
     pub fn debugMode(self: Repl) ReplError!void {
@@ -387,6 +489,10 @@ pub const Repl = struct {
 
 const testKeys = struct {
     const enter = "\r";
+    const ctrl_j = "\x0a";
+    const ctrl_v = "\x16";
+    const paste_begin = "\x1b[200~";
+    const paste_end = "\x1b[201~";
     const backspace = "\x7f";
     const ctrl_c = "\x03";
     const ctrl_d = "\x04";
@@ -415,6 +521,23 @@ fn expectReadline(inputBytes: []const u8, columns: usize, expectedLine: []const 
 
 test "readline reads an ordinary line" {
     try expectReadline("hello" ++ testKeys.enter, 80, "hello");
+}
+
+test "quoted ctrl-j inserts a literal newline" {
+    try expectReadline(
+        "first" ++ testKeys.ctrl_v ++ testKeys.ctrl_j ++ "second" ++ testKeys.enter,
+        80,
+        "first\nsecond",
+    );
+}
+
+test "bracketed paste inserts newlines and controls without executing them" {
+    try expectReadline(
+        "before" ++ testKeys.paste_begin ++ "first\rsecond\x03" ++ testKeys.paste_end ++
+            "after" ++ testKeys.enter,
+        80,
+        "beforefirst\nsecond\x03after",
+    );
 }
 
 test "readline backspace removes the previous character" {
@@ -495,7 +618,64 @@ test "backspace removes one UTF-8 codepoint and refreshes the cursor" {
 
     try std.testing.expectEqualStrings("aéz", repl.buf.items);
     try std.testing.expectEqual(@as(usize, 3), repl.pos);
-    try std.testing.expectEqualStrings("\r> aéz\x1b[0K\r\x1b[4C", output.written());
+    try std.testing.expectEqualStrings("> aéz\x1b[0K\r\x1b[4C", output.written());
+}
+
+test "redisplay clears physical rows left after reflow" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("");
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 4,
+        .rows = 24,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    repl.cols = 4;
+    repl.rows = 24;
+    try repl.buf.appendSlice(allocator, "abcdef");
+    repl.pos = repl.buf.items.len;
+    try repl.refreshLine();
+
+    output.writer.end = 0;
+    repl.buf.items.len = 1;
+    repl.pos = 1;
+    try repl.refreshLine();
+
+    try std.testing.expectEqualStrings(
+        "\r\x1b[2A> a\x1b[0K\r\n\x1b[0K\r\n\x1b[0K\x1b[2A\r\x1b[3C",
+        output.written(),
+    );
+}
+
+test "redisplay keeps the cursor visible when input exceeds terminal height" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("");
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 4,
+        .rows = 2,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    repl.cols = 4;
+    repl.rows = 2;
+    try repl.buf.appendSlice(allocator, "abcdef");
+    repl.pos = repl.buf.items.len;
+
+    try repl.refreshLine();
+
+    try std.testing.expectEqual(@as(usize, 2), repl.rendered_rows);
+    try std.testing.expectEqual(@as(usize, 1), repl.rendered_cursor_row);
+    try std.testing.expectEqualStrings("cdef\x1b[0K\r\n\x1b[0K\r", output.written());
 }
 
 test "move left and right across UTF-8 codepoints" {
