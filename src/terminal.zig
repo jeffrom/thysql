@@ -89,3 +89,18 @@ pub fn size() Size {
 pub fn columns() usize {
     return size().columns;
 }
+
+/// Wait briefly for a terminal response on the process standard input. Replar
+/// still reads the bytes through its configured reader so existing buffering
+/// remains authoritative.
+pub fn stdinReady(timeout_ms: i32) bool {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return false;
+
+    var fds = [_]posix.pollfd{.{
+        .fd = std.Io.File.stdin().handle,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    return (posix.poll(&fds, timeout_ms) catch return false) > 0 and
+        fds[0].revents & posix.POLL.IN != 0;
+}

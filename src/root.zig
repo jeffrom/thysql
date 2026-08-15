@@ -1,9 +1,12 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const display = @import("display.zig");
 const terminal = @import("terminal.zig");
 const unicode = @import("unicode.zig");
+
+pub const kitty = @import("kitty.zig");
 
 pub const TermState = terminal.TermState;
 
@@ -45,7 +48,12 @@ const KeyCode = enum(u8) {
 const MaxLine = 1024 * 1024;
 
 pub const ReplConfig = struct {
+    /// Text or a richer encoded prompt. Kitty PNG prompts can be produced with
+    /// kitty.pngPrompt while ordinary string prompts require no special setup.
     prompt: []const u8,
+    /// Used when prompt contains Kitty graphics commands but the terminal does
+    /// not answer the Kitty graphics capability query.
+    fallback_prompt: ?[]const u8 = null,
     in: *Io.Reader,
     out: *Io.Writer,
     /// Override the detected terminal width. Intended for embedders and tests
@@ -69,6 +77,9 @@ pub const Repl = struct {
     rendered_cursor_row: usize,
     quoted_next: bool,
     bracketed_paste_enabled: bool,
+    prompt_setup_written: bool,
+    prompt_selected: bool,
+    active_prompt: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
         return .{
@@ -82,6 +93,9 @@ pub const Repl = struct {
             .rendered_cursor_row = 0,
             .quoted_next = false,
             .bracketed_paste_enabled = false,
+            .prompt_setup_written = false,
+            .prompt_selected = false,
+            .active_prompt = cfg.prompt,
         };
     }
 
@@ -134,11 +148,78 @@ pub const Repl = struct {
         self.quoted_next = false;
         // std.debug.print("\r\neditStart: {} cols, line buffer {}/{}\r\n", .{ self.cols, self.pos, self.buf.capacity });
 
+        if (!self.prompt_selected) {
+            if (self.cfg.fallback_prompt) |fallback| {
+                if (std.mem.indexOf(u8, self.cfg.prompt, "\x1b_G") != null and
+                    !try self.detectKittyGraphics())
+                {
+                    self.active_prompt = fallback;
+                }
+            }
+            self.prompt_selected = true;
+        }
+
         if (self.cfg.bracketed_paste) {
             try self.cfg.out.writeAll("\x1b[?2004h");
             self.bracketed_paste_enabled = true;
         }
+        if (!self.prompt_setup_written) {
+            try self.writePromptSetup();
+            self.prompt_setup_written = true;
+        }
         try self.refreshLine();
+    }
+
+    fn writePromptSetup(self: *Repl) !void {
+        var i: usize = 0;
+        while (i < self.active_prompt.len) {
+            const len = display.kittyGraphicsLen(self.active_prompt[i..]);
+            if (len > 0) {
+                try self.cfg.out.writeAll(self.active_prompt[i .. i + len]);
+                i += len;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    const kitty_query_id = 2_147_483_646;
+
+    fn detectKittyGraphics(self: *Repl) !bool {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return false;
+
+        try self.cfg.out.print(
+            "\x1b_Gi={d},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c",
+            .{kitty_query_id},
+        );
+        try self.cfg.out.flush();
+
+        var response: std.ArrayList(u8) = .empty;
+        defer response.deinit(self.allocator);
+        while (response.items.len < 4096) {
+            if (self.cfg.in.bufferedLen() == 0 and !terminal.stdinReady(200)) return false;
+            const byte = self.cfg.in.takeByte() catch return false;
+            try response.append(self.allocator, byte);
+            if (hasDeviceAttributesResponse(response.items)) break;
+        }
+        return hasKittyOkResponse(response.items);
+    }
+
+    fn hasKittyOkResponse(response: []const u8) bool {
+        var expected: [64]u8 = undefined;
+        const ok = std.fmt.bufPrint(&expected, "\x1b_Gi={d};OK\x1b\\", .{kitty_query_id}) catch unreachable;
+        return std.mem.indexOf(u8, response, ok) != null;
+    }
+
+    fn hasDeviceAttributesResponse(response: []const u8) bool {
+        var i: usize = 0;
+        while (i + 2 < response.len) : (i += 1) {
+            if (response[i] != 0x1b or response[i + 1] != '[') continue;
+            var end = i + 2;
+            while (end < response.len and response[end] >= 0x20 and response[end] <= 0x3f) : (end += 1) {}
+            if (end < response.len and response[end] == 'c') return true;
+        }
+        return false;
     }
 
     fn readEditKey(self: *Repl) !ReadEditState {
@@ -387,7 +468,7 @@ pub const Repl = struct {
         }
         var next = try display.layout(
             self.allocator,
-            self.cfg.prompt,
+            self.active_prompt,
             self.buf.items,
             self.pos,
             self.cols,
@@ -521,6 +602,47 @@ fn expectReadline(inputBytes: []const u8, columns: usize, expectedLine: []const 
 
 test "readline reads an ordinary line" {
     try expectReadline("hello" ++ testKeys.enter, 80, "hello");
+}
+
+test "kitty prompt setup is emitted only once while placeholders repaint" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("a" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const setup = "\x1b_Ga=p,U=1,i=42,c=1,r=1,q=2\x1b\\";
+    const cfg: ReplConfig = .{
+        .prompt = "\x01" ++ setup ++ "\x02\u{10eeee}\u{0305}> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .rows = 24,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("a", try repl.readline());
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), setup));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), "\u{10eeee}"));
+}
+
+test "kitty capability responses are recognized before device attributes" {
+    var ok_response: [128]u8 = undefined;
+    const ok = try std.fmt.bufPrint(
+        &ok_response,
+        "\x1b_Gi={d};OK\x1b\\\x1b[?1;2c",
+        .{Repl.kitty_query_id},
+    );
+    try std.testing.expect(Repl.hasKittyOkResponse(ok));
+    try std.testing.expect(Repl.hasDeviceAttributesResponse(ok));
+
+    var error_response: [128]u8 = undefined;
+    const unsupported = try std.fmt.bufPrint(
+        &error_response,
+        "\x1b_Gi={d};EINVAL\x1b\\\x1b[?1;2c",
+        .{Repl.kitty_query_id},
+    );
+    try std.testing.expect(!Repl.hasKittyOkResponse(unsupported));
+    try std.testing.expect(Repl.hasDeviceAttributesResponse(unsupported));
 }
 
 test "quoted ctrl-j inserts a literal newline" {
