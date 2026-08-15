@@ -7,6 +7,7 @@ const terminal = @import("terminal.zig");
 const unicode = @import("unicode.zig");
 
 pub const kitty = @import("kitty.zig");
+const kill = @import("kill.zig");
 
 pub const TermState = terminal.TermState;
 
@@ -67,7 +68,7 @@ pub const ReplConfig = struct {
 };
 
 pub const Repl = struct {
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     cfg: *const ReplConfig,
     buf: std.ArrayList(u8),
     pos: usize,
@@ -80,12 +81,14 @@ pub const Repl = struct {
     prompt_setup_written: bool,
     prompt_selected: bool,
     active_prompt: []const u8,
+    kills: kill.Ring,
+    lastCommandWasKill: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
+    pub fn init(gpa: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
         return .{
-            .allocator = allocator,
+            .gpa = gpa,
             .cfg = cfg,
-            .buf = try std.ArrayList(u8).initCapacity(allocator, 1024),
+            .buf = try std.ArrayList(u8).initCapacity(gpa, 1024),
             .pos = 0,
             .cols = 0,
             .rows = 0,
@@ -96,12 +99,13 @@ pub const Repl = struct {
             .prompt_setup_written = false,
             .prompt_selected = false,
             .active_prompt = cfg.prompt,
+            .kills = try kill.Ring.init(gpa),
         };
     }
 
     pub fn deinit(self: *Repl) void {
-        self.buf.deinit(self.allocator);
-        // self.allocator.free(self.buf);
+        self.buf.deinit(self.gpa);
+        self.kills.deinit();
     }
 
     pub fn readline(self: *Repl) ![]u8 {
@@ -195,11 +199,11 @@ pub const Repl = struct {
         try self.cfg.out.flush();
 
         var response: std.ArrayList(u8) = .empty;
-        defer response.deinit(self.allocator);
+        defer response.deinit(self.gpa);
         while (response.items.len < 4096) {
             if (self.cfg.in.bufferedLen() == 0 and !terminal.stdinReady(200)) return false;
             const byte = self.cfg.in.takeByte() catch return false;
-            try response.append(self.allocator, byte);
+            try response.append(self.gpa, byte);
             if (hasDeviceAttributesResponse(response.items)) break;
         }
         return hasKittyOkResponse(response.items);
@@ -224,12 +228,24 @@ pub const Repl = struct {
 
     fn readEditKey(self: *Repl) !ReadEditState {
         const c = try self.cfg.in.takeByte();
+        defer {
+            switch (c) {
+                @intFromEnum(KeyCode.CTRL_K), @intFromEnum(KeyCode.CTRL_W), @intFromEnum(KeyCode.CTRL_U) => {
+                    self.lastCommandWasKill = true;
+                },
+                else => {
+                    self.lastCommandWasKill = false;
+                },
+            }
+        }
+
         if (self.quoted_next) {
             self.quoted_next = false;
             try self.editInputByte(c, true);
             return ReadEditState.More;
         }
         // std.debug.print("readEditKey c: {c}\n", .{c});
+
         switch (c) {
             @intFromEnum(KeyCode.ENTER) => {
                 return ReadEditState.Done;
@@ -270,6 +286,14 @@ pub const Repl = struct {
                 self.quoted_next = true;
                 return ReadEditState.More;
             },
+            @intFromEnum(KeyCode.CTRL_K) => {
+                try self.editKillLine();
+                return ReadEditState.More;
+            },
+            @intFromEnum(KeyCode.CTRL_U) => {
+                try self.editBackwardsKillLine();
+                return ReadEditState.More;
+            },
             @intFromEnum(KeyCode.ESC) => {
                 try self.editEscapeSequence();
                 return ReadEditState.More;
@@ -305,7 +329,7 @@ pub const Repl = struct {
         }
 
         const oldLen = self.buf.items.len;
-        try self.buf.resize(self.allocator, oldLen + bytes.len);
+        try self.buf.resize(self.gpa, oldLen + bytes.len);
         @memmove(
             self.buf.items[self.pos + bytes.len ..],
             self.buf.items[self.pos..oldLen],
@@ -362,6 +386,58 @@ pub const Repl = struct {
         }
     }
 
+    fn isWordCodepointAt(self: *const Repl, pos: usize) bool {
+        const len = unicode.codepointLenAt(self.buf.items, pos);
+        const codepoint = std.unicode.utf8Decode(self.buf.items[pos .. pos + len]) catch return false;
+
+        // Readline's default word predicate is iswalnum(3). Zig does not ship
+        // Unicode character-category tables, so retain its exact ASCII behavior
+        // and regard valid non-ASCII codepoints as word characters.
+        return if (codepoint <= 0x7f)
+            std.ascii.isAlphanumeric(@intCast(codepoint))
+        else
+            true;
+    }
+
+    fn editBackwardWord(self: *Repl) !void {
+        if (self.pos == 0) return;
+
+        var next = self.pos;
+        var previous = unicode.codepointStartBefore(self.buf.items, next);
+        while (!self.isWordCodepointAt(previous)) {
+            next = previous;
+            if (next == 0) break;
+            previous = unicode.codepointStartBefore(self.buf.items, next);
+        }
+        while (next > 0) {
+            previous = unicode.codepointStartBefore(self.buf.items, next);
+            if (!self.isWordCodepointAt(previous)) break;
+            next = previous;
+        }
+
+        if (next != self.pos) {
+            self.pos = next;
+            try self.refreshLine();
+        }
+    }
+
+    fn editForwardWord(self: *Repl) !void {
+        if (self.pos == self.buf.items.len) return;
+
+        var next = self.pos;
+        while (next < self.buf.items.len and !self.isWordCodepointAt(next)) {
+            next += unicode.codepointLenAt(self.buf.items, next);
+        }
+        while (next < self.buf.items.len and self.isWordCodepointAt(next)) {
+            next += unicode.codepointLenAt(self.buf.items, next);
+        }
+
+        if (next != self.pos) {
+            self.pos = next;
+            try self.refreshLine();
+        }
+    }
+
     fn editDelete(self: *Repl) !void {
         if (self.pos < self.buf.items.len) {
             const removedLen = unicode.codepointLenAt(self.buf.items, self.pos);
@@ -373,6 +449,22 @@ pub const Repl = struct {
             );
             self.buf.items.len -= removedLen;
             try self.refreshLine();
+        }
+    }
+
+    fn editKillLine(self: *Repl) !void {
+        if (self.pos == self.buf.items.len) {
+            return;
+        }
+
+        try self.kills.push(self.buf.items, self.pos, self.buf.items.len, self.lastCommandWasKill);
+        self.buf.items.len -= self.buf.items.len - self.pos;
+        try self.refreshLine();
+    }
+
+    fn editBackwardsKillLine(self: *Repl) !void {
+        if (self.pos == 0) {
+            return;
         }
     }
 
@@ -392,6 +484,8 @@ pub const Repl = struct {
                 const final = (try self.takeEscapeByte()) orelse return;
                 try self.editEscapeFinal(final, null);
             },
+            'b', 'B' => try self.editBackwardWord(),
+            'f', 'F' => try self.editForwardWord(),
             else => {},
         }
     }
@@ -444,12 +538,12 @@ pub const Repl = struct {
     fn editBracketedPaste(self: *Repl) !void {
         const suffix = "\x1b[201~";
         var pasted: std.ArrayList(u8) = .empty;
-        defer pasted.deinit(self.allocator);
+        defer pasted.deinit(self.gpa);
 
         while (true) {
             var byte = try self.cfg.in.takeByte();
             if (byte == '\r') byte = '\n';
-            try pasted.append(self.allocator, byte);
+            try pasted.append(self.gpa, byte);
 
             if (pasted.items.len >= suffix.len and std.mem.endsWith(u8, pasted.items, suffix)) {
                 pasted.items.len -= suffix.len;
@@ -467,13 +561,13 @@ pub const Repl = struct {
             if (self.cfg.rows == null) self.rows = current_size.rows;
         }
         var next = try display.layout(
-            self.allocator,
+            self.gpa,
             self.active_prompt,
             self.buf.items,
             self.pos,
             self.cols,
         );
-        defer next.deinit(self.allocator);
+        defer next.deinit(self.gpa);
 
         const visible_rows = @min(next.rows.items.len, @max(self.rows, 1));
         var first_row: usize = 0;
@@ -580,6 +674,8 @@ const testKeys = struct {
     const left = "\x1b[D";
     const home = "\x1b[H";
     const end = "\x1b[F";
+    const meta_b = "\x1bb";
+    const meta_f = "\x1bf";
 };
 
 fn expectReadline(inputBytes: []const u8, columns: usize, expectedLine: []const u8) !void {
@@ -676,6 +772,24 @@ test "readline home and end reposition the cursor" {
 
 test "readline left arrow allows insertion in the middle" {
     try expectReadline("ac" ++ testKeys.left ++ "b" ++ testKeys.enter, 80, "abc");
+}
+
+test "meta-b and meta-f move by Readline words" {
+    try expectReadline(
+        "one two.three" ++ testKeys.meta_b ++ testKeys.meta_b ++ "-" ++
+            testKeys.meta_f ++ "!" ++ testKeys.enter,
+        80,
+        "one -two!.three",
+    );
+}
+
+test "meta-b and meta-f respect UTF-8 boundaries" {
+    try expectReadline(
+        "é界 ok" ++ testKeys.meta_b ++ testKeys.meta_b ++ "!" ++
+            testKeys.meta_f ++ "?" ++ testKeys.enter,
+        80,
+        "!é界? ok",
+    );
 }
 
 test "readline editing respects UTF-8 boundaries" {
