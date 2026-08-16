@@ -466,6 +466,15 @@ pub const Repl = struct {
         if (self.pos == 0) {
             return;
         }
+
+        try self.kills.push(self.buf.items, self.pos, 0, self.lastCommandWasKill);
+
+        const headLen = self.buf.items.len - self.pos;
+        @memmove(self.buf.items[0..self.pos][0..headLen], self.buf.items[self.pos..self.buf.items.len]);
+
+        self.buf.items.len -= self.pos;
+        self.pos = 0;
+        try self.refreshLine();
     }
 
     fn takeEscapeByte(self: *Repl) Io.Reader.Error!?u8 {
