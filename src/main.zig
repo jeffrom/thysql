@@ -1,7 +1,24 @@
 const std = @import("std");
 const Io = std.Io;
+const posix = std.posix;
 
 const replete = @import("replete");
+
+var active_term: ?*const replete.TermState = null;
+
+fn handleSigterm(_: posix.SIG) callconv(.c) void {
+    if (active_term) |term| term.disable();
+    posix.system._exit(128 + @intFromEnum(posix.SIG.TERM));
+}
+
+fn installSigtermHandler() void {
+    const action: posix.Sigaction = .{
+        .handler = .{ .handler = handleSigterm },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.TERM, &action, null);
+}
 
 const Options = struct {
     debug: bool = false,
@@ -122,7 +139,12 @@ pub fn main(init: std.process.Init) !void {
     defer repl.deinit();
 
     const term = try replete.TermState.enable(stdin_file_reader.file.handle);
-    defer term.disable();
+    active_term = &term;
+    defer {
+        term.disable();
+        active_term = null;
+    }
+    installSigtermHandler();
 
     if (opts.debug) {
         try repl.debugMode();
