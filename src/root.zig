@@ -22,6 +22,12 @@ const ReadEditState = enum {
     EOF,
 };
 
+const LastCommand = enum {
+    other,
+    kill,
+    yank,
+};
+
 const KeyCode = enum(u8) {
     KEY_NULL = 0,
     CTRL_A = 1,
@@ -73,6 +79,7 @@ pub const Repl = struct {
     cfg: *const ReplConfig,
     buf: std.ArrayList(u8),
     pos: usize,
+    yankPos: usize, // for cycling the kill ring (ctrl-y, meta-y)
     cols: usize,
     rows: usize,
     rendered_rows: usize,
@@ -83,7 +90,7 @@ pub const Repl = struct {
     prompt_selected: bool,
     active_prompt: []const u8,
     kills: kill.Ring,
-    lastCommandWasKill: bool = false,
+    lastCommand: LastCommand = .other,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
         return .{
@@ -91,6 +98,7 @@ pub const Repl = struct {
             .cfg = cfg,
             .buf = try std.ArrayList(u8).initCapacity(gpa, 1024),
             .pos = 0,
+            .yankPos = 0,
             .cols = 0,
             .rows = 0,
             .rendered_rows = 0,
@@ -229,16 +237,8 @@ pub const Repl = struct {
 
     fn readEditKey(self: *Repl) !ReadEditState {
         const c = try self.cfg.in.takeByte();
-        defer {
-            switch (c) {
-                @intFromEnum(KeyCode.CTRL_K), @intFromEnum(KeyCode.CTRL_W), @intFromEnum(KeyCode.CTRL_U) => {
-                    self.lastCommandWasKill = true;
-                },
-                else => {
-                    self.lastCommandWasKill = false;
-                },
-            }
-        }
+        var command: LastCommand = .other;
+        defer self.lastCommand = command;
 
         if (self.quoted_next) {
             self.quoted_next = false;
@@ -288,19 +288,22 @@ pub const Repl = struct {
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.CTRL_K) => {
+                command = .kill;
                 try self.editKillLine();
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.CTRL_U) => {
+                command = .kill;
                 try self.editBackwardsKillLine();
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.CTRL_Y) => {
+                command = .yank;
                 try self.editYank();
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.ESC) => {
-                try self.editEscapeSequence();
+                command = try self.editEscapeSequence();
                 return ReadEditState.More;
             },
             else => {
@@ -462,8 +465,9 @@ pub const Repl = struct {
             return;
         }
 
-        try self.kills.push(self.buf.items, self.pos, self.buf.items.len, self.lastCommandWasKill);
+        try self.kills.push(self.buf.items, self.pos, self.buf.items.len, self.lastCommand == .kill);
         self.buf.items.len -= self.buf.items.len - self.pos;
+
         try self.refreshLine();
     }
 
@@ -472,7 +476,7 @@ pub const Repl = struct {
             return;
         }
 
-        try self.kills.push(self.buf.items, self.pos, 0, self.lastCommandWasKill);
+        try self.kills.push(self.buf.items, self.pos, 0, self.lastCommand == .kill);
 
         const headLen = self.buf.items.len - self.pos;
         @memmove(self.buf.items[0..self.pos][0..headLen], self.buf.items[self.pos..self.buf.items.len]);
@@ -483,10 +487,30 @@ pub const Repl = struct {
     }
 
     fn editYank(self: *Repl) !void {
-        const k = self.kills.pop() orelse null;
+        const k = self.kills.get();
         if (k != null) {
+            self.yankPos = self.pos;
             try self.editInsertSlice(k.?);
         }
+    }
+
+    fn editYankPop(self: *Repl) !LastCommand {
+        if (self.lastCommand != .yank) return .other;
+
+        const previous = self.kills.get() orelse return .other;
+        const changed = self.kills.yankPop();
+        if (changed) {
+            const tail_start = self.yankPos + previous.len;
+            const tail_len = self.buf.items.len - tail_start;
+            @memmove(
+                self.buf.items[self.yankPos..][0..tail_len],
+                self.buf.items[tail_start..],
+            );
+            self.buf.items.len -= previous.len;
+            self.pos = self.yankPos;
+            try self.editYank();
+        }
+        return if (changed) .yank else .other;
     }
 
     fn takeEscapeByte(self: *Repl) Io.Reader.Error!?u8 {
@@ -496,18 +520,29 @@ pub const Repl = struct {
         };
     }
 
-    fn editEscapeSequence(self: *Repl) !void {
-        const introducer = (try self.takeEscapeByte()) orelse return;
+    fn editEscapeSequence(self: *Repl) !LastCommand {
+        const introducer = (try self.takeEscapeByte()) orelse return .other;
 
         switch (introducer) {
-            '[' => try self.editCsiSequence(),
-            'O' => {
-                const final = (try self.takeEscapeByte()) orelse return;
-                try self.editEscapeFinal(final, null);
+            '[' => {
+                try self.editCsiSequence();
+                return .other;
             },
-            'b', 'B' => try self.editBackwardWord(),
-            'f', 'F' => try self.editForwardWord(),
-            else => {},
+            'O' => {
+                const final = (try self.takeEscapeByte()) orelse return .other;
+                try self.editEscapeFinal(final, null);
+                return .other;
+            },
+            'b', 'B' => {
+                try self.editBackwardWord();
+                return .other;
+            },
+            'f', 'F' => {
+                try self.editForwardWord();
+                return .other;
+            },
+            'y', 'Y' => return self.editYankPop(),
+            else => return .other,
         }
     }
 
@@ -692,11 +727,14 @@ const testKeys = struct {
     const backspace = "\x7f";
     const ctrl_c = "\x03";
     const ctrl_d = "\x04";
+    const ctrl_f = "\x06";
+    const ctrl_y = "\x19";
     const left = "\x1b[D";
     const home = "\x1b[H";
     const end = "\x1b[F";
     const meta_b = "\x1bb";
     const meta_f = "\x1bf";
+    const meta_y = "\x1by";
 };
 
 fn expectReadline(inputBytes: []const u8, columns: usize, expectedLine: []const u8) !void {
@@ -793,6 +831,30 @@ test "readline home and end reposition the cursor" {
 
 test "readline left arrow allows insertion in the middle" {
     try expectReadline("ac" ++ testKeys.left ++ "b" ++ testKeys.enter, 80, "abc");
+}
+
+test "yank pop replaces differently sized kills without removing following text" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed(
+        "leftright" ++ testKeys.home ++ testKeys.ctrl_f ** 4 ++ testKeys.ctrl_y ++
+            testKeys.meta_y ++ testKeys.meta_y ++ testKeys.enter,
+    );
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try repl.kills.push("medium", 0, 6, false);
+    try repl.kills.push("x", 0, 1, false);
+    try repl.kills.push("most-recent", 0, 11, false);
+
+    try std.testing.expectEqualStrings("leftmediumright", try repl.readline());
 }
 
 test "meta-b and meta-f move by Readline words" {

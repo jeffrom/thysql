@@ -90,8 +90,8 @@ pub fn columns() usize {
     return size().columns;
 }
 
-/// Wait briefly for a terminal response on the process standard input. Replar
-/// still reads the bytes through its configured reader so existing buffering
+/// Wait briefly for a terminal response on the process standard input. We
+/// still read the bytes through its configured reader so existing buffering
 /// remains authoritative.
 pub fn stdinReady(timeout_ms: i32) bool {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return false;
