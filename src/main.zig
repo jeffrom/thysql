@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const replar = @import("replar");
+const replete = @import("replete");
 
 const Options = struct {
     debug: bool = false,
@@ -59,7 +59,7 @@ fn parseOptions(args: []const []const u8) OptionsError!Options {
             if (options.prompt_columns == 0) return error.InvalidOptionValue;
         } else if (try optionValue(args, &i, arg, "--prompt-rows")) |value| {
             options.prompt_rows = try parseUnsigned(usize, value);
-            if (options.prompt_rows == 0 or options.prompt_rows > replar.kitty.max_rows) {
+            if (options.prompt_rows == 0 or options.prompt_rows > replete.kitty.max_rows) {
                 return error.InvalidOptionValue;
             }
         } else if (try optionValue(args, &i, arg, "--prompt-gap")) |value| {
@@ -88,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
     var fallback_prompt: ?[]const u8 = null;
     if (opts.prompt_image) |path| {
         const png = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024));
-        prompt = try replar.kitty.pngPrompt(arena, png, .{
+        prompt = try replete.kitty.pngPrompt(arena, png, .{
             .image_id = opts.prompt_image_id,
             .columns = opts.prompt_columns,
             .rows = opts.prompt_rows,
@@ -112,16 +112,16 @@ pub fn main(init: std.process.Init) !void {
 
     // need to get stdin's fileno here to put the terminal in raw mode
     // stdin_file_reader.file.handle
-    const cfg = replar.ReplConfig{
+    const cfg = replete.ReplConfig{
         .prompt = prompt,
         .fallback_prompt = fallback_prompt,
         .in = stdin_reader,
         .out = stdout_writer,
     };
-    var repl = try replar.Repl.init(init.gpa, &cfg);
+    var repl = try replete.Repl.init(init.gpa, &cfg);
     defer repl.deinit();
 
-    const term = try replar.TermState.enable(stdin_file_reader.file.handle);
+    const term = try replete.TermState.enable(stdin_file_reader.file.handle);
     defer term.disable();
 
     if (opts.debug) {
@@ -134,7 +134,7 @@ pub fn main(init: std.process.Init) !void {
                     try stdout_writer.flush();
                     return;
                 },
-                replar.ReplError.Cancelled => {
+                replete.ReplError.Cancelled => {
                     try stdout_writer.printAscii("\r\n^C\r\n", .{});
                     try stdout_writer.flush();
                     continue;
@@ -166,23 +166,23 @@ test "simple test" {
 }
 
 test "prompt image is optional and accepts both flag forms" {
-    const plain = try parseOptions(&.{"replar"});
+    const plain = try parseOptions(&.{"replete"});
     try std.testing.expect(!plain.debug);
     try std.testing.expectEqual(@as(?[]const u8, null), plain.prompt_image);
 
-    const separate = try parseOptions(&.{ "replar", "--debug", "--prompt-image", "cat.png" });
+    const separate = try parseOptions(&.{ "replete", "--debug", "--prompt-image", "cat.png" });
     try std.testing.expect(separate.debug);
     try std.testing.expectEqualStrings("cat.png", separate.prompt_image.?);
 
-    const joined = try parseOptions(&.{ "replar", "--prompt-image=/tmp/cat.png" });
+    const joined = try parseOptions(&.{ "replete", "--prompt-image=/tmp/cat.png" });
     try std.testing.expectEqualStrings("/tmp/cat.png", joined.prompt_image.?);
 
-    try std.testing.expectError(error.MissingOptionValue, parseOptions(&.{ "replar", "--prompt-image" }));
+    try std.testing.expectError(error.MissingOptionValue, parseOptions(&.{ "replete", "--prompt-image" }));
 }
 
 test "prompt image layout flags parse and validate" {
     const options = try parseOptions(&.{
-        "replar",
+        "replete",
         "--prompt-image-id=42",
         "--prompt-columns",
         "10",
@@ -200,9 +200,9 @@ test "prompt image layout flags parse and validate" {
     try std.testing.expectEqualStrings("λ> ", options.prompt_text);
     try std.testing.expectEqualStrings("$ ", options.prompt_fallback);
 
-    try std.testing.expectError(error.InvalidOptionValue, parseOptions(&.{ "replar", "--prompt-image-id=0" }));
-    try std.testing.expectError(error.InvalidOptionValue, parseOptions(&.{ "replar", "--prompt-columns=nope" }));
-    try std.testing.expectError(error.InvalidOptionValue, parseOptions(&.{ "replar", "--prompt-rows=0" }));
+    try std.testing.expectError(error.InvalidOptionValue, parseOptions(&.{ "replete", "--prompt-image-id=0" }));
+    try std.testing.expectError(error.InvalidOptionValue, parseOptions(&.{ "replete", "--prompt-columns=nope" }));
+    try std.testing.expectError(error.InvalidOptionValue, parseOptions(&.{ "replete", "--prompt-rows=0" }));
 }
 
 test "fuzz example" {
