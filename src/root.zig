@@ -5,8 +5,12 @@ const Io = std.Io;
 const display = @import("display.zig");
 const terminal = @import("terminal.zig");
 const unicode = @import("unicode.zig");
+const history_mod = @import("history.zig");
 
 pub const kitty = @import("kitty.zig");
+pub const History = history_mod.History;
+pub const HistoryOptions = history_mod.Options;
+pub const HistoryDeduplication = history_mod.Deduplication;
 const kill = @import("kill.zig");
 
 pub const TermState = terminal.TermState;
@@ -44,6 +48,8 @@ const KeyCode = enum(u8) {
     CTRL_N = 14,
     CTRL_P = 16,
     CTRL_Q = 17,
+    CTRL_R = 18,
+    CTRL_S = 19,
     CTRL_T = 20,
     CTRL_U = 21,
     CTRL_V = 22,
@@ -72,6 +78,9 @@ pub const ReplConfig = struct {
     /// Ask the terminal to delimit pasted text so it can be inserted without
     /// executing editing commands. Matches GNU Readline's default.
     bracketed_paste: bool = true,
+    /// Optional command history used by navigation and search. Like GNU
+    /// Readline, adding accepted lines remains the caller's responsibility.
+    history: ?*History = null,
 };
 
 pub const Repl = struct {
@@ -90,6 +99,10 @@ pub const Repl = struct {
     prompt_selected: bool,
     active_prompt: []const u8,
     kills: kill.Ring,
+    history_index: usize,
+    saved_line: std.ArrayList(u8),
+    saved_line_valid: bool,
+    last_search: std.ArrayList(u8),
     lastCommand: LastCommand = .other,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
@@ -109,12 +122,18 @@ pub const Repl = struct {
             .prompt_selected = false,
             .active_prompt = cfg.prompt,
             .kills = try kill.Ring.init(gpa),
+            .history_index = 0,
+            .saved_line = .empty,
+            .saved_line_valid = false,
+            .last_search = .empty,
         };
     }
 
     pub fn deinit(self: *Repl) void {
         self.buf.deinit(self.gpa);
         self.kills.deinit();
+        self.saved_line.deinit(self.gpa);
+        self.last_search.deinit(self.gpa);
     }
 
     pub fn readline(self: *Repl) ![]u8 {
@@ -139,6 +158,7 @@ pub const Repl = struct {
                     // try self.refreshLine();
                 },
                 ReadEditState.Done => {
+                    try self.saveEditedHistoryEntry();
                     try self.finishAtBottom();
                     return self.buf.items;
                 },
@@ -159,7 +179,9 @@ pub const Repl = struct {
         self.rendered_rows = 0;
         self.rendered_cursor_row = 0;
         self.quoted_next = false;
-        // std.debug.print("\r\neditStart: {} cols, line buffer {}/{}\r\n", .{ self.cols, self.pos, self.buf.capacity });
+        self.saved_line.clearRetainingCapacity();
+        self.saved_line_valid = false;
+        self.history_index = if (self.cfg.history) |history| history.len() else 0;
 
         if (!self.prompt_selected) {
             if (self.cfg.fallback_prompt) |fallback| {
@@ -283,6 +305,20 @@ pub const Repl = struct {
                 try self.editMoveRight();
                 return ReadEditState.More;
             },
+            @intFromEnum(KeyCode.CTRL_P) => {
+                try self.editPreviousHistory();
+                return ReadEditState.More;
+            },
+            @intFromEnum(KeyCode.CTRL_N) => {
+                try self.editNextHistory();
+                return ReadEditState.More;
+            },
+            @intFromEnum(KeyCode.CTRL_R) => {
+                return try self.editIncrementalSearch(.backward);
+            },
+            @intFromEnum(KeyCode.CTRL_S) => {
+                return try self.editIncrementalSearch(.forward);
+            },
             @intFromEnum(KeyCode.CTRL_Q), @intFromEnum(KeyCode.CTRL_V) => {
                 self.quoted_next = true;
                 return ReadEditState.More;
@@ -392,6 +428,55 @@ pub const Repl = struct {
             self.pos += unicode.codepointLenAt(self.buf.items, self.pos);
             try self.refreshLine();
         }
+    }
+
+    fn replaceBuffer(self: *Repl, line: []const u8, point: ?usize) !void {
+        if (line.len > MaxLine) return error.LineTooLong;
+        self.buf.clearRetainingCapacity();
+        try self.buf.appendSlice(self.gpa, line);
+        self.pos = @min(point orelse line.len, line.len);
+    }
+
+    fn saveEditedHistoryEntry(self: *Repl) !void {
+        const history = self.cfg.history orelse return;
+        if (self.history_index < history.len()) {
+            _ = try history.replace(self.history_index, self.buf.items);
+        }
+    }
+
+    fn saveUnfinishedLine(self: *Repl) !void {
+        if (self.saved_line_valid) return;
+        self.saved_line.clearRetainingCapacity();
+        try self.saved_line.appendSlice(self.gpa, self.buf.items);
+        self.saved_line_valid = true;
+    }
+
+    fn editPreviousHistory(self: *Repl) !void {
+        const history = self.cfg.history orelse return;
+        if (history.len() == 0 or self.history_index == 0) return;
+
+        if (self.history_index == history.len()) {
+            try self.saveUnfinishedLine();
+        } else {
+            try self.saveEditedHistoryEntry();
+        }
+        self.history_index -= 1;
+        try self.replaceBuffer(history.get(self.history_index).?.line, null);
+        try self.refreshLine();
+    }
+
+    fn editNextHistory(self: *Repl) !void {
+        const history = self.cfg.history orelse return;
+        if (self.history_index >= history.len()) return;
+
+        try self.saveEditedHistoryEntry();
+        self.history_index += 1;
+        if (self.history_index == history.len()) {
+            try self.replaceBuffer(if (self.saved_line_valid) self.saved_line.items else "", null);
+        } else {
+            try self.replaceBuffer(history.get(self.history_index).?.line, null);
+        }
+        try self.refreshLine();
     }
 
     fn isWordCodepointAt(self: *const Repl, pos: usize) bool {
@@ -513,6 +598,212 @@ pub const Repl = struct {
         return if (changed) .yank else .other;
     }
 
+    const SearchOriginal = struct {
+        line: []u8,
+        point: usize,
+        history_index: usize,
+
+        fn deinit(original: SearchOriginal, gpa: std.mem.Allocator) void {
+            gpa.free(original.line);
+        }
+    };
+
+    fn searchOriginal(self: *Repl) !SearchOriginal {
+        return .{
+            .line = try self.gpa.dupe(u8, self.buf.items),
+            .point = self.pos,
+            .history_index = self.history_index,
+        };
+    }
+
+    fn searchStart(history_len: usize, position: usize, direction: history_mod.Direction) ?usize {
+        if (history_len == 0) return null;
+        return switch (direction) {
+            .backward => if (position >= history_len) history_len - 1 else position,
+            .forward => if (position + 1 < history_len) position + 1 else null,
+        };
+    }
+
+    fn searchNext(history_len: usize, index: usize, direction: history_mod.Direction) ?usize {
+        return switch (direction) {
+            .backward => if (index == 0) null else index - 1,
+            .forward => if (index + 1 < history_len) index + 1 else null,
+        };
+    }
+
+    fn showIncrementalSearch(
+        self: *Repl,
+        query: []const u8,
+        direction: history_mod.Direction,
+        match: ?history_mod.Match,
+        failed: bool,
+    ) !void {
+        const history = self.cfg.history.?;
+        const label = switch (direction) {
+            .backward => "reverse-i-search",
+            .forward => "forward-i-search",
+        };
+        const prompt = if (failed)
+            try std.fmt.allocPrint(self.gpa, "(failed {s})`{s}': ", .{ label, query })
+        else
+            try std.fmt.allocPrint(self.gpa, "({s})`{s}': ", .{ label, query });
+        defer self.gpa.free(prompt);
+
+        const normal_prompt = self.active_prompt;
+        self.active_prompt = prompt;
+        defer self.active_prompt = normal_prompt;
+        if (match) |found| {
+            try self.replaceBuffer(history.get(found.index).?.line, found.offset + query.len);
+        }
+        try self.refreshLine();
+    }
+
+    fn acceptSearchMatch(self: *Repl, original: SearchOriginal, match: history_mod.Match) !void {
+        const history = self.cfg.history.?;
+        if (original.history_index == history.len()) {
+            try self.replaceBuffer(original.line, original.point);
+            try self.saveUnfinishedLine();
+        }
+        self.history_index = match.index;
+        try self.replaceBuffer(history.get(match.index).?.line, match.offset);
+    }
+
+    fn editIncrementalSearch(self: *Repl, initial_direction: history_mod.Direction) !ReadEditState {
+        const history = self.cfg.history orelse return .More;
+        if (history.len() == 0) return .More;
+
+        const original = try self.searchOriginal();
+        defer original.deinit(self.gpa);
+        var query: std.ArrayList(u8) = .empty;
+        defer query.deinit(self.gpa);
+        var direction = initial_direction;
+        var match: ?history_mod.Match = null;
+
+        if (searchStart(history.len(), original.history_index, direction)) |start| {
+            match = history.find(query.items, start, direction, .substring);
+        }
+        try self.showIncrementalSearch(query.items, direction, match, match == null);
+
+        while (true) {
+            const byte = try self.cfg.in.takeByte();
+            switch (byte) {
+                @intFromEnum(KeyCode.ENTER) => {
+                    if (match) |found| {
+                        try self.acceptSearchMatch(original, found);
+                        try self.refreshLine();
+                        return .Done;
+                    }
+                    try self.replaceBuffer(original.line, original.point);
+                    self.history_index = original.history_index;
+                    try self.refreshLine();
+                    return .More;
+                },
+                @intFromEnum(KeyCode.ESC), @intFromEnum(KeyCode.CTRL_C), 7 => {
+                    try self.replaceBuffer(original.line, original.point);
+                    self.history_index = original.history_index;
+                    try self.refreshLine();
+                    return .More;
+                },
+                @intFromEnum(KeyCode.CTRL_R), @intFromEnum(KeyCode.CTRL_S) => {
+                    direction = if (byte == @intFromEnum(KeyCode.CTRL_R)) .backward else .forward;
+                    const start = if (match) |found|
+                        searchNext(history.len(), found.index, direction)
+                    else
+                        searchStart(history.len(), original.history_index, direction);
+                    match = if (start) |at| history.find(query.items, at, direction, .substring) else null;
+                },
+                @intFromEnum(KeyCode.BACKSPACE), @intFromEnum(KeyCode.CTRL_H) => {
+                    if (query.items.len > 0) {
+                        query.items.len = unicode.codepointStartBefore(query.items, query.items.len);
+                    }
+                    const start = searchStart(history.len(), original.history_index, direction);
+                    match = if (start) |at| history.find(query.items, at, direction, .substring) else null;
+                },
+                else => {
+                    if (!std.ascii.isPrint(byte) and byte < 0x80) {
+                        if (match) |found| try self.acceptSearchMatch(original, found) else {
+                            try self.replaceBuffer(original.line, original.point);
+                            self.history_index = original.history_index;
+                        }
+                        switch (byte) {
+                            @intFromEnum(KeyCode.CTRL_A) => try self.editStartOfLine(),
+                            @intFromEnum(KeyCode.CTRL_B) => try self.editMoveLeft(),
+                            @intFromEnum(KeyCode.CTRL_D) => try self.editDelete(),
+                            @intFromEnum(KeyCode.CTRL_E) => try self.editEndOfLine(),
+                            @intFromEnum(KeyCode.CTRL_F) => try self.editMoveRight(),
+                            else => try self.refreshLine(),
+                        }
+                        return .More;
+                    }
+                    const utf8_len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+                    try query.append(self.gpa, byte);
+                    for (1..utf8_len) |_| try query.append(self.gpa, try self.cfg.in.takeByte());
+                    const start = searchStart(history.len(), original.history_index, direction);
+                    match = if (start) |at| history.find(query.items, at, direction, .substring) else null;
+                },
+            }
+            try self.showIncrementalSearch(query.items, direction, match, match == null);
+        }
+    }
+
+    fn editNonIncrementalSearch(self: *Repl, direction: history_mod.Direction) !void {
+        const history = self.cfg.history orelse return;
+        if (history.len() == 0) return;
+        const original = try self.searchOriginal();
+        defer original.deinit(self.gpa);
+
+        const normal_prompt = self.active_prompt;
+        self.active_prompt = ": ";
+        try self.replaceBuffer("", 0);
+        try self.refreshLine();
+
+        var cancelled = false;
+        while (true) {
+            const byte = try self.cfg.in.takeByte();
+            switch (byte) {
+                @intFromEnum(KeyCode.ENTER) => break,
+                @intFromEnum(KeyCode.ESC), @intFromEnum(KeyCode.CTRL_C), 7 => {
+                    cancelled = true;
+                    break;
+                },
+                @intFromEnum(KeyCode.BACKSPACE), @intFromEnum(KeyCode.CTRL_H) => try self.editBackspace(),
+                else => try self.editInputByte(byte, false),
+            }
+        }
+
+        self.active_prompt = normal_prompt;
+        if (cancelled) {
+            try self.replaceBuffer(original.line, original.point);
+            self.history_index = original.history_index;
+            try self.refreshLine();
+            return;
+        }
+
+        if (self.buf.items.len > 0) {
+            self.last_search.clearRetainingCapacity();
+            try self.last_search.appendSlice(self.gpa, self.buf.items);
+        }
+        const start = switch (direction) {
+            .backward => if (original.history_index == 0) null else @min(original.history_index, history.len()) - 1,
+            .forward => if (original.history_index + 1 < history.len())
+                original.history_index + 1
+            else
+                null,
+        };
+        const match = if (start) |at|
+            history.find(self.last_search.items, at, direction, .substring)
+        else
+            null;
+        if (match) |found| {
+            try self.acceptSearchMatch(original, found);
+        } else {
+            try self.replaceBuffer(original.line, original.point);
+            self.history_index = original.history_index;
+            try self.cfg.out.writeByte(7);
+        }
+        try self.refreshLine();
+    }
+
     fn takeEscapeByte(self: *Repl) Io.Reader.Error!?u8 {
         return self.cfg.in.takeByte() catch |err| switch (err) {
             Io.Reader.Error.EndOfStream => null,
@@ -539,6 +830,14 @@ pub const Repl = struct {
             },
             'f', 'F' => {
                 try self.editForwardWord();
+                return .other;
+            },
+            'p', 'P' => {
+                try self.editNonIncrementalSearch(.backward);
+                return .other;
+            },
+            'n', 'N' => {
+                try self.editNonIncrementalSearch(.forward);
                 return .other;
             },
             'y', 'Y' => return self.editYankPop(),
@@ -576,6 +875,8 @@ pub const Repl = struct {
 
     fn editEscapeFinal(self: *Repl, final: u8, parameter: ?usize) !void {
         switch (final) {
+            'A' => try self.editPreviousHistory(),
+            'B' => try self.editNextHistory(),
             'C' => try self.editMoveRight(),
             'D' => try self.editMoveLeft(),
             'H' => try self.editStartOfLine(),
@@ -666,7 +967,7 @@ pub const Repl = struct {
     fn finishAtBottom(self: *Repl) !void {
         // If point is in an earlier viewport, display the final viewport before
         // handing control back to the caller. This leaves subsequent output
-        // below the complete accepted or cancelled input, as Readline does.
+        // below the complete accepted or cancelled input.
         if (self.pos != self.buf.items.len) {
             const saved_pos = self.pos;
             self.pos = self.buf.items.len;
@@ -728,13 +1029,20 @@ const testKeys = struct {
     const ctrl_c = "\x03";
     const ctrl_d = "\x04";
     const ctrl_f = "\x06";
+    const ctrl_n = "\x0e";
+    const ctrl_p = "\x10";
+    const ctrl_r = "\x12";
+    const ctrl_s = "\x13";
     const ctrl_y = "\x19";
     const left = "\x1b[D";
+    const up = "\x1b[A";
+    const down = "\x1b[B";
     const home = "\x1b[H";
     const end = "\x1b[F";
     const meta_b = "\x1bb";
     const meta_f = "\x1bf";
     const meta_y = "\x1by";
+    const meta_p = "\x1bp";
 };
 
 fn expectReadline(inputBytes: []const u8, columns: usize, expectedLine: []const u8) !void {
@@ -831,6 +1139,106 @@ test "readline home and end reposition the cursor" {
 
 test "readline left arrow allows insertion in the middle" {
     try expectReadline("ac" ++ testKeys.left ++ "b" ++ testKeys.enter, 80, "abc");
+}
+
+test "history navigation preserves edits and the unfinished line" {
+    const allocator = std.testing.allocator;
+    var history = History.init(allocator, .{});
+    defer history.deinit();
+    _ = try history.add("old", 1);
+    _ = try history.add("new", 2);
+
+    var input: Io.Reader = .fixed(
+        "unfinished" ++ testKeys.ctrl_p ++ "!" ++ testKeys.up ++
+            testKeys.ctrl_n ++ testKeys.down ++ testKeys.enter,
+    );
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .history = &history,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("unfinished", try repl.readline());
+    try std.testing.expectEqualStrings("new!", history.get(1).?.line);
+}
+
+test "incremental search changes direction and accepts a match" {
+    const allocator = std.testing.allocator;
+    var history = History.init(allocator, .{});
+    defer history.deinit();
+    _ = try history.add("git status", 1);
+    _ = try history.add("zig build", 2);
+    _ = try history.add("git diff", 3);
+
+    var input: Io.Reader = .fixed(
+        testKeys.ctrl_r ++ "git" ++ testKeys.ctrl_r ++ testKeys.ctrl_s ++ testKeys.enter,
+    );
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .history = &history,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("git diff", try repl.readline());
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "reverse-i-search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "forward-i-search") != null);
+}
+
+test "ctrl-e accepts an incremental search match and moves to its end" {
+    const allocator = std.testing.allocator;
+    var history = History.init(allocator, .{});
+    defer history.deinit();
+    _ = try history.add("echo matching command", 1);
+
+    var input: Io.Reader = .fixed(testKeys.ctrl_r ++ "matching" ++ "\x05" ++ "!" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .history = &history,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("echo matching command!", try repl.readline());
+}
+
+test "meta-p performs a prompted non-incremental history search" {
+    const allocator = std.testing.allocator;
+    var history = History.init(allocator, .{});
+    defer history.deinit();
+    _ = try history.add("git status", 1);
+    _ = try history.add("zig build", 2);
+
+    var input: Io.Reader = .fixed(testKeys.meta_p ++ "build" ++ testKeys.enter ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .history = &history,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("zig build", try repl.readline());
 }
 
 test "yank pop replaces differently sized kills without removing following text" {

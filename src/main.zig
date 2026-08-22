@@ -29,6 +29,11 @@ const Options = struct {
     prompt_gap: usize = 1,
     prompt_text: []const u8 = "> ",
     prompt_fallback: []const u8 = "> ",
+    history_enabled: bool = true,
+    history_file: ?[]const u8 = null,
+    history_limit: usize = 1000,
+    history_deduplication: replete.HistoryDeduplication = .consecutive,
+    history_timestamps: bool = true,
 };
 
 const OptionsError = error{
@@ -65,6 +70,20 @@ fn parseOptions(args: []const []const u8) OptionsError!Options {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--debug")) {
             options.debug = true;
+        } else if (std.mem.eql(u8, arg, "--no-history")) {
+            options.history_enabled = false;
+        } else if (std.mem.eql(u8, arg, "--no-history-timestamps")) {
+            options.history_timestamps = false;
+        } else if (try optionValue(args, &i, arg, "--history-file")) |value| {
+            if (value.len == 0) return error.InvalidOptionValue;
+            options.history_file = value;
+        } else if (try optionValue(args, &i, arg, "--history-limit")) |value| {
+            options.history_limit = try parseUnsigned(usize, value);
+        } else if (try optionValue(args, &i, arg, "--history-dedup")) |value| {
+            options.history_deduplication = std.meta.stringToEnum(
+                replete.HistoryDeduplication,
+                value,
+            ) orelse return error.InvalidOptionValue;
         } else if (try optionValue(args, &i, arg, "--prompt-image")) |value| {
             if (value.len == 0) return error.InvalidOptionValue;
             options.prompt_image = value;
@@ -101,6 +120,23 @@ pub fn main(init: std.process.Init) !void {
     // In order to do I/O operations need an `Io` instance.
     const io = init.io;
 
+    var history = replete.History.init(init.gpa, .{
+        .limit = opts.history_limit,
+        .deduplication = opts.history_deduplication,
+        .write_timestamps = opts.history_timestamps,
+    });
+    defer history.deinit();
+    const history_path = opts.history_file orelse if (init.environ_map.get("HOME")) |home|
+        try std.fmt.allocPrint(arena, "{s}/.replete_history", .{home})
+    else
+        ".replete_history";
+    if (opts.history_enabled) {
+        history.readFile(io, history_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
     var prompt: []const u8 = opts.prompt_text;
     var fallback_prompt: ?[]const u8 = null;
     if (opts.prompt_image) |path| {
@@ -134,6 +170,7 @@ pub fn main(init: std.process.Init) !void {
         .fallback_prompt = fallback_prompt,
         .in = stdin_reader,
         .out = stdout_writer,
+        .history = if (opts.history_enabled) &history else null,
     };
     var repl = try replete.Repl.init(init.gpa, &cfg);
     defer repl.deinit();
@@ -169,6 +206,10 @@ pub fn main(init: std.process.Init) !void {
             };
 
             if (line.len > 0) {
+                if (opts.history_enabled) {
+                    _ = try history.addNow(io, line);
+                    try history.writeFile(io, history_path);
+                }
                 try stdout_writer.print("\r\nreceived line: '{s}'", .{line});
             }
             try stdout_writer.printAscii("\r\n", .{});
@@ -225,6 +266,25 @@ test "prompt image layout flags parse and validate" {
     try std.testing.expectError(error.InvalidOptionValue, parseOptions(&.{ "replete", "--prompt-image-id=0" }));
     try std.testing.expectError(error.InvalidOptionValue, parseOptions(&.{ "replete", "--prompt-columns=nope" }));
     try std.testing.expectError(error.InvalidOptionValue, parseOptions(&.{ "replete", "--prompt-rows=0" }));
+}
+
+test "history flags parse and validate" {
+    const options = try parseOptions(&.{
+        "replete",
+        "--history-file=/tmp/replete-history",
+        "--history-limit",
+        "25",
+        "--history-dedup=all",
+        "--no-history-timestamps",
+    });
+    try std.testing.expectEqualStrings("/tmp/replete-history", options.history_file.?);
+    try std.testing.expectEqual(@as(usize, 25), options.history_limit);
+    try std.testing.expectEqual(replete.HistoryDeduplication.all, options.history_deduplication);
+    try std.testing.expect(!options.history_timestamps);
+
+    const disabled = try parseOptions(&.{ "replete", "--no-history" });
+    try std.testing.expect(!disabled.history_enabled);
+    try std.testing.expectError(error.InvalidOptionValue, parseOptions(&.{ "replete", "--history-dedup=adjacent" }));
 }
 
 test "fuzz example" {
