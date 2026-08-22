@@ -41,6 +41,14 @@ pub const Ring = struct {
         return;
     }
 
+    pub fn pop(self: *Ring) ?[]u8 {
+        if (self.kills.items.len == 0) {
+            return null;
+        }
+        const line = self.kills.items[self.kills.items.len - 1 - self.cur];
+        return line.items;
+    }
+
     fn append(self: *Ring, buf: []const u8) !void {
         if (self.kills.items.len == 0) {
             return error.RingIsEmpty;

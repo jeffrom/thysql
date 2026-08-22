@@ -42,6 +42,7 @@ const KeyCode = enum(u8) {
     CTRL_U = 21,
     CTRL_V = 22,
     CTRL_W = 23,
+    CTRL_Y = 25,
     ESC = 27,
     BACKSPACE = 127,
 };
@@ -294,6 +295,10 @@ pub const Repl = struct {
                 try self.editBackwardsKillLine();
                 return ReadEditState.More;
             },
+            @intFromEnum(KeyCode.CTRL_Y) => {
+                try self.editYank();
+                return ReadEditState.More;
+            },
             @intFromEnum(KeyCode.ESC) => {
                 try self.editEscapeSequence();
                 return ReadEditState.More;
@@ -475,6 +480,13 @@ pub const Repl = struct {
         self.buf.items.len -= self.pos;
         self.pos = 0;
         try self.refreshLine();
+    }
+
+    fn editYank(self: *Repl) !void {
+        const k = self.kills.pop() orelse null;
+        if (k != null) {
+            try self.editInsertSlice(k.?);
+        }
     }
 
     fn takeEscapeByte(self: *Repl) Io.Reader.Error!?u8 {
