@@ -58,6 +58,12 @@ with SIGKILL, the same filter finds any leftovers.
   `"\n"` is ctrl+J in isocline, which inserts a newline instead. Send `"\x04"`
   (Ctrl-D) only after `expect` has seen the prompt, because the tty may still
   be in cooked mode before that.
+  The prompt is not a reliable marker on its own. isocline redraws it while a
+  line is typed, so `expect(prompt)` can match a redraw before the statement has
+  run. After a statement, wait for its output, such as `"1 row in set"` or the
+  error text, and then for the prompt. After a client command that prints
+  nothing, wait for `"\n" + prompt`, since a redraw follows a carriage return.
+  Typing before the real prompt is back can lose the input.
 - `password_env(user)` returns the `MYSQL_PWD` entry for the fixture users
   (`{}` for the no-password user). Pass it as `env=` for interactive logins.
 - `tls_material()` returns the throwaway TLS files for this run (`TlsMaterial`):

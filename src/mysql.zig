@@ -7,6 +7,32 @@ const Options = @import("options.zig");
 
 const maxTableColumnDisplayWidth: usize = 1024;
 const crServerGoneError: u32 = 2006;
+const crServerLostError: u32 = 2013;
+
+/// True when the error means the connection is gone: 2006 (server has gone away)
+/// or 2013 (lost connection during a query). The REPL reconnects on these, as mysql.cc does.
+pub fn isLostConnection(errno: u32) bool {
+    return errno == crServerGoneError or errno == crServerLostError;
+}
+
+/// What the last failed connect attempt reported. It is copied out because the
+/// handle is closed before the caller can read it.
+pub const ConnectFailure = struct {
+    errno: u32 = 0,
+    message_buffer: [512]u8 = undefined,
+    message_len: usize = 0,
+
+    pub fn message(self: *const ConnectFailure) []const u8 {
+        return self.message_buffer[0..self.message_len];
+    }
+
+    fn record(self: *ConnectFailure, db: *C.struct_st_mysql) void {
+        self.errno = C.mysql_errno(db);
+        const text = std.mem.sliceTo(C.mysql_error(db), 0);
+        self.message_len = @min(text.len, self.message_buffer.len);
+        @memcpy(self.message_buffer[0..self.message_len], text[0..self.message_len]);
+    }
+};
 
 pub const DBInfo = struct {
     host: []const u8,
@@ -45,7 +71,7 @@ const ConnectParams = struct {
     tls: Tls,
 };
 
-pub const DBError = error{ ExecError, StoreResultError, OutOfMemory };
+pub const DBError = error{ ExecError, StoreResultError, ConnectError, OutOfMemory };
 
 pub const OKResult = struct {
     affected_rows: u64,
@@ -71,6 +97,7 @@ pub const DB = struct {
     socket: [:0]const u8,
     protocol: Options.Protocol,
     tls: Tls,
+    connect_failure: ConnectFailure = .{},
 
     pub fn init(allocator: Allocator, info: DBInfo) !DB {
         const host = try allocator.dupeSentinel(u8, info.host, 0);
@@ -97,7 +124,13 @@ pub const DB = struct {
             .protocol = info.protocol,
             .tls = tls,
         };
-        const db = try connect(connect_params);
+        var failure: ConnectFailure = .{};
+        const db = connect(connect_params, &failure) catch |err| {
+            if (err == error.ConnectError) {
+                std.debug.print("Connect to database failed: {s}\n", .{failure.message()});
+            }
+            return err;
+        };
 
         return .{
             .conn = db,
@@ -136,15 +169,11 @@ pub const DB = struct {
         };
     }
 
+    /// Makes `database` the current one. Reconnecting after a lost connection is up to the
+    /// caller, so it can print what mysql.cc prints.
     pub fn selectDatabase(self: *DB, database: [:0]const u8) DBError!void {
         if (C.mysql_select_db(self.conn, database.ptr) != 0) {
-            if (C.mysql_errno(self.conn) != crServerGoneError) {
-                return error.ExecError;
-            }
-            try self.reconnect();
-            if (C.mysql_select_db(self.conn, database.ptr) != 0) {
-                return error.ExecError;
-            }
+            return error.ExecError;
         }
 
         const owned_database = try self.allocator.dupeSentinel(u8, database, 0);
@@ -152,19 +181,12 @@ pub const DB = struct {
         self.database = owned_database;
     }
 
+    /// Runs one statement. It does not reconnect: see `isLostConnection` and `reconnect`.
     pub fn exec(self: *DB, query: []const u8) DBError!ExecResult {
-        var retry: usize = 0;
-        while (true) : (retry += 1) {
-            if (C.mysql_real_query(self.conn, query.ptr, query.len) == 0) {
-                return self.currentExecResult();
-            }
-
-            const errno = C.mysql_errno(self.conn);
-            if (!shouldReconnectAfterQueryError(errno, retry)) {
-                return error.ExecError;
-            }
-            try self.reconnect();
+        if (C.mysql_real_query(self.conn, query.ptr, query.len) == 0) {
+            return self.currentExecResult();
         }
+        return error.ExecError;
     }
 
     pub fn nextResult(self: *DB) DBError!?ExecResult {
@@ -314,7 +336,8 @@ pub const DB = struct {
     }
 
     pub fn killRunningQuery(self: *DB) DBError!void {
-        const killer = connect(self.params()) catch {
+        var failure: ConnectFailure = .{};
+        const killer = connect(self.params(), &failure) catch {
             return error.ExecError;
         };
         defer C.mysql_close(killer);
@@ -358,14 +381,87 @@ pub const DB = struct {
         out.flush() catch return error.ExecError;
     }
 
-    fn reconnect(self: *DB) DBError!void {
-        const db = connect(self.params()) catch {
-            return error.ExecError;
-        };
+    /// Opens a new connection with the same settings, as mysql.cc's reconnect does.
+    pub fn reconnect(self: *DB) DBError!void {
+        return self.connectTo(null, null);
+    }
+
+    /// Opens a new connection to `host` and selects `database`. Null keeps the current
+    /// value. The old connection stays open when this fails, and the failure is kept
+    /// for `renderConnectFailure`.
+    pub fn connectTo(self: *DB, database: ?[]const u8, host: ?[]const u8) DBError!void {
+        const new_database: ?[:0]u8 = if (database) |name| try self.allocator.dupeSentinel(u8, name, 0) else null;
+        errdefer if (new_database) |name| self.allocator.free(name);
+        const new_host: ?[:0]u8 = if (host) |name| try self.allocator.dupeSentinel(u8, name, 0) else null;
+        errdefer if (new_host) |name| self.allocator.free(name);
+
+        var next_params = self.params();
+        if (new_database) |name| next_params.database = name;
+        if (new_host) |name| next_params.host = name;
+
+        const conn = connect(next_params, &self.connect_failure) catch return error.ConnectError;
         C.mysql_close(self.conn);
-        self.conn = db;
+        self.conn = conn;
+        if (new_database) |name| {
+            self.allocator.free(self.database);
+            self.database = name;
+        }
+        if (new_host) |name| {
+            self.allocator.free(self.host);
+            self.host = name;
+        }
+    }
+
+    /// Prints the last failed connect attempt as mysql.cc's put_error does. `line` adds
+    /// the "at line N" suffix that batch input uses.
+    pub fn renderConnectFailure(self: *DB, out: *std.Io.Writer, line: ?usize) !void {
+        try out.print("ERROR {d} (HY000)", .{self.connect_failure.errno});
+        if (line) |number| {
+            try out.print(" at line {d}", .{number});
+        }
+        try out.print(": {s}\n", .{self.connect_failure.message()});
+    }
+
+    /// Runs `sql` and copies all of its rows. NULL cells are null. Returns null when the
+    /// query fails or returns no rows. Release the result with `freeRowsCopy`.
+    pub fn rowsCopy(self: *DB, allocator: Allocator, sql: []const u8) !?[][]?[]u8 {
+        const exec_result = self.exec(sql) catch return null;
+        const result = switch (exec_result) {
+            .result => |res| res,
+            .ok => return null,
+        };
+        defer freeResult(result);
+
+        const count: usize = C.mysql_num_fields(result);
+        var rows: std.ArrayList([]?[]u8) = .empty;
+        errdefer {
+            for (rows.items) |row| freeRowCopy(allocator, row);
+            rows.deinit(allocator);
+        }
+        while (C.mysql_fetch_row(result)) |row| {
+            const lengths = C.mysql_fetch_lengths(result);
+            const values = try allocator.alloc(?[]u8, count);
+            @memset(values, null);
+            errdefer freeRowCopy(allocator, values);
+            for (values, 0..) |*value, index| {
+                if (row[index] == null) {
+                    continue;
+                }
+                value.* = try allocator.dupe(u8, row[index][0..lengths[index]]);
+            }
+            try rows.append(allocator, values);
+        }
+        return try rows.toOwnedSlice(allocator);
     }
 };
+
+/// Frees the result of `DB.rowsCopy`.
+pub fn freeRowsCopy(allocator: Allocator, rows: [][]?[]u8) void {
+    for (rows) |row| {
+        freeRowCopy(allocator, row);
+    }
+    allocator.free(rows);
+}
 
 /// Copies the TLS options and resolves the verification default: verify when
 /// a CA is given, unless the user chose otherwise (as mysql.cc does).
@@ -430,7 +526,8 @@ fn applyConnectOptions(db: *C.struct_st_mysql, params: ConnectParams) void {
     _ = C.mysql_options(db, C.MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &verify);
 }
 
-fn connect(params: ConnectParams) !*C.struct_st_mysql {
+/// Opens a connection. On failure, `failure` holds the error and the handle is closed.
+fn connect(params: ConnectParams, failure: *ConnectFailure) !*C.struct_st_mysql {
     const db = C.mysql_init(null);
 
     if (db == null) {
@@ -452,16 +549,12 @@ fn connect(params: ConnectParams) !*C.struct_st_mysql {
         C.CLIENT_MULTI_STATEMENTS,
     );
     if (conn_result == null) {
-        std.debug.print("Connect to database failed: {s}\n", .{C.mysql_error(db)});
+        failure.record(db);
         C.mysql_close(db);
         return error.ConnectError;
     }
 
     return db;
-}
-
-fn shouldReconnectAfterQueryError(errno: u32, retry: usize) bool {
-    return errno == crServerGoneError and retry <= 1;
 }
 
 pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
@@ -1235,12 +1328,22 @@ test "render SQL error" {
     );
 }
 
-test "reconnect retry decision follows server gone errors" {
-    try std.testing.expect(shouldReconnectAfterQueryError(crServerGoneError, 0));
-    try std.testing.expect(shouldReconnectAfterQueryError(crServerGoneError, 1));
-    try std.testing.expect(!shouldReconnectAfterQueryError(crServerGoneError, 2));
-    try std.testing.expect(!shouldReconnectAfterQueryError(2013, 0));
-    try std.testing.expect(!shouldReconnectAfterQueryError(1064, 0));
+test "lost connection means server gone (2006) or lost during query (2013)" {
+    try std.testing.expect(isLostConnection(2006));
+    try std.testing.expect(isLostConnection(2013));
+    try std.testing.expect(!isLostConnection(1064));
+    try std.testing.expect(!isLostConnection(1927));
+    try std.testing.expect(!isLostConnection(0));
+}
+
+test "a connect failure keeps the message and error number" {
+    var failure: ConnectFailure = .{};
+    try std.testing.expectEqualStrings("", failure.message());
+    const text = "Can't connect to MySQL server on '127.0.0.1' (111)";
+    failure.message_len = text.len;
+    @memcpy(failure.message_buffer[0..text.len], text);
+    failure.errno = 2003;
+    try std.testing.expectEqualStrings(text, failure.message());
 }
 
 test "render query OK with affected rows" {

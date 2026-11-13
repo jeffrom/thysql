@@ -10,8 +10,23 @@ const Client = @import("client.zig");
 const Completion = @import("completion.zig");
 const Options = @import("options.zig");
 const OptionFile = @import("option_file.zig");
+const Prompt = @import("prompt.zig");
 const Readline = @import("readline.zig");
+const SqlCompletion = @import("sql_completion.zig");
 pub const Unicode = @import("unicode.zig");
+
+/// Settings and state that only the interactive client has. Batch input runs without
+/// them, so the client commands take them as null. Reconnecting is interactive-only, as
+/// in mysql.cc, which turns it off for batch input.
+const Repl = struct {
+    names: *SqlCompletion.Names,
+    prompt: *Prompt.State,
+    history_ignore: *const Readline.Ignore,
+    auto_rehash: bool,
+    reconnect: bool,
+    /// --silent: the notice about loading names is not printed.
+    silent: bool,
+};
 
 var sigint_requested = std.atomic.Value(bool).init(false);
 var query_executing = std.atomic.Value(bool).init(false);
@@ -137,13 +152,86 @@ fn unquoteName(name: []const u8) []const u8 {
     return name;
 }
 
+/// Prints the connection id and database, as mysql.cc's com_connect does.
+fn renderConnectionInfo(out: *std.Io.Writer, db: *Mysql.DB) !void {
+    const database = if (db.database.len == 0) "*** NONE ***" else db.database;
+    try out.print("Connection id:    {d}\nCurrent database: {s}\n\n", .{ db.connectionId(), database });
+}
+
+/// Loads the names for completion when auto-rehash is on. The notice is printed on connect
+/// and on `use`, as mysql.cc does, unless --silent is given.
+fn loadNames(repl: *const Repl, db: *Mysql.DB, out: *std.Io.Writer, notice: bool) !void {
+    if (!repl.auto_rehash) {
+        return;
+    }
+    const tables = try repl.names.load(db);
+    if (notice and tables > 0 and !repl.silent) {
+        try out.print("Reading table information for completion of table and column names\n" ++
+            "You can turn off this feature to get a quicker startup with -A\n\n", .{});
+    }
+}
+
+/// Reconnects after the server has gone away, with mysql.cc's messages: the notice, then the
+/// connection id and database, then the names when auto-rehash is on. Returns false after
+/// printing the failure when the connection cannot be made.
+fn reconnectSession(db: *Mysql.DB, out: *std.Io.Writer, repl: *Repl) !bool {
+    try out.print("No connection. Trying to reconnect...\n", .{});
+    db.reconnect() catch |err| switch (err) {
+        Mysql.DBError.ConnectError => {
+            try db.renderConnectFailure(out, null);
+            try out.print("ERROR: Can't connect to the server\n", .{});
+            return false;
+        },
+        else => return err,
+    };
+    try renderConnectionInfo(out, db);
+    try loadNames(repl, db, out, false);
+    return true;
+}
+
+/// Whether a failed statement should trigger a reconnect: only in the interactive client,
+/// with reconnect on, and only when the connection was lost.
+fn canReconnect(db: *Mysql.DB, repl: ?*const Repl) bool {
+    const session = repl orelse return false;
+    return session.reconnect and Mysql.isLostConnection(db.lastErrno());
+}
+
+/// Selects `database`. A lost connection is reconnected once, and the select is tried again.
+/// Errors are printed with the batch line number when `line` is set. Returns false after printing.
+fn selectDatabase(db: *Mysql.DB, out: *std.Io.Writer, err_out: *std.Io.Writer, line: ?usize, repl: ?*Repl, database: [:0]const u8) !bool {
+    var retried = false;
+    while (true) {
+        if (db.selectDatabase(database)) |_| {
+            return true;
+        } else |err| {
+            if (err != Mysql.DBError.ExecError) {
+                return err;
+            }
+        }
+        if (!retried and canReconnect(db, repl)) {
+            retried = true;
+            // mysql.cc prints nothing for the lost connection itself, only the reconnect.
+            if (!try reconnectSession(db, out, repl.?)) {
+                return false;
+            }
+            continue;
+        }
+        if (line) |number| {
+            try db.renderLastErrorAt(err_out, number);
+        } else {
+            try db.renderLastError(err_out);
+        }
+        return false;
+    }
+}
+
 /// Runs `use <name>`. Errors go to `err_out`, with the line number when `line` is set (batch input).
 fn useDatabase(
     db: *Mysql.DB,
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
     line: ?usize,
-    interactive: bool,
+    repl: ?*Repl,
     arg: []const u8,
 ) !bool {
     if (arg.len == 0) {
@@ -151,38 +239,70 @@ fn useDatabase(
         return false;
     }
 
-    const database_z = try db.allocator.dupeSentinel(u8, unquoteName(arg), 0);
+    const name = unquoteName(arg);
+    const database_z = try db.allocator.dupeSentinel(u8, name, 0);
     defer db.allocator.free(database_z);
 
-    db.selectDatabase(database_z) catch |err| {
-        switch (err) {
-            Mysql.DBError.ExecError => {
-                if (line) |number| {
-                    try db.renderLastErrorAt(err_out, number);
-                } else {
-                    try db.renderLastError(err_out);
-                }
-                return false;
-            },
-            else => return err,
-        }
-    };
+    // As in mysql.cc, names are loaded only when the database changes.
+    const changed = !std.mem.eql(u8, db.database, name);
+    if (!try selectDatabase(db, out, err_out, line, repl, database_z)) {
+        return false;
+    }
 
-    if (interactive) {
-        try Readline.rebuildCompletions();
+    if (repl) |session| {
+        if (changed) {
+            try loadNames(session, db, out, true);
+        }
         try out.print("Database changed\n", .{});
     }
     return true;
 }
 
-/// Runs a client command from the REPL or batch input. `error.ClientQuit` ends the session.
+/// Runs `connect [db [host]]`. With no arguments it reconnects to the current database and
+/// host, and the names are not reloaded. As in mysql.cc, a failed connect leaves the old one open.
+fn connectCommand(db: *Mysql.DB, out: *std.Io.Writer, err_out: *std.Io.Writer, line: ?usize, repl: ?*Repl, arg: []const u8) !bool {
+    var words = std.mem.tokenizeAny(u8, arg, " \t");
+    const database = words.next();
+    const host = words.next();
+
+    db.connectTo(database, host) catch |err| switch (err) {
+        Mysql.DBError.ConnectError => {
+            try db.renderConnectFailure(err_out, line);
+            return false;
+        },
+        else => return err,
+    };
+    if (repl) |session| {
+        try renderConnectionInfo(out, db);
+        if (database != null) {
+            try loadNames(session, db, out, true);
+        }
+    }
+    return true;
+}
+
+/// Runs `prompt [format]`. With no format, the prompt goes back to the default. The
+/// prompt only shows in the interactive client, so batch input ignores it.
+fn promptCommand(out: *std.Io.Writer, repl: ?*Repl, text: []const u8) !void {
+    const session = repl orelse return;
+    if (text.len == 0) {
+        session.prompt.reset();
+        try out.print("Returning to default PROMPT of {s}\n", .{session.prompt.defaultText()});
+    } else {
+        try session.prompt.set(text);
+        try out.print("PROMPT set to '{s}'\n", .{text});
+    }
+}
+
+/// Runs a client command from the REPL or batch input. `repl` is null for batch input.
+/// `error.ClientQuit` ends the session.
 fn runClientCommand(
     client: *Client,
     db: *Mysql.DB,
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
     line: ?usize,
-    interactive: bool,
+    repl: ?*Repl,
     delimiter: []const u8,
     command: ClientCommand.Command,
 ) !bool {
@@ -196,7 +316,13 @@ fn runClientCommand(
             }
         },
         .status => try client.renderStatus(db, out, delimiter),
-        .use => return try useDatabase(db, out, err_out, line, interactive, command.arg),
+        .use => return try useDatabase(db, out, err_out, line, repl, command.arg),
+        .connect => return try connectCommand(db, out, err_out, line, repl, command.arg),
+        .prompt => try promptCommand(out, repl, command.rest),
+        // `rehash` loads the names whatever auto-rehash says, and prints nothing, as in mysql.cc.
+        .rehash => if (repl) |session| {
+            _ = try session.names.load(db);
+        },
         .print => try Client.renderPrint(out, ""),
         .pager => try client.cmdPager(out, command.arg),
         .nopager => try client.cmdNopager(out),
@@ -228,31 +354,50 @@ fn renderResult(client: *Client, result: [*c]C.struct_st_mysql_res, vertical: bo
     };
 }
 
+/// Runs one statement for the REPL. As in mysql.cc, a lost connection prints the error,
+/// reconnects, and runs the statement once more. Returns null after the error is printed.
+fn execReplStatement(context: *ReplContext, stdout: *std.Io.Writer, sql: []const u8) !?Mysql.ExecResult {
+    const db = context.db;
+    var retried = false;
+    while (true) {
+        if (db.exec(sql)) |result| {
+            return result;
+        } else |err| switch (err) {
+            Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {},
+            else => return err,
+        }
+
+        try db.renderLastError(stdout);
+        if (retried or !canReconnect(db, &context.repl)) {
+            return null;
+        }
+        retried = true;
+        if (!try reconnectSession(db, stdout, &context.repl)) {
+            return null;
+        }
+    }
+}
+
 /// Runs one SQL statement from the REPL and renders its result sets. Errors and warnings go to `stdout`.
-fn executeQuery(client: *Client, db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.Query) !bool {
+fn executeQuery(context: *ReplContext, stdout: *std.Io.Writer, query: Batch.Query) !bool {
     if (query.sql.len == 0) {
         return true;
     }
+    const client = context.client;
+    const db = context.db;
 
-    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    const start = std.Io.Clock.Timestamp.now(context.io, .awake);
     beginInterruptibleQuery();
     defer endInterruptibleQuery();
 
-    var exec_result = db.exec(query.sql) catch |err| {
-        switch (err) {
-            Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
-                const error_code = db.lastErrno();
-                try db.renderLastError(stdout);
-                try client.afterStatement(db, stdout, 0, error_code);
-                return false;
-            },
-            else => return err,
-        }
+    var exec_result = (try execReplStatement(context, stdout, query.sql)) orelse {
+        try client.afterStatement(db, stdout, 0, db.lastErrno());
+        return false;
     };
 
     var warnings: u32 = 0;
     while (true) {
-        const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+        const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(context.io, .awake)).raw.nanoseconds;
         switch (exec_result) {
             .result => |result| {
                 defer Mysql.freeResult(result);
@@ -282,9 +427,41 @@ fn executeQuery(client: *Client, db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writ
     return true;
 }
 
-fn interactivePrompt(allocator: Allocator, db: *Mysql.DB, scanner: *const Batch.Scanner) ![:0]u8 {
+/// The main prompt. With a format from --prompt, MYSQL_PS1, or `prompt`, it is rendered with
+/// mysql.cc's escapes. Otherwise it is the built-in connection prompt.
+fn mainPrompt(context: *ReplContext, delimiter: []const u8) ![:0]u8 {
+    const db = context.db;
+    const allocator = db.allocator;
+    const format = context.repl.prompt.activeFormat() orelse {
+        return connectionPrompt(allocator, db.user, db.host, db.port, db.database);
+    };
+
+    // USER() is a query, so it runs only when the format asks for a user.
+    const needs_user = std.mem.indexOf(u8, format, "\\u") != null or std.mem.indexOf(u8, format, "\\U") != null;
+    const user_row = if (needs_user) try db.firstRowCopy(allocator, "select USER()") else null;
+    defer if (user_row) |row| Mysql.freeRowCopy(allocator, row);
+    const full_user: []const u8 = if (user_row) |row| (row[0] orelse "") else "";
+
+    var hostname_buffer: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const hostname: []const u8 = std.posix.gethostname(&hostname_buffer) catch "";
+
+    return Prompt.render(allocator, format, .{
+        .full_user = full_user,
+        .host_info = db.hostInfo(),
+        .hostname = hostname,
+        .port = db.port,
+        .socket = db.socket,
+        .database = db.database,
+        .server_name = db.serverName(),
+        .server_version = db.serverVersion(),
+        .delimiter = delimiter,
+    }, &context.repl.prompt.counter, Prompt.clockNow());
+}
+
+fn interactivePrompt(context: *ReplContext, scanner: *const Batch.Scanner) ![:0]u8 {
+    const allocator = context.db.allocator;
     return switch (scanner.promptKind()) {
-        .main => connectionPrompt(allocator, db.user, db.host, db.port, db.database),
+        .main => try mainPrompt(context, scanner.delimiterText()),
         .continuation => try allocator.dupeSentinel(u8, "    -> ", 0),
         .single_quote => try allocator.dupeSentinel(u8, "    '> ", 0),
         .double_quote => try allocator.dupeSentinel(u8, "    \"> ", 0),
@@ -357,14 +534,14 @@ fn formatHistoryEntry(allocator: Allocator, query: Batch.Query, delimiter: []con
     return try entry.toOwnedSliceSentinel(allocator, 0);
 }
 
-fn addQueryToHistory(allocator: Allocator, query: Batch.Query, delimiter: []const u8) !void {
+fn addQueryToHistory(allocator: Allocator, query: Batch.Query, delimiter: []const u8, ignore: *const Readline.Ignore) !void {
     if (query.sql.len == 0) {
         return;
     }
 
     const entry = try formatHistoryEntry(allocator, query, delimiter);
     defer allocator.free(entry);
-    Readline.addHistory(entry);
+    Readline.addHistory(ignore, entry);
 }
 
 fn rememberLastQuery(allocator: Allocator, last_query: *std.ArrayList(u8), query: Batch.Query) !void {
@@ -505,6 +682,7 @@ const ReplContext = struct {
     /// Batch state for statements typed at the prompt. It carries the force flag and `source` depth.
     session: Batch.Session,
     client: *Client,
+    repl: Repl,
 };
 
 /// Runs one statement typed at the prompt. Errors are printed, and the REPL keeps going.
@@ -517,12 +695,12 @@ fn executeReplQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.
         if (command == null) {
             try rememberLastQuery(allocator, context.last_query, query);
         }
-        try addQueryToHistory(allocator, query, context.scanner.delimiterText());
+        try addQueryToHistory(allocator, query, context.scanner.delimiterText(), context.repl.history_ignore);
     }
     if (command) |client_command| {
-        return try runClientCommand(context.client, context.db, stdout, stdout, null, true, context.scanner.delimiterText(), client_command);
+        return try runClientCommand(context.client, context.db, stdout, stdout, null, &context.repl, context.scanner.delimiterText(), client_command);
     }
-    return try executeQuery(context.client, context.db, context.io, stdout, query);
+    return try executeQuery(context, stdout, query);
 }
 
 fn feedInteractiveInput(
@@ -563,10 +741,10 @@ fn readOneLine(
     const io = context.io;
     const scanner = context.scanner;
     const last_query = context.last_query;
-    const prompt = try interactivePrompt(db.allocator, db, scanner);
+    const prompt = try interactivePrompt(context, scanner);
     defer db.allocator.free(prompt);
 
-    const maybeLine = Readline.one(prompt);
+    const maybeLine = try Readline.one(db.allocator, prompt);
     if (maybeLine == null) {
         return true;
     }
@@ -596,7 +774,7 @@ fn readOneLine(
     // A client command at the start of a line runs at once, without a delimiter, as in mysql.cc.
     if (scanner.atStatementStart() and std.mem.indexOf(u8, line, scanner.delimiterText()) == null) {
         if (ClientCommand.parse(line)) |command| {
-            _ = runClientCommand(context.client, db, stdout, stdout, null, true, scanner.delimiterText(), command) catch |err| switch (err) {
+            _ = runClientCommand(context.client, db, stdout, stdout, null, &context.repl, scanner.delimiterText(), command) catch |err| switch (err) {
                 error.ClientQuit => return true,
                 else => return err,
             };
@@ -629,7 +807,7 @@ fn executeBatchQuery(context: BatchContext, stdout: *std.Io.Writer, stderr: *std
     }
 
     if (ClientCommand.parse(query.sql)) |command| {
-        return try runClientCommand(context.client, db, stdout, stderr, query.line, false, context.options.delimiter, command);
+        return try runClientCommand(context.client, db, stdout, stderr, query.line, null, context.options.delimiter, command);
     }
 
     var exec_result = db.exec(query.sql) catch |err| {
@@ -807,7 +985,25 @@ pub fn runREPL(
     var repl_out = Client.Mirror.init(stdout, &client);
     const out = repl_out.writer();
 
-    try Readline.setup(allocator, io, env);
+    // The prompt comes from --prompt, else MYSQL_PS1, else the built-in connection prompt.
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    var prompt_state = try Prompt.State.init(allocator, env.get("MYSQL_PS1"), options.prompt);
+    defer prompt_state.deinit();
+    var history_ignore = try Readline.Ignore.init(allocator, env.get("MYSQL_HISTIGNORE"));
+    defer history_ignore.deinit();
+    var repl: Repl = .{
+        .names = &names,
+        .prompt = &prompt_state,
+        .history_ignore = &history_ignore,
+        .auto_rehash = options.auto_rehash,
+        .reconnect = options.reconnect,
+        .silent = options.silent > 0,
+    };
+
+    Readline.setup(allocator, io, env, &names);
+    // Names load before the banner, as mysql.cc does at connect.
+    try loadNames(&repl, &db, out, true);
     try renderConnectionBanner(out, db.serverName(), db.connectionId(), db.serverVersion(), Mysql.clientInfo());
 
     var interrupt_worker = QueryInterruptWorker{ .db = &db };
@@ -826,6 +1022,7 @@ pub fn runREPL(
         .last_query = &last_query,
         .session = Batch.Session.init(allocator, io, options.force),
         .client = &client,
+        .repl = repl,
     };
     while (true) {
         const done = try readOneLine(&context, out, stderr, env);
@@ -965,6 +1162,9 @@ test {
         @import("mysql.zig"),
         @import("option_file.zig"),
         @import("options.zig"),
+        @import("prompt.zig"),
+        @import("readline.zig"),
+        @import("sql_completion.zig"),
         @import("unicode.zig"),
     };
 }

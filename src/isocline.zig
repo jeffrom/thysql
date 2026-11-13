@@ -86,8 +86,28 @@ test "history path is null without any location variable" {
     try std.testing.expect((try historyPath(allocator, &env)) == null);
 }
 
-pub fn disableFilenameCompletion() void {
-    C.ic_set_default_completer(null, null);
+pub const CompletionEnv = C.ic_completion_env_t;
+/// The C header types the environment pointer as nullable in callbacks.
+pub const CompleterFn = *const fn (?*CompletionEnv, [*c]const u8) callconv(.c) void;
+pub const IsWordCharFn = *const fn ([*c]const u8, c_long) callconv(.c) bool;
+
+/// Sets the completer for the whole line. `arg` is handed back by `completionArg`.
+pub fn setDefaultCompleter(completer: CompleterFn, arg: ?*anyopaque) void {
+    C.ic_set_default_completer(completer, arg);
+}
+
+/// Completes the word at the end of `prefix`, and calls `completer` with that word.
+pub fn completeWord(env: *CompletionEnv, prefix: [*c]const u8, completer: CompleterFn, is_word_char: IsWordCharFn) void {
+    C.ic_complete_word(env, prefix, completer, is_word_char);
+}
+
+/// Offers one completion for the word being completed.
+pub fn addCompletion(env: *CompletionEnv, text: [:0]const u8) void {
+    _ = C.ic_add_completion(env, text.ptr);
+}
+
+pub fn completionArg(env: *CompletionEnv) ?*anyopaque {
+    return C.ic_completion_arg(env);
 }
 
 pub fn disablePromptMarker() void {

@@ -96,3 +96,29 @@ class InteractiveTests(E2ETestCase):
         self.assertEqual(quit_session(session, server, ROOT_USER), 0)
         self.assertTrue(os.path.isfile(histfile), "MYSQL_HISTFILE was not used")
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local")))
+
+    def test_mysql_histignore_keeps_matching_statements_out_of_history(self):
+        histfile = os.path.join(self.home, "histignore-history")
+        env = {
+            **password_env(ROOT_USER),
+            "MYSQL_HISTFILE": histfile,
+            "MYSQL_HISTIGNORE": "*topsecret*:*Hidden*",
+        }
+        server = self.each_server()[0]
+        session = self.interactive(server.connect_args(ROOT_USER) + [TEST_DB], env=env)
+        session.expect(main_prompt(ROOT_USER, server))
+        session.send("select 'topsecret' as s;" + ENTER)
+        session.expect("1 row in set")
+        session.expect(main_prompt(ROOT_USER, server))
+        session.send("select 'HIDDEN' as h;" + ENTER)
+        session.expect("1 row in set")
+        session.expect(main_prompt(ROOT_USER, server))
+        session.send("select 12 as twelve;" + ENTER)
+        session.expect("1 row in set")
+        self.assertEqual(quit_session(session, server, ROOT_USER), 0)
+
+        with open(histfile, encoding="utf-8") as handle:
+            history = handle.read()
+        self.assertIn("select 12 as twelve", history)
+        self.assertNotIn("topsecret", history)
+        self.assertNotIn("HIDDEN", history)

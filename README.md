@@ -97,12 +97,64 @@ at the start of a statement, such as `\P less` on its own line.
   to the file. Messages do not go to the file.
 - `warnings`, `\W`, `nowarning`, `\w`: show `Warning (Code N): ...` after a
   statement with warnings.
+- `connect [db [host]]`, `\r [db [host]]`: reconnects. With no arguments it
+  reconnects to the current database and host. A failed connect keeps the old one.
+- `prompt [fmt]`, `\R [fmt]`: sets the prompt. With no argument it returns to the default.
+  The text after the command is kept as typed, including trailing spaces.
+- `rehash`, `\#`: reloads the names used for completion.
 - Flags: `--pager[=cmd]`, `--tee=file`, `--show-warnings`. Pager and tee are
   interactive only, as in mysql.cc.
 
 Not supported: server-side `help <topic>`, and backslash commands in the middle
 of a statement. In batch input, a named command such as `quit` must end with its
-delimiter, unless it is the last input.
+delimiter, unless it is the last input. Batch input ignores `prompt`, and `rehash`
+does nothing there, as in mysql.cc.
+
+## prompt
+
+The default prompt is `user@host:port/db> `. Set another one with `--prompt=fmt`,
+the `prompt` command, or `MYSQL_PS1`. The option wins over `MYSQL_PS1`, and
+`prompt` with no argument goes back to `MYSQL_PS1`, or to the default when that
+is not set. Continuation prompts such as `    -> ` do not change.
+
+Escapes are those of mysql.cc: `\u` user, `\U` user@host, `\h` host, `\H` host
+name, `\p` port or socket name, `\d` database, `\N` server name, `\v` server
+version, `\c` a counter that goes up each time the prompt is drawn, `\R`/`\r` hour
+(24h/12h), `\m` minute, `\s` second, `\y`/`\Y` year, `\o`/`\O` month, `\w` day,
+`\P` am/pm, `\D` the date, `\l` delimiter, `\S` `;`, `\_` or `\ ` space, `\n`
+newline, `\t` tab, `\\` backslash. Any other escaped character is written as is.
+
+```sh
+thysql --prompt='[\u|\d|\c]\_' -u root thysql_test
+```
+
+## completion
+
+Tab completes SQL keywords, database names, and the table and column names of the
+current database. A column is offered by its name and as `table.column`. The
+names load on connect and on `use` when the database changes. They are reloaded
+with `rehash`. The notice about loading is printed on connect and `use`, unless
+`--silent` is given.
+
+`-A` (or `--no-auto-rehash`) skips loading. Then only keywords complete until
+`rehash` runs. `--auto-rehash` turns loading back on.
+
+## reconnect
+
+When the server drops the connection, the interactive client prints the error
+(2006 or 2013), then `No connection. Trying to reconnect...`, reconnects to the
+same database, and runs the statement once more. Use `--skip-reconnect` to turn
+this off. Batch input never reconnects, as in mysql.cc.
+
+Over TLS, the server's close appears as error 2026 (TLS EOF). That is not treated
+as a lost connection, so use `--skip-ssl` if you need reconnects.
+
+## history
+
+History goes to `$MYSQL_HISTFILE`, then `$XDG_STATE_HOME/thysql/history`, then
+`~/.local/state/thysql/history`. `MYSQL_HISTIGNORE` is a list of glob patterns
+separated by colons. A statement that matches any of them is not saved. `*` matches
+any run of characters, `?` matches one, and case is ignored.
 
 ## misc
 

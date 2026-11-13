@@ -16,12 +16,18 @@ pub const Kind = enum {
     notee,
     warnings,
     nowarnings,
+    connect,
+    prompt,
+    rehash,
 };
 
 pub const Command = struct {
     kind: Kind,
     /// The text after the command, trimmed. Empty when there is none.
     arg: []const u8 = "",
+    /// The text after the command with only the leading whitespace removed. Trailing
+    /// spaces stay, because a prompt may end with one.
+    rest: []const u8 = "",
 };
 
 const Named = struct { name: []const u8, kind: Kind, takes_arg: bool };
@@ -30,6 +36,7 @@ const Short = struct { char: u8, kind: Kind, takes_arg: bool };
 /// Word forms, matched case-insensitively. A word with an argument must allow one.
 const named = [_]Named{
     .{ .name = "?", .kind = .help, .takes_arg = true },
+    .{ .name = "connect", .kind = .connect, .takes_arg = true },
     .{ .name = "exit", .kind = .quit, .takes_arg = false },
     .{ .name = "help", .kind = .help, .takes_arg = true },
     .{ .name = "nopager", .kind = .nopager, .takes_arg = false },
@@ -37,7 +44,9 @@ const named = [_]Named{
     .{ .name = "nowarning", .kind = .nowarnings, .takes_arg = false },
     .{ .name = "pager", .kind = .pager, .takes_arg = true },
     .{ .name = "print", .kind = .print, .takes_arg = false },
+    .{ .name = "prompt", .kind = .prompt, .takes_arg = true },
     .{ .name = "quit", .kind = .quit, .takes_arg = false },
+    .{ .name = "rehash", .kind = .rehash, .takes_arg = false },
     .{ .name = "status", .kind = .status, .takes_arg = false },
     .{ .name = "tee", .kind = .tee, .takes_arg = true },
     .{ .name = "use", .kind = .use, .takes_arg = true },
@@ -58,6 +67,9 @@ const short = [_]Short{
     .{ .char = 't', .kind = .notee, .takes_arg = false },
     .{ .char = 'W', .kind = .warnings, .takes_arg = false },
     .{ .char = 'w', .kind = .nowarnings, .takes_arg = false },
+    .{ .char = 'r', .kind = .connect, .takes_arg = true },
+    .{ .char = 'R', .kind = .prompt, .takes_arg = true },
+    .{ .char = '#', .kind = .rehash, .takes_arg = false },
 };
 
 const whitespace = " \t\r\n";
@@ -73,7 +85,9 @@ pub fn isShortChar(byte: u8) bool {
 /// Returns the client command that `input` holds, or null when it is SQL. A
 /// trailing `;` is ignored, as it is when a statement ends with the delimiter.
 pub fn parse(input: []const u8) ?Command {
-    var text = std.mem.trim(u8, input, whitespace);
+    // `body` keeps trailing spaces for `rest`. Only the line ending is removed from it.
+    const body = std.mem.trimEnd(u8, std.mem.trimStart(u8, input, whitespace), "\r\n");
+    var text = std.mem.trim(u8, body, whitespace);
     if (text.len > 0 and text[text.len - 1] == ';') {
         text = std.mem.trimEnd(u8, text[0 .. text.len - 1], whitespace);
     }
@@ -81,12 +95,12 @@ pub fn parse(input: []const u8) ?Command {
         return null;
     }
     if (text[0] == '\\') {
-        return parseShort(text);
+        return parseShort(text, body);
     }
-    return parseNamed(text);
+    return parseNamed(text, body);
 }
 
-fn parseNamed(text: []const u8) ?Command {
+fn parseNamed(text: []const u8, body: []const u8) ?Command {
     const split = std.mem.indexOfAny(u8, text, " \t") orelse text.len;
     const word = text[0..split];
     const arg = std.mem.trim(u8, text[split..], " \t");
@@ -97,12 +111,12 @@ fn parseNamed(text: []const u8) ?Command {
         if (arg.len > 0 and !entry.takes_arg) {
             return null;
         }
-        return .{ .kind = entry.kind, .arg = arg };
+        return .{ .kind = entry.kind, .arg = arg, .rest = std.mem.trimStart(u8, body[split..], " \t") };
     }
     return null;
 }
 
-fn parseShort(text: []const u8) ?Command {
+fn parseShort(text: []const u8, body: []const u8) ?Command {
     if (text.len < 2) {
         return null;
     }
@@ -117,7 +131,7 @@ fn parseShort(text: []const u8) ?Command {
         if (arg.len > 0 and !entry.takes_arg) {
             return null;
         }
-        return .{ .kind = entry.kind, .arg = arg };
+        return .{ .kind = entry.kind, .arg = arg, .rest = std.mem.trimStart(u8, body[2..], " \t") };
     }
     return null;
 }
@@ -126,6 +140,7 @@ fn parseShort(text: []const u8) ?Command {
 const help_items = [_]struct { name: []const u8, char: u8, doc: []const u8 }{
     .{ .name = "?", .char = '?', .doc = "Synonym for `help'." },
     .{ .name = "clear", .char = 'c', .doc = "Clear the current input statement." },
+    .{ .name = "connect", .char = 'r', .doc = "Reconnect to the server. Optional arguments are db and host." },
     .{ .name = "delimiter", .char = 'd', .doc = "Set statement delimiter." },
     .{ .name = "edit", .char = 'e', .doc = "Edit command with $EDITOR." },
     .{ .name = "exit", .char = 'q', .doc = "Exit thysql. Same as quit." },
@@ -135,7 +150,9 @@ const help_items = [_]struct { name: []const u8, char: u8, doc: []const u8 }{
     .{ .name = "nowarning", .char = 'w', .doc = "Don't show warnings after every statement." },
     .{ .name = "pager", .char = 'P', .doc = "Set PAGER [to_pager]. Print the query results via PAGER." },
     .{ .name = "print", .char = 'p', .doc = "Print current command." },
+    .{ .name = "prompt", .char = 'R', .doc = "Change your mysql prompt." },
     .{ .name = "quit", .char = 'q', .doc = "Quit thysql." },
+    .{ .name = "rehash", .char = '#', .doc = "Rebuild completion hash." },
     .{ .name = "source", .char = '.', .doc = "Execute an SQL script file. Takes a file name as an argument." },
     .{ .name = "status", .char = 's', .doc = "Get status information from the server." },
     .{ .name = "tee", .char = 'T', .doc = "Set outfile [to_outfile]. Append everything into given outfile." },
@@ -190,8 +207,35 @@ test "backslash commands need whitespace before an argument" {
 test "only backslash forms with a command letter are client commands" {
     try std.testing.expect(isShortChar('P'));
     try std.testing.expect(isShortChar('?'));
+    try std.testing.expect(isShortChar('#'));
     try std.testing.expect(!isShortChar('G'));
     try std.testing.expect(!isShortChar('c'));
+}
+
+test "connect, prompt, and rehash parse in both forms" {
+    const connect = parse("connect app db.example").?;
+    try std.testing.expectEqual(Kind.connect, connect.kind);
+    try std.testing.expectEqualStrings("app db.example", connect.arg);
+
+    try std.testing.expectEqual(Kind.connect, parse("\\r").?.kind);
+    try std.testing.expectEqualStrings("app", parse("\\r   app").?.arg);
+    try std.testing.expectEqual(Kind.rehash, parse("rehash").?.kind);
+    try std.testing.expectEqual(Kind.rehash, parse("\\#").?.kind);
+    try std.testing.expectEqual(@as(?Command, null), parse("\\#now"));
+    try std.testing.expectEqual(@as(?Command, null), parse("rehash now"));
+}
+
+test "prompt keeps the raw text, including trailing spaces" {
+    const named_prompt = parse("prompt \\u@\\h> ").?;
+    try std.testing.expectEqual(Kind.prompt, named_prompt.kind);
+    try std.testing.expectEqualStrings("\\u@\\h> ", named_prompt.rest);
+    try std.testing.expectEqualStrings("\\u@\\h>", named_prompt.arg);
+
+    const short_prompt = parse("\\R   \\d>  ").?;
+    try std.testing.expectEqualStrings("\\d>  ", short_prompt.rest);
+
+    const bare = parse("\\R").?;
+    try std.testing.expectEqualStrings("", bare.rest);
 }
 
 test "help lists each command with its backslash form" {

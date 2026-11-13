@@ -61,6 +61,12 @@ pub const Id = enum {
     pager,
     tee,
     show_warnings,
+    prompt,
+    auto_rehash,
+    no_auto_rehash,
+    skip_auto_rehash,
+    reconnect,
+    skip_reconnect,
     help,
     version,
 };
@@ -112,6 +118,12 @@ pub const specs = [_]Spec{
     .{ .id = .pager, .long = "pager", .arg = .optional, .arg_name = "command", .group = .output, .help = "Print results through this shell command. With no command, uses $PAGER. Interactive only." },
     .{ .id = .tee, .long = "tee", .arg = .required, .arg_name = "file", .group = .output, .help = "Append all output to this file. Interactive only." },
     .{ .id = .show_warnings, .long = "show-warnings", .group = .output, .help = "Show warnings after every statement." },
+    .{ .id = .prompt, .long = "prompt", .arg = .required, .arg_name = "fmt", .group = .output, .help = "Set the interactive prompt. Escapes such as \\u, \\h, and \\d work as in mysql. Defaults to $MYSQL_PS1." },
+    .{ .id = .auto_rehash, .long = "auto-rehash", .group = .output, .help = "Load database, table, and column names for completion. This is the default." },
+    .{ .id = .no_auto_rehash, .long = "no-auto-rehash", .short = 'A', .group = .output, .help = "Do not load names for completion. Use rehash to load them." },
+    .{ .id = .skip_auto_rehash, .long = "skip-auto-rehash", .group = .output, .help = "Same as --no-auto-rehash." },
+    .{ .id = .reconnect, .long = "reconnect", .group = .connection, .help = "Reconnect once if the server has gone away, in the interactive client. This is the default." },
+    .{ .id = .skip_reconnect, .long = "skip-reconnect", .group = .connection, .help = "Do not reconnect when the server has gone away." },
     .{ .id = .help, .long = "help", .short = '?', .group = .other, .help = "Display this help and exit." },
     .{ .id = .version, .long = "version", .short = 'V', .group = .other, .help = "Output version information and exit." },
 };
@@ -166,6 +178,12 @@ pub const Options = struct {
     /// From --tee. Null when not given.
     tee: ?[]const u8 = null,
     show_warnings: bool = false,
+    /// From --prompt. Null when not given. Used only by the interactive client.
+    prompt: ?[]const u8 = null,
+    /// Load names for completion when the interactive client connects and changes databases.
+    auto_rehash: bool = true,
+    /// Reconnect when the server has gone away. The interactive client only, as in mysql.cc.
+    reconnect: bool = true,
     show_help: bool = false,
     show_version: bool = false,
 
@@ -434,6 +452,10 @@ fn applyFileFlag(options: *Options, id: Id, enabled: bool) void {
         .vertical => options.vertical = enabled,
         .raw => options.raw = enabled,
         .show_warnings => options.show_warnings = enabled,
+        .auto_rehash => options.auto_rehash = enabled,
+        .no_auto_rehash, .skip_auto_rehash => options.auto_rehash = !enabled,
+        .reconnect => options.reconnect = enabled,
+        .skip_reconnect => options.reconnect = !enabled,
         // Every other flag is caught by the spec-coverage test below.
         else => unreachable,
     }
@@ -495,6 +517,11 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         .pager => options.pager = value orelse "",
         .tee => options.tee = try requiredValue(value),
         .show_warnings => options.show_warnings = true,
+        .prompt => options.prompt = try requiredValue(value),
+        .auto_rehash => options.auto_rehash = true,
+        .no_auto_rehash, .skip_auto_rehash => options.auto_rehash = false,
+        .reconnect => options.reconnect = true,
+        .skip_reconnect => options.reconnect = false,
         .help => options.show_help = true,
         .version => options.show_version = true,
     }
@@ -921,6 +948,46 @@ test "pager, tee, and show-warnings flags" {
 
     const missing = [_][]const u8{ "thysql", "--tee" };
     try std.testing.expectError(Error.MissingOptionValue, parse(std.testing.allocator, &missing, &env));
+}
+
+test "prompt, auto-rehash, and reconnect flags, with their negative forms" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const plain = [_][]const u8{"thysql"};
+    var defaults = try parse(std.testing.allocator, &plain, &env);
+    defer defaults.deinit(std.testing.allocator);
+    try std.testing.expect(defaults.prompt == null);
+    try std.testing.expect(defaults.auto_rehash);
+    try std.testing.expect(defaults.reconnect);
+
+    const given = [_][]const u8{ "thysql", "--prompt=\\u> ", "-A", "--skip-reconnect" };
+    var options = try parse(std.testing.allocator, &given, &env);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("\\u> ", options.prompt.?);
+    try std.testing.expect(!options.auto_rehash);
+    try std.testing.expect(!options.reconnect);
+
+    const back_on = [_][]const u8{ "thysql", "--no-auto-rehash", "--auto-rehash", "--reconnect" };
+    var restored = try parse(std.testing.allocator, &back_on, &env);
+    defer restored.deinit(std.testing.allocator);
+    try std.testing.expect(restored.auto_rehash);
+    try std.testing.expect(restored.reconnect);
+
+    const missing = [_][]const u8{ "thysql", "--prompt" };
+    try std.testing.expectError(Error.MissingOptionValue, parse(std.testing.allocator, &missing, &env));
+
+    const file_settings = [_]OptionFile.Setting{
+        .{ .name = "auto-rehash", .value = "0" },
+        .{ .name = "skip_reconnect", .value = null },
+        .{ .name = "prompt", .value = "[\\d]> " },
+    };
+    const none = [_][]const u8{"thysql"};
+    var from_file = try parseWithSettings(std.testing.allocator, &none, 1, &env, &file_settings);
+    defer from_file.deinit(std.testing.allocator);
+    try std.testing.expect(!from_file.auto_rehash);
+    try std.testing.expect(!from_file.reconnect);
+    try std.testing.expectEqualStrings("[\\d]> ", from_file.prompt.?);
 }
 
 test "usage describes the optional pager command and the tee file" {
