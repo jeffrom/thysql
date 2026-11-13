@@ -9,6 +9,7 @@ const ClientCommand = @import("client_command.zig");
 const Client = @import("client.zig");
 const Completion = @import("completion.zig");
 const Options = @import("options.zig");
+const OptionFile = @import("option_file.zig");
 const Readline = @import("readline.zig");
 pub const Unicode = @import("unicode.zig");
 
@@ -729,10 +730,22 @@ pub fn runREPL(
     }
 
     if (args.items.len > 1 and std.mem.eql(u8, args.items[1], "complete")) {
-        return try Completion.run(allocator, stdout, stderr, args.items, env);
+        return try Completion.run(allocator, io, stdout, stderr, args.items, env);
     }
 
-    var options = Options.parse(allocator, args.items, env) catch |err| {
+    // Option files come before the command line, as in mysql.cc's load_defaults.
+    var loaded = OptionFile.load(allocator, io, env, args.items, stderr) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.OptionFileFailed => return 1,
+    };
+    defer loaded.deinit();
+    if (loaded.print_defaults) {
+        try OptionFile.renderPrintDefaults(stdout, args.items[0], loaded.settings, args.items[loaded.next..]);
+        try stdout.flush();
+        return 0;
+    }
+
+    var options = Options.parseWithSettings(allocator, args.items, loaded.next, env, loaded.settings) catch |err| {
         try Options.renderError(stderr, err);
         try Options.renderUsage(stderr);
         return 1;
@@ -950,6 +963,7 @@ test {
         @import("completion.zig"),
         @import("isocline.zig"),
         @import("mysql.zig"),
+        @import("option_file.zig"),
         @import("options.zig"),
         @import("unicode.zig"),
     };

@@ -62,6 +62,28 @@ These options match mysql.cc and are passed to the bundled Connector/C.
   `-P`, `-S`, or `--protocol` uses the socket at the library's default path.
 - Not supported: `--protocol=pipe` and `memory`.
 
+## option files
+
+These match mysql.cc and MariaDB's load_defaults. By default, thysql reads
+`/etc/my.cnf`, `/etc/mysql/my.cnf`, then `~/.my.cnf`. Later files override earlier
+ones, and command-line flags override all of them.
+
+- Groups read: `[client]`, `[mysql]`, `[mariadb-client]`, `[client-mariadb]`, `[mariadb]`.
+  Other groups are skipped.
+- `--defaults-file=path` reads only that file. It is an error if the file is missing.
+  `--defaults-extra-file=path` is read after the system files and before `~/.my.cnf`.
+  `--no-defaults` reads nothing. `--print-defaults` prints the resulting arguments and exits.
+  These four must come first on the command line, each at most once.
+- `!include file` and `!includedir dir` read more files. `!includedir` reads `*.cnf` files in
+  name order.
+- `#` and `;` start comments. A `#` inside quotes is not a comment. A matching pair of quotes
+  around a value is removed, and `\n \t \r \b \s \" \' \\` are expanded.
+- A bare name such as `skip-column-names` turns the flag on. `skip-x=0` turns on the positive
+  form, and `x=0` turns the flag off. `loose-` names and unknown names are ignored.
+  Dashes and underscores are interchangeable.
+- Unlike the command line, a `password=` line is allowed, and it overrides `MYSQL_PWD`.
+  A bare `password` line prompts. `--print-defaults` shows the password as `***`.
+
 ## client commands
 
 These match mysql.cc. Each works at the prompt, and the backslash forms also work

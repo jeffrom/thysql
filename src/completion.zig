@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Mysql = @import("mysql.zig");
+const OptionFile = @import("option_file.zig");
 const Options = @import("options.zig");
 
 const CompletionRequest = struct {
@@ -66,6 +67,7 @@ fn parseRequest(allocator: Allocator, args: []const []const u8) !CompletionReque
 
 pub fn run(
     allocator: Allocator,
+    io: std.Io,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     args: []const []const u8,
@@ -74,7 +76,18 @@ pub fn run(
     var request = try parseRequest(allocator, args);
     defer request.deinit(allocator);
 
-    var options = Options.parse(allocator, request.connection_args.items, env) catch |err| {
+    // It connects like the REPL, so it reads the same option files.
+    var loaded = OptionFile.load(allocator, io, env, request.connection_args.items, stderr) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.OptionFileFailed => return 1,
+    };
+    defer loaded.deinit();
+    if (loaded.print_defaults) {
+        try OptionFile.renderPrintDefaults(stdout, args[0], loaded.settings, request.connection_args.items[loaded.next..]);
+        return 0;
+    }
+
+    var options = Options.parseWithSettings(allocator, request.connection_args.items, loaded.next, env, loaded.settings) catch |err| {
         try Options.renderError(stderr, err);
         return 1;
     };
