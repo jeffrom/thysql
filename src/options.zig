@@ -120,12 +120,13 @@ pub const Options = struct {
     }
 
     /// Picks the output format for one statement's result. A trailing \G
-    /// always means vertical. Tab output is the default in batch input and with -B or -s.
+    /// always means vertical. Tab output is the default in batch mode (-B, -e, or non-tty
+    /// input) and with -s, as mysql.cc sets status.batch for -e.
     pub fn resultFormat(self: *const Options, stdin_is_tty: bool, query_vertical: bool) ResultFormat {
         if (query_vertical or self.vertical) {
             return .vertical;
         }
-        const tab_output = self.batch or !stdin_is_tty or self.silent > 0;
+        const tab_output = self.isBatch(stdin_is_tty) or self.silent > 0;
         return if (tab_output and !self.table) .tab else .table;
     }
 
@@ -510,7 +511,7 @@ test "result format follows mysql.cc: vertical, tab in batch or with -s, else ta
     const with_e = [_][]const u8{ "thysql", "-e", "select 1" };
     var execute = try parse(std.testing.allocator, &with_e, &env);
     defer execute.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.table, execute.resultFormat(true, false));
+    try std.testing.expectEqual(ResultFormat.tab, execute.resultFormat(true, false));
 
     const with_t = [_][]const u8{ "thysql", "-t", "-B" };
     var forced_table = try parse(std.testing.allocator, &with_t, &env);
