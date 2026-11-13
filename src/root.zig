@@ -796,7 +796,7 @@ pub fn runREPL(
         return try Batch.run(db.allocator, io, stdin, stdout, stderr, &db, executeBatchQuery);
     }
 
-    try Readline.setup();
+    try Readline.setup(allocator, io, env);
     try renderConnectionBanner(stdout, db.serverName(), db.connectionId(), db.serverVersion(), Mysql.clientInfo());
 
     var interrupt_worker = QueryInterruptWorker{ .db = &db };
@@ -1003,6 +1003,7 @@ test {
     _ = .{
         @import("batch.zig"),
         @import("completion.zig"),
+        @import("isocline.zig"),
         @import("mysql.zig"),
         @import("unicode.zig"),
     };

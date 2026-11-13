@@ -15,8 +15,8 @@ pub fn one(prompt: ?[:0]const u8) ?[:0]const u8 {
 //     // isocline.ic_add_completions(env, word, completions);
 // }
 
-pub fn setup() !void {
-    isocline.setupHistory();
+pub fn setup(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !void {
+    isocline.setupHistory(allocator, io, env);
     isocline.disableFilenameCompletion();
     isocline.disablePromptMarker();
 

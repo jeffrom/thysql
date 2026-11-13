@@ -189,6 +189,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // End-to-end tests run the installed binary against Docker containers
+    // (MySQL 8.4 and MariaDB 11.4). Extra arguments go to the Python runner,
+    // e.g. `zig build e2e -- -k select`.
+    const e2e_run = b.addSystemCommand(&.{ "python3", "tests/e2e/run.py" });
+    e2e_run.addArtifactArg(exe);
+    e2e_run.addPassthruArgs();
+    e2e_run.step.dependOn(b.getInstallStep());
+    const e2e_step = b.step("e2e", "Run end-to-end tests against MySQL 8.4 and MariaDB 11.4 (needs Docker)");
+    e2e_step.dependOn(&e2e_run.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
