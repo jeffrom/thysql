@@ -60,6 +60,13 @@ with SIGKILL, the same filter finds any leftovers.
   be in cooked mode before that.
 - `password_env(user)` returns the `MYSQL_PWD` entry for the fixture users
   (`{}` for the no-password user). Pass it as `env=` for interactive logins.
+- `tls_material()` returns the throwaway TLS files for this run (`TlsMaterial`):
+  `ca` signed the server certificate, `wrong_ca` did not, `capath` holds `ca` in
+  hashed form, and `client_cert`/`client_key` are a client pair. Both servers are
+  started with the server certificate, with the material mounted read-only at
+  `/etc/thysql-tls`. The files come from `openssl` on the host. With
+  `THYSQL_E2E_KEEP=1` they live in a fixed temp directory, so kept containers
+  still find them.
 - `E2ETestCase` is a `unittest.TestCase` base class. `setUp` gives each test a
   fresh `self.home`, and `self.interactive(...)` returns an `Interactive` whose
   session is closed in cleanup.
@@ -73,6 +80,15 @@ Fixtures live in the `thysql_test` database (`SEED_SQL` in `harness.py`):
   default auth plugin. It has SELECT on `thysql_test.*`.
 - `thysql_nopw`: a user with no password. It also has SELECT on `thysql_test.*`.
 - root uses the `e2e-root-pw` password. The containers are throwaway.
+
+### Socket tests
+
+`test_tls.py` covers `--socket` and `--protocol` error handling only. A
+positive socket test does not work on Docker Desktop for macOS. The server
+creates its socket in a bind-mounted host directory, and the socket file
+appears on the host, but connecting to it is refused. The socket is not a live
+bridge into the container. Test a positive socket connection on Linux, or with
+a named volume and a helper container, if you need one.
 
 ## Adding a test
 

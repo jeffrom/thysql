@@ -14,6 +14,35 @@ pub const DBInfo = struct {
     password: []const u8,
     database: []const u8,
     port: u32 = 3306,
+    socket: []const u8 = "",
+    protocol: Options.Protocol = .default,
+    tls: Options.Tls = .{},
+};
+
+/// TLS settings as NUL-terminated strings for the C library. An empty string means unset.
+const Tls = struct {
+    enabled: bool,
+    ca: [:0]const u8,
+    capath: [:0]const u8,
+    cert: [:0]const u8,
+    key: [:0]const u8,
+    cipher: [:0]const u8,
+    crl: [:0]const u8,
+    crlpath: [:0]const u8,
+    tls_version: [:0]const u8,
+    verify_server_cert: bool,
+};
+
+/// Everything `connect` needs. The strings must be NUL-terminated.
+const ConnectParams = struct {
+    host: [:0]const u8,
+    user: [:0]const u8,
+    password: [:0]const u8,
+    database: [:0]const u8,
+    port: u32,
+    socket: [:0]const u8,
+    protocol: Options.Protocol,
+    tls: Tls,
 };
 
 pub const DBError = error{ ExecError, StoreResultError, OutOfMemory };
@@ -32,11 +61,16 @@ pub const ExecResult = union(enum) {
 pub const DB = struct {
     conn: *C.struct_st_mysql,
     allocator: Allocator,
+    /// Owns the socket path and TLS strings, so they live as long as the connection.
+    strings: std.heap.ArenaAllocator,
     host: [:0]u8,
     user: [:0]u8,
     password: [:0]u8,
     database: [:0]u8,
     port: u32,
+    socket: [:0]const u8,
+    protocol: Options.Protocol,
+    tls: Tls,
 
     pub fn init(allocator: Allocator, info: DBInfo) !DB {
         const host = try allocator.dupeSentinel(u8, info.host, 0);
@@ -48,16 +82,35 @@ pub const DB = struct {
         const database = try allocator.dupeSentinel(u8, info.database, 0);
         errdefer allocator.free(database);
 
-        const db = try connect(host, user, password, database, info.port);
+        var strings = std.heap.ArenaAllocator.init(allocator);
+        errdefer strings.deinit();
+        const socket = try strings.allocator().dupeSentinel(u8, info.socket, 0);
+        const tls = try dupeTls(strings.allocator(), info.tls);
 
-        return .{
-            .conn = db,
-            .allocator = allocator,
+        const connect_params: ConnectParams = .{
             .host = host,
             .user = user,
             .password = password,
             .database = database,
             .port = info.port,
+            .socket = socket,
+            .protocol = info.protocol,
+            .tls = tls,
+        };
+        const db = try connect(connect_params);
+
+        return .{
+            .conn = db,
+            .allocator = allocator,
+            .strings = strings,
+            .host = host,
+            .user = user,
+            .password = password,
+            .database = database,
+            .port = info.port,
+            .socket = socket,
+            .protocol = info.protocol,
+            .tls = tls,
         };
     }
 
@@ -67,6 +120,20 @@ pub const DB = struct {
         self.allocator.free(self.user);
         self.allocator.free(self.password);
         self.allocator.free(self.database);
+        self.strings.deinit();
+    }
+
+    fn params(self: *const DB) ConnectParams {
+        return .{
+            .host = self.host,
+            .user = self.user,
+            .password = self.password,
+            .database = self.database,
+            .port = self.port,
+            .socket = self.socket,
+            .protocol = self.protocol,
+            .tls = self.tls,
+        };
     }
 
     pub fn selectDatabase(self: *DB, database: [:0]const u8) DBError!void {
@@ -165,7 +232,7 @@ pub const DB = struct {
     }
 
     pub fn killRunningQuery(self: *DB) DBError!void {
-        const killer = connect(self.host, self.user, self.password, self.database, self.port) catch {
+        const killer = connect(self.params()) catch {
             return error.ExecError;
         };
         defer C.mysql_close(killer);
@@ -210,7 +277,7 @@ pub const DB = struct {
     }
 
     fn reconnect(self: *DB) DBError!void {
-        const db = connect(self.host, self.user, self.password, self.database, self.port) catch {
+        const db = connect(self.params()) catch {
             return error.ExecError;
         };
         C.mysql_close(self.conn);
@@ -218,21 +285,88 @@ pub const DB = struct {
     }
 };
 
-fn connect(host: [:0]const u8, user: [:0]const u8, password: [:0]const u8, database: [:0]const u8, port: u32) !*C.struct_st_mysql {
+/// Copies the TLS options and resolves the verification default: verify when
+/// a CA is given, unless the user chose otherwise (as mysql.cc does).
+fn dupeTls(allocator: Allocator, tls: Options.Tls) !Tls {
+    const has_ca = tls.ca.len > 0 or tls.capath.len > 0;
+    return .{
+        .enabled = tls.enabled,
+        .ca = try allocator.dupeSentinel(u8, tls.ca, 0),
+        .capath = try allocator.dupeSentinel(u8, tls.capath, 0),
+        .cert = try allocator.dupeSentinel(u8, tls.cert, 0),
+        .key = try allocator.dupeSentinel(u8, tls.key, 0),
+        .cipher = try allocator.dupeSentinel(u8, tls.cipher, 0),
+        .crl = try allocator.dupeSentinel(u8, tls.crl, 0),
+        .crlpath = try allocator.dupeSentinel(u8, tls.crlpath, 0),
+        .tls_version = try allocator.dupeSentinel(u8, tls.tls_version, 0),
+        .verify_server_cert = tls.verify_server_cert orelse has_ca,
+    };
+}
+
+/// Maps an empty string to NULL, which the C library reads as "not set".
+fn optionalCString(value: [:0]const u8) ?[*:0]const u8 {
+    return if (value.len == 0) null else value.ptr;
+}
+
+/// Sets the protocol and TLS options, as mysql.cc does before mysql_real_connect.
+/// Both TLS branches set the posture explicitly rather than relying on library
+/// defaults, which differ by host. Verification is set to match TLS use: the
+/// library turns TLS on whenever verification is on.
+fn applyConnectOptions(db: *C.struct_st_mysql, params: ConnectParams) void {
+    switch (params.protocol) {
+        .default => {},
+        .tcp, .socket => {
+            var protocol: c_uint = if (params.protocol == .tcp)
+                @intCast(C.MYSQL_PROTOCOL_TCP)
+            else
+                @intCast(C.MYSQL_PROTOCOL_SOCKET);
+            _ = C.mysql_options(db, C.MYSQL_OPT_PROTOCOL, &protocol);
+        },
+    }
+
+    const tls = params.tls;
+    if (!tls.enabled) {
+        // Plaintext. Verification must be off as well, or the library turns TLS back on.
+        var off: C.my_bool = 0;
+        _ = C.mysql_options(db, C.MYSQL_OPT_SSL_ENFORCE, &off);
+        _ = C.mysql_options(db, C.MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &off);
+        return;
+    }
+    // Use TLS when the server offers it. mysql_ssl_set also turns TLS on.
+    _ = C.mysql_ssl_set(
+        db,
+        optionalCString(tls.key),
+        optionalCString(tls.cert),
+        optionalCString(tls.ca),
+        optionalCString(tls.capath),
+        optionalCString(tls.cipher),
+    );
+    _ = C.mysql_options(db, C.MYSQL_OPT_SSL_CRL, optionalCString(tls.crl));
+    _ = C.mysql_options(db, C.MYSQL_OPT_SSL_CRLPATH, optionalCString(tls.crlpath));
+    _ = C.mysql_options(db, C.MYSQL_OPT_TLS_VERSION, optionalCString(tls.tls_version));
+    var verify: C.my_bool = @intFromBool(tls.verify_server_cert);
+    _ = C.mysql_options(db, C.MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &verify);
+}
+
+fn connect(params: ConnectParams) !*C.struct_st_mysql {
     const db = C.mysql_init(null);
 
     if (db == null) {
         return error.InitError;
     }
 
+    applyConnectOptions(db, params);
+
+    // A socket path only matters for host "localhost" (or no host). The library
+    // ignores it for other hosts and for protocol tcp, as it does for mysql.cc.
     const conn_result = C.mysql_real_connect(
         db,
-        host,
-        user,
-        password,
-        database,
-        port,
-        null,
+        params.host.ptr,
+        params.user.ptr,
+        params.password.ptr,
+        params.database.ptr,
+        params.port,
+        optionalCString(params.socket),
         C.CLIENT_MULTI_STATEMENTS,
     );
     if (conn_result == null) {

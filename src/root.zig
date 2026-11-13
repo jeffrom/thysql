@@ -686,6 +686,9 @@ pub fn runREPL(
         .password = options.password,
         .database = options.database,
         .port = options.port,
+        .socket = options.socket,
+        .protocol = options.protocol,
+        .tls = options.tls,
     });
     defer db.close();
 

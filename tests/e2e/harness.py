@@ -3,7 +3,8 @@
 Python 3 standard library only. The module holds three things:
 
 - Docker lifecycle: start a MySQL 8.4 and a MariaDB 11.4 container on random
-  host ports, seed fixtures, and remove the containers afterwards.
+  host ports, seed fixtures, and remove the containers afterwards. Each server
+  also gets throwaway TLS certificates (see `tls_material()`).
 - Non-interactive runs: run the thysql binary with args, stdin, and env, and
   get back stdout, stderr, and the exit code.
 - Interactive runs: run thysql under a pseudo-terminal and expect output.
@@ -44,6 +45,12 @@ NOPW_USER = "thysql_nopw"
 LABEL = "thysql-e2e"
 READY_TIMEOUT = 240
 
+# Where the TLS material is mounted inside each server container.
+TLS_MOUNT = "/etc/thysql-tls"
+# Kept containers reference their TLS directory by path, so with
+# THYSQL_E2E_KEEP=1 the directory is fixed and only generated when missing.
+TLS_KEEP_DIR = os.path.join(tempfile.gettempdir(), "thysql-e2e-tls-keep")
+
 _ANSI = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07)")
 
 SEED_SQL = f"""
@@ -70,6 +77,97 @@ GRANT SELECT ON {TEST_DB}.* TO '{PW_USER}'@'%', '{NOPW_USER}'@'%';
 """
 
 
+SERVER_EXT = """subjectAltName=DNS:localhost,IP:127.0.0.1
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+"""
+
+CLIENT_EXT = """basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=clientAuth
+"""
+
+
+@dataclasses.dataclass
+class TlsMaterial:
+    """Throwaway certificates for the TLS tests. Paths are on the host."""
+
+    directory: str
+    ca: str  # the CA that signed the server certificate
+    wrong_ca: str  # a second CA that did not sign it
+    capath: str  # a directory holding `ca`, in OpenSSL hashed form
+    server_cert: str
+    server_key: str
+    client_cert: str
+    client_key: str
+
+
+def _openssl(args, cwd):
+    result = subprocess.run(["openssl", *args], cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"openssl {args[0]} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def make_tls_material(directory):
+    """Writes a CA, a second CA, and a server and client certificate signed by the first CA."""
+    def write(name, text):
+        with open(os.path.join(directory, name), "w") as handle:
+            handle.write(text)
+
+    write("server-ext.cnf", SERVER_EXT)
+    write("client-ext.cnf", CLIENT_EXT)
+    days = ["-days", "3"]
+    _openssl(
+        ["req", "-x509", "-newkey", "rsa:2048", "-nodes", *days,
+         "-keyout", "ca-key.pem", "-out", "ca.pem", "-subj", "/CN=thysql e2e CA"],
+        directory,
+    )
+    _openssl(
+        ["req", "-x509", "-newkey", "rsa:2048", "-nodes", *days,
+         "-keyout", "wrong-key.pem", "-out", "wrong-ca.pem", "-subj", "/CN=thysql e2e other CA"],
+        directory,
+    )
+    for role, subject, ext in [("server", "/CN=localhost", "server-ext.cnf"),
+                               ("client", "/CN=thysql e2e client", "client-ext.cnf")]:
+        _openssl(
+            ["req", "-newkey", "rsa:2048", "-nodes", "-keyout", f"{role}-key.pem",
+             "-out", f"{role}.csr", "-subj", subject],
+            directory,
+        )
+        _openssl(
+            ["x509", "-req", "-in", f"{role}.csr", "-CA", "ca.pem", "-CAkey", "ca-key.pem",
+             "-CAcreateserial", *days, "-extfile", ext, "-out", f"{role}-cert.pem"],
+            directory,
+        )
+    # The server reads its key as the mysql user inside the container, and
+    # the key is a throwaway, so it is made world-readable.
+    for key in ("server-key.pem", "client-key.pem"):
+        os.chmod(os.path.join(directory, key), 0o644)
+
+    capath = os.path.join(directory, "capath")
+    os.makedirs(capath, exist_ok=True)
+    subject_hash = _openssl(["x509", "-hash", "-noout", "-in", "ca.pem"], directory).strip()
+    shutil.copy(os.path.join(directory, "ca.pem"), os.path.join(capath, f"{subject_hash}.0"))
+
+    return tls_paths(directory)
+
+
+def tls_paths(directory):
+    """The TLS file names inside `directory`. Does not check that they exist."""
+    return TlsMaterial(
+        directory=directory,
+        ca=os.path.join(directory, "ca.pem"),
+        wrong_ca=os.path.join(directory, "wrong-ca.pem"),
+        capath=os.path.join(directory, "capath"),
+        server_cert=os.path.join(directory, "server-cert.pem"),
+        server_key=os.path.join(directory, "server-key.pem"),
+        client_cert=os.path.join(directory, "client-cert.pem"),
+        client_key=os.path.join(directory, "client-key.pem"),
+    )
+
+
 @dataclasses.dataclass
 class Server:
     name: str
@@ -92,6 +190,8 @@ class RunResult:
 
 _SERVERS = []
 _STARTED = []  # containers created in this process, for cleanup
+_TLS = None  # TlsMaterial for this run
+_TLS_DIRS = []  # temporary TLS directories created in this process, for cleanup
 
 
 def keep_containers():
@@ -179,15 +279,62 @@ def _seed(server):
     )
 
 
-def _start_one(name, image, client, password_var):
+def _mounts_tls(container, tls_dir):
+    """True if `container` mounts `tls_dir` at TLS_MOUNT."""
+    result = docker(
+        ["inspect", "-f", "{{range .Mounts}}{{.Source}} {{.Destination}}\n{{end}}", container],
+        check=False,
+    )
+    want = os.path.realpath(tls_dir)
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == TLS_MOUNT and os.path.realpath(parts[0]) == want:
+            return True
+    return False
+
+
+def _tls_server_args():
+    """mysqld/mariadbd options that point the server at the mounted certificates."""
+    return [
+        f"--ssl-ca={TLS_MOUNT}/ca.pem",
+        f"--ssl-cert={TLS_MOUNT}/server-cert.pem",
+        f"--ssl-key={TLS_MOUNT}/server-key.pem",
+    ]
+
+
+def _prepare_tls():
+    """Generates the TLS material for this run, or reuses the kept material."""
+    if keep_containers():
+        os.makedirs(TLS_KEEP_DIR, exist_ok=True)
+        if not os.path.exists(os.path.join(TLS_KEEP_DIR, "server-key.pem")):
+            return make_tls_material(TLS_KEEP_DIR)
+        return tls_paths(TLS_KEEP_DIR)
+    directory = tempfile.mkdtemp(prefix="thysql-e2e-tls-")
+    _TLS_DIRS.append(directory)
+    return make_tls_material(directory)
+
+
+def tls_material():
+    """The TLS material for this run. Only valid while the servers are running."""
+    if _TLS is None:
+        raise RuntimeError("TLS material is not set up; the servers are not running")
+    return _TLS
+
+
+def _start_one(name, image, client, password_var, tls):
     container = _container_name(name)
     exists = docker(["container", "inspect", container], check=False).returncode == 0
+    if exists and not _mounts_tls(container, tls.directory):
+        # A kept container from a run with other TLS material. Its mount cannot change.
+        docker(["rm", "-f", container])
+        exists = False
     if exists:
         docker(["start", container])
     else:
         run_args = ["run", "-d", "--name", container, "--label", f"{LABEL}=1"]
         run_args += ["-e", password_var]  # value comes from _docker_env()
-        run_args += ["-p", "127.0.0.1::3306", image]
+        run_args += ["-v", f"{tls.directory}:{TLS_MOUNT}:ro"]
+        run_args += ["-p", "127.0.0.1::3306", image, *_tls_server_args()]
         docker(run_args, env={**_docker_env(), password_var: ROOT_PASSWORD})
     _STARTED.append(container)
     server = Server(
@@ -204,19 +351,26 @@ def _start_one(name, image, client, password_var):
 
 def start_servers():
     """Starts both servers and seeds fixtures. Safe to call once per run."""
+    global _TLS
+    _TLS = _prepare_tls()
     _SERVERS.extend([
-        _start_one("mysql", "mysql:8.4", "mysql", "MYSQL_ROOT_PASSWORD"),
-        _start_one("mariadb", "mariadb:11.4", "mariadb", "MARIADB_ROOT_PASSWORD"),
+        _start_one("mysql", "mysql:8.4", "mysql", "MYSQL_ROOT_PASSWORD", _TLS),
+        _start_one("mariadb", "mariadb:11.4", "mariadb", "MARIADB_ROOT_PASSWORD", _TLS),
     ])
 
 
 def stop_servers():
+    global _TLS
     _SERVERS.clear()
+    _TLS = None
     if keep_containers():
         return
     for container in _STARTED:
         docker(["rm", "-f", container], check=False)
     _STARTED.clear()
+    for directory in _TLS_DIRS:
+        shutil.rmtree(directory, ignore_errors=True)
+    _TLS_DIRS.clear()
 
 
 @contextlib.contextmanager

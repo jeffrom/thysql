@@ -15,10 +15,16 @@ pub const Error = error{
     UnknownOption,
     UnexpectedOptionValue,
     PasswordOnCommandLine,
+    InvalidProtocol,
+    InvalidBoolValue,
     OutOfMemory,
 };
 
 pub const ResultFormat = enum { table, tab, vertical };
+
+/// How to reach the server. `default` lets the library choose: a socket for
+/// host "localhost", TCP otherwise. -P selects tcp and -S selects socket.
+pub const Protocol = enum { default, tcp, socket };
 
 pub const Id = enum {
     host,
@@ -26,6 +32,20 @@ pub const Id = enum {
     port,
     user,
     password,
+    socket,
+    protocol,
+    ssl,
+    skip_ssl,
+    ssl_ca,
+    ssl_capath,
+    ssl_cert,
+    ssl_key,
+    ssl_cipher,
+    ssl_crl,
+    ssl_crlpath,
+    tls_version,
+    ssl_verify_server_cert,
+    skip_ssl_verify_server_cert,
     execute,
     force,
     delimiter,
@@ -57,9 +77,23 @@ pub const Spec = struct {
 pub const specs = [_]Spec{
     .{ .id = .host, .long = "host", .short = 'h', .arg = .required, .arg_name = "name", .group = .connection, .help = "Connect to host. Defaults to $MARIADB_HOST, $MYSQL_HOST, then localhost." },
     .{ .id = .database, .long = "database", .short = 'D', .arg = .required, .arg_name = "name", .group = .connection, .help = "Database to use." },
-    .{ .id = .port, .long = "port", .short = 'P', .arg = .required, .arg_name = "#", .group = .connection, .help = "Port number. Defaults to $MYSQL_TCP_PORT, then 3306." },
+    .{ .id = .port, .long = "port", .short = 'P', .arg = .required, .arg_name = "#", .group = .connection, .help = "Port number. Defaults to $MYSQL_TCP_PORT, then 3306. Selects TCP." },
     .{ .id = .user, .long = "user", .short = 'u', .arg = .required, .arg_name = "name", .group = .connection, .help = "User for login. Defaults to $USER when set." },
     .{ .id = .password, .long = "password", .short = 'p', .arg = .optional, .group = .connection, .help = "Prompt for password without echoing input." },
+    .{ .id = .socket, .long = "socket", .short = 'S', .arg = .required, .arg_name = "path", .group = .connection, .help = "Unix socket file to use. Selects the socket protocol." },
+    .{ .id = .protocol, .long = "protocol", .arg = .required, .arg_name = "name", .group = .connection, .help = "Connection protocol: tcp or socket. Socket applies only to host localhost." },
+    .{ .id = .ssl, .long = "ssl", .arg = .optional, .group = .connection, .help = "Use TLS when the server offers it. This is the default." },
+    .{ .id = .skip_ssl, .long = "skip-ssl", .group = .connection, .help = "Do not use TLS." },
+    .{ .id = .ssl_ca, .long = "ssl-ca", .arg = .required, .arg_name = "file", .group = .connection, .help = "CA certificate file in PEM format. Implies --ssl." },
+    .{ .id = .ssl_capath, .long = "ssl-capath", .arg = .required, .arg_name = "dir", .group = .connection, .help = "Directory of CA certificates in PEM format. Implies --ssl." },
+    .{ .id = .ssl_cert, .long = "ssl-cert", .arg = .required, .arg_name = "file", .group = .connection, .help = "Client certificate file in PEM format. Implies --ssl." },
+    .{ .id = .ssl_key, .long = "ssl-key", .arg = .required, .arg_name = "file", .group = .connection, .help = "Client private key file in PEM format. Implies --ssl." },
+    .{ .id = .ssl_cipher, .long = "ssl-cipher", .arg = .required, .arg_name = "list", .group = .connection, .help = "TLS cipher list. Implies --ssl." },
+    .{ .id = .ssl_crl, .long = "ssl-crl", .arg = .required, .arg_name = "file", .group = .connection, .help = "Certificate revocation list file. Implies --ssl." },
+    .{ .id = .ssl_crlpath, .long = "ssl-crlpath", .arg = .required, .arg_name = "dir", .group = .connection, .help = "Directory of certificate revocation lists. Implies --ssl." },
+    .{ .id = .tls_version, .long = "tls-version", .arg = .required, .arg_name = "list", .group = .connection, .help = "TLS protocol versions to allow, such as TLSv1.2,TLSv1.3. Implies --ssl." },
+    .{ .id = .ssl_verify_server_cert, .long = "ssl-verify-server-cert", .arg = .optional, .group = .connection, .help = "Verify the server certificate. Takes 1 or 0. Verifies by default when --ssl-ca or --ssl-capath is given." },
+    .{ .id = .skip_ssl_verify_server_cert, .long = "skip-ssl-verify-server-cert", .group = .connection, .help = "Do not verify the server certificate, even when a CA is given." },
     .{ .id = .execute, .long = "execute", .short = 'e', .arg = .required, .arg_name = "sql", .group = .execution, .help = "Run the statements and exit. Implies batch mode. Repeat to add more." },
     .{ .id = .delimiter, .long = "delimiter", .arg = .required, .arg_name = "str", .group = .execution, .help = "Statement delimiter for batch and REPL input. Defaults to ';'." },
     .{ .id = .force, .long = "force", .short = 'f', .group = .execution, .help = "Keep going after SQL errors in batch and -e mode." },
@@ -81,6 +115,23 @@ const group_titles = [_]struct { group: Group, title: []const u8 }{
     .{ .group = .other, .title = "Help and version:" },
 };
 
+/// TLS settings. As in mysql.cc, TLS is used when the server offers it, a path
+/// option implies --ssl, and --skip-ssl turns TLS off. The last of these flags wins.
+pub const Tls = struct {
+    enabled: bool = true,
+    ca: []const u8 = "",
+    capath: []const u8 = "",
+    cert: []const u8 = "",
+    key: []const u8 = "",
+    cipher: []const u8 = "",
+    crl: []const u8 = "",
+    crlpath: []const u8 = "",
+    tls_version: []const u8 = "",
+    /// null means "verify when a CA is given", as mysql.cc does. Otherwise
+    /// the server certificate is not verified.
+    verify_server_cert: ?bool = null,
+};
+
 pub const Options = struct {
     host: []const u8 = "",
     user: []const u8 = "",
@@ -88,6 +139,9 @@ pub const Options = struct {
     database: []const u8 = "",
     port: u32 = 3306,
     prompt_password: bool = false,
+    socket: []const u8 = "",
+    protocol: Protocol = .default,
+    tls: Tls = .{},
     execute: ?std.ArrayList(u8) = null,
     force: bool = false,
     /// Delimiter for batch and REPL input. Checked when it is set.
@@ -273,12 +327,67 @@ fn delimiterValue(value: ?[]const u8) Error![]const u8 {
     return text;
 }
 
+/// As in mysql.cc, an empty value means "not set" and anything but tcp or socket is rejected.
+fn protocolValue(value: ?[]const u8) Error!Protocol {
+    const text = try requiredValue(value);
+    if (text.len == 0) {
+        return .default;
+    }
+    if (std.ascii.eqlIgnoreCase(text, "tcp")) {
+        return .tcp;
+    }
+    if (std.ascii.eqlIgnoreCase(text, "socket")) {
+        return .socket;
+    }
+    return Error.InvalidProtocol;
+}
+
+/// Boolean values for --ssl and --ssl-verify-server-cert. A bare flag means true.
+fn boolValue(value: ?[]const u8) Error!bool {
+    const text = value orelse return true;
+    const truthy = [_][]const u8{ "1", "on", "true", "yes" };
+    const falsy = [_][]const u8{ "0", "off", "false", "no" };
+    for (truthy) |word| {
+        if (std.ascii.eqlIgnoreCase(text, word)) return true;
+    }
+    for (falsy) |word| {
+        if (std.ascii.eqlIgnoreCase(text, word)) return false;
+    }
+    return Error.InvalidBoolValue;
+}
+
+/// Sets one TLS path option. Like the mysql.cc --ssl-ca family, it also enables TLS.
+fn setTlsPath(options: *Options, field: *[]const u8, value: ?[]const u8) Error!void {
+    field.* = try requiredValue(value);
+    options.tls.enabled = true;
+}
+
 fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Error!void {
     switch (id) {
         .host => options.host = try requiredValue(value),
         .database => options.database = try requiredValue(value),
         .user => options.user = try requiredValue(value),
-        .port => options.port = try parsePort(try requiredValue(value)),
+        .port => {
+            options.port = try parsePort(try requiredValue(value));
+            options.protocol = .tcp;
+        },
+        .socket => {
+            options.socket = try requiredValue(value);
+            options.protocol = .socket;
+        },
+        .protocol => options.protocol = try protocolValue(value),
+        .ssl => options.tls.enabled = try boolValue(value),
+        .skip_ssl => options.tls.enabled = false,
+        .ssl_ca => try setTlsPath(options, &options.tls.ca, value),
+        .ssl_capath => try setTlsPath(options, &options.tls.capath, value),
+        .ssl_cert => try setTlsPath(options, &options.tls.cert, value),
+        .ssl_key => try setTlsPath(options, &options.tls.key, value),
+        .ssl_cipher => try setTlsPath(options, &options.tls.cipher, value),
+        .ssl_crl => try setTlsPath(options, &options.tls.crl, value),
+        .ssl_crlpath => try setTlsPath(options, &options.tls.crlpath, value),
+        .tls_version => try setTlsPath(options, &options.tls.tls_version, value),
+        .ssl_verify_server_cert => options.tls.verify_server_cert = try boolValue(value),
+        .skip_ssl_verify_server_cert => options.tls.verify_server_cert = false,
         .password => {
             if (value != null) {
                 return Error.PasswordOnCommandLine;
@@ -320,6 +429,8 @@ pub fn renderError(out: *std.Io.Writer, err: Error) !void {
         Error.UnknownOption => "Unknown option. Run thysql --help for the supported options.",
         Error.UnexpectedOptionValue => "This option does not take a value.",
         Error.PasswordOnCommandLine => "Password values are not accepted on the command line; use -p or MYSQL_PWD.",
+        Error.InvalidProtocol => "Invalid protocol. Expected tcp or socket.",
+        Error.InvalidBoolValue => "Invalid value for a boolean option. Use 1, 0, on, or off.",
         Error.OutOfMemory => "Out of memory.",
     };
     try out.print("{s}\n", .{message});
@@ -580,4 +691,124 @@ test "usage lists every option in its group" {
     try std.testing.expect(std.mem.indexOf(u8, text, "      --column-names") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "  -?, --help") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "  -V, --version") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  -S, --socket=path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --ssl-ca=file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --skip-ssl") != null);
+}
+
+test "-P selects tcp and -S selects the socket; the last flag wins" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const socket_first = [_][]const u8{ "thysql", "-S", "/tmp/mysql.sock" };
+    var by_socket = try parse(std.testing.allocator, &socket_first, &env);
+    defer by_socket.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Protocol.socket, by_socket.protocol);
+    try std.testing.expectEqualStrings("/tmp/mysql.sock", by_socket.socket);
+
+    const port_after = [_][]const u8{ "thysql", "--socket=/tmp/mysql.sock", "-P", "3307" };
+    var by_port = try parse(std.testing.allocator, &port_after, &env);
+    defer by_port.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Protocol.tcp, by_port.protocol);
+    try std.testing.expectEqual(@as(u32, 3307), by_port.port);
+
+    const explicit = [_][]const u8{ "thysql", "-P", "3307", "--protocol=SOCKET" };
+    var by_protocol = try parse(std.testing.allocator, &explicit, &env);
+    defer by_protocol.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Protocol.socket, by_protocol.protocol);
+
+    const plain = [_][]const u8{"thysql"};
+    var none = try parse(std.testing.allocator, &plain, &env);
+    defer none.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Protocol.default, none.protocol);
+}
+
+test "--protocol accepts tcp and socket, treats empty as unset, and rejects the rest" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const tcp = [_][]const u8{ "thysql", "--protocol=tcp" };
+    var options = try parse(std.testing.allocator, &tcp, &env);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Protocol.tcp, options.protocol);
+
+    const empty = [_][]const u8{ "thysql", "--protocol=" };
+    var unset = try parse(std.testing.allocator, &empty, &env);
+    defer unset.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Protocol.default, unset.protocol);
+
+    const pipe = [_][]const u8{ "thysql", "--protocol=pipe" };
+    try std.testing.expectError(Error.InvalidProtocol, parse(std.testing.allocator, &pipe, &env));
+}
+
+test "TLS path options imply --ssl, and --skip-ssl turns TLS off again" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const ca_only = [_][]const u8{ "thysql", "--ssl-ca=/tmp/ca.pem" };
+    var with_ca = try parse(std.testing.allocator, &ca_only, &env);
+    defer with_ca.deinit(std.testing.allocator);
+    try std.testing.expect(with_ca.tls.enabled);
+    try std.testing.expectEqualStrings("/tmp/ca.pem", with_ca.tls.ca);
+    try std.testing.expectEqual(@as(?bool, null), with_ca.tls.verify_server_cert);
+
+    const skipped = [_][]const u8{ "thysql", "--ssl-ca=/tmp/ca.pem", "--skip-ssl" };
+    var off = try parse(std.testing.allocator, &skipped, &env);
+    defer off.deinit(std.testing.allocator);
+    try std.testing.expect(!off.tls.enabled);
+
+    const reenabled = [_][]const u8{ "thysql", "--skip-ssl", "--ssl-cert", "client.pem", "--ssl-key=client-key.pem" };
+    var on = try parse(std.testing.allocator, &reenabled, &env);
+    defer on.deinit(std.testing.allocator);
+    try std.testing.expect(on.tls.enabled);
+    try std.testing.expectEqualStrings("client.pem", on.tls.cert);
+    try std.testing.expectEqualStrings("client-key.pem", on.tls.key);
+
+    const ssl_zero = [_][]const u8{ "thysql", "--ssl-ca=/tmp/ca.pem", "--ssl=0" };
+    var disabled = try parse(std.testing.allocator, &ssl_zero, &env);
+    defer disabled.deinit(std.testing.allocator);
+    try std.testing.expect(!disabled.tls.enabled);
+
+    const missing = [_][]const u8{ "thysql", "--ssl-capath" };
+    try std.testing.expectError(Error.MissingOptionValue, parse(std.testing.allocator, &missing, &env));
+}
+
+test "TLS is on by default, and --skip-ssl turns it off" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const plain = [_][]const u8{"thysql"};
+    var default = try parse(std.testing.allocator, &plain, &env);
+    defer default.deinit(std.testing.allocator);
+    try std.testing.expect(default.tls.enabled);
+    try std.testing.expectEqual(@as(?bool, null), default.tls.verify_server_cert);
+
+    const skip = [_][]const u8{ "thysql", "--skip-ssl" };
+    var skipped = try parse(std.testing.allocator, &skip, &env);
+    defer skipped.deinit(std.testing.allocator);
+    try std.testing.expect(!skipped.tls.enabled);
+}
+
+test "TLS verify flag takes a boolean, with a skip form" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const bare = [_][]const u8{ "thysql", "--ssl", "--ssl-verify-server-cert" };
+    var verified = try parse(std.testing.allocator, &bare, &env);
+    defer verified.deinit(std.testing.allocator);
+    try std.testing.expect(verified.tls.enabled);
+    try std.testing.expectEqual(@as(?bool, true), verified.tls.verify_server_cert);
+
+    const zero = [_][]const u8{ "thysql", "--ssl-verify-server-cert=0" };
+    var unverified = try parse(std.testing.allocator, &zero, &env);
+    defer unverified.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, false), unverified.tls.verify_server_cert);
+
+    const skip = [_][]const u8{ "thysql", "--ssl-verify-server-cert", "--skip-ssl-verify-server-cert" };
+    var skipped = try parse(std.testing.allocator, &skip, &env);
+    defer skipped.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, false), skipped.tls.verify_server_cert);
+
+    const bad = [_][]const u8{ "thysql", "--ssl-verify-server-cert=maybe" };
+    try std.testing.expectError(Error.InvalidBoolValue, parse(std.testing.allocator, &bad, &env));
 }

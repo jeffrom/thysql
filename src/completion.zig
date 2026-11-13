@@ -91,6 +91,9 @@ pub fn run(
         .password = options.password,
         .database = "",
         .port = options.port,
+        .socket = options.socket,
+        .protocol = options.protocol,
+        .tls = options.tls,
     });
     defer db.close();
 

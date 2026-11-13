@@ -45,6 +45,23 @@ Example with the password supplied by the environment:
 MYSQL_PWD=foo zig build run -- -h 127.0.0.1 -uroot hi
 ```
 
+## TLS and sockets
+
+These options match mysql.cc and are passed to the bundled Connector/C.
+
+- TLS is used when the server offers it, as in mysql.cc. `--skip-ssl` turns it off.
+- `--ssl-ca`, `--ssl-capath`, `--ssl-cert`, `--ssl-key`, `--ssl-cipher`, `--ssl-crl`,
+  `--ssl-crlpath`, and `--tls-version` each turn TLS on. `--ssl` turns it on by name.
+- The server certificate is verified when `--ssl-verify-server-cert` is given, or when
+  `--ssl-ca` or `--ssl-capath` is given. `--ssl-verify-server-cert=0` and
+  `--skip-ssl-verify-server-cert` turn verification off.
+- `-P`/`--port` selects TCP. `-S`/`--socket=path` selects the socket.
+  `--protocol=tcp|socket` sets it directly. The last of these flags wins.
+- The library uses the socket only when the host is `localhost` or unset. For example,
+  `-h 127.0.0.1 -S path` still connects over TCP. A bare `-h localhost` with no
+  `-P`, `-S`, or `--protocol` uses the socket at the library's default path.
+- Not supported: `--protocol=pipe` and `memory`.
+
 ## misc
 
 ```sql
