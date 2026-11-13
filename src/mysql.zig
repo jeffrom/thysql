@@ -227,6 +227,88 @@ pub const DB = struct {
         return C.mysql_warning_count(self.conn);
     }
 
+    pub fn lastErrno(self: *DB) u32 {
+        return C.mysql_errno(self.conn);
+    }
+
+    /// Prints the warnings of the last statement as mysql.cc does: `Warning (Code 1366): text`.
+    /// A lone warning with the same code as `error_code` is skipped, because the error was already printed.
+    pub fn renderWarnings(self: *DB, out: *std.Io.Writer, error_code: u32) !void {
+        const exec_result = self.exec("SHOW WARNINGS") catch return;
+        const result = switch (exec_result) {
+            .result => |res| res,
+            .ok => return,
+        };
+        defer freeResult(result);
+
+        const count = C.mysql_num_rows(result);
+        while (C.mysql_fetch_row(result)) |row| {
+            if (row == null) {
+                break;
+            }
+            const lengths = C.mysql_fetch_lengths(result);
+            const level = cellText(row, lengths, 0);
+            const code = cellText(row, lengths, 1);
+            const message = cellText(row, lengths, 2);
+            const code_number = std.fmt.parseUnsigned(u32, code, 10) catch 0;
+            if (count == 1 and error_code != 0 and code_number == error_code) {
+                return;
+            }
+            try out.print("{s} (Code {s}): {s}\n", .{ level, code, message });
+        }
+        try out.flush();
+    }
+
+    /// Runs `sql` and copies its first row into owned strings. NULL columns are null.
+    /// Returns null when the query fails or has no rows. Release it with `freeRowCopy`.
+    pub fn firstRowCopy(self: *DB, allocator: Allocator, sql: []const u8) !?[]?[]u8 {
+        const exec_result = self.exec(sql) catch return null;
+        const result = switch (exec_result) {
+            .result => |res| res,
+            .ok => return null,
+        };
+        defer freeResult(result);
+
+        const row = C.mysql_fetch_row(result);
+        if (row == null) {
+            return null;
+        }
+        const lengths = C.mysql_fetch_lengths(result);
+        const count: usize = C.mysql_num_fields(result);
+        const values = try allocator.alloc(?[]u8, count);
+        @memset(values, null);
+        errdefer freeRowCopy(allocator, values);
+        for (values, 0..) |*value, index| {
+            if (row[index] == null) {
+                continue;
+            }
+            value.* = try allocator.dupe(u8, row[index][0..lengths[index]]);
+        }
+        return values;
+    }
+
+    /// The TLS cipher in use, or null when the connection is not encrypted.
+    pub fn sslCipher(self: *DB) ?[]const u8 {
+        const cipher = C.mysql_get_ssl_cipher(self.conn);
+        return if (cipher == null) null else std.mem.sliceTo(cipher, 0);
+    }
+
+    /// The connection type, such as "127.0.0.1 via TCP/IP".
+    pub fn hostInfo(self: *DB) []const u8 {
+        const info = C.mysql_get_host_info(self.conn);
+        return if (info == null) "" else std.mem.sliceTo(info, 0);
+    }
+
+    pub fn protocolVersion(self: *DB) u32 {
+        return C.mysql_get_proto_info(self.conn);
+    }
+
+    /// The server's status line, as from SHOW STATUS summary, such as "Uptime: 3725  Threads: 2 ...".
+    pub fn statLine(self: *DB) ?[]const u8 {
+        const stat = C.mysql_stat(self.conn);
+        return if (stat == null) null else std.mem.sliceTo(stat, 0);
+    }
+
     pub fn connectionId(self: *DB) u64 {
         return @intCast(C.mysql_thread_id(self.conn));
     }
@@ -384,6 +466,24 @@ fn shouldReconnectAfterQueryError(errno: u32, retry: usize) bool {
 
 pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
     C.mysql_free_result(result);
+}
+
+/// Frees a row from `DB.firstRowCopy`.
+pub fn freeRowCopy(allocator: Allocator, values: []?[]u8) void {
+    for (values) |value| {
+        if (value) |text| {
+            allocator.free(text);
+        }
+    }
+    allocator.free(values);
+}
+
+/// The text of one column of a fetched row. NULL and missing columns read as "".
+fn cellText(row: C.MYSQL_ROW, lengths: [*c]c_ulong, index: usize) []const u8 {
+    if (row[index] == null) {
+        return "";
+    }
+    return row[index][0..lengths[index]];
 }
 
 pub fn clientInfo() []const u8 {

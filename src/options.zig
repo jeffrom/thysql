@@ -56,6 +56,9 @@ pub const Id = enum {
     silent,
     skip_column_names,
     column_names,
+    pager,
+    tee,
+    show_warnings,
     help,
     version,
 };
@@ -104,6 +107,9 @@ pub const specs = [_]Spec{
     .{ .id = .column_names, .long = "column-names", .group = .output, .help = "Write column names in results. This is the default." },
     .{ .id = .silent, .long = "silent", .short = 's', .group = .output, .help = "Tab-separated results. Give -s twice to also omit column names." },
     .{ .id = .raw, .long = "raw", .short = 'r', .group = .output, .help = "Write tab-separated fields without escaping." },
+    .{ .id = .pager, .long = "pager", .arg = .optional, .arg_name = "command", .group = .output, .help = "Print results through this shell command. With no command, uses $PAGER. Interactive only." },
+    .{ .id = .tee, .long = "tee", .arg = .required, .arg_name = "file", .group = .output, .help = "Append all output to this file. Interactive only." },
+    .{ .id = .show_warnings, .long = "show-warnings", .group = .output, .help = "Show warnings after every statement." },
     .{ .id = .help, .long = "help", .short = '?', .group = .other, .help = "Display this help and exit." },
     .{ .id = .version, .long = "version", .short = 'V', .group = .other, .help = "Output version information and exit." },
 };
@@ -153,6 +159,11 @@ pub const Options = struct {
     column_names: bool = true,
     /// Number of explicit -s flags.
     silent: u8 = 0,
+    /// From --pager. Null when not given, empty when given without a command.
+    pager: ?[]const u8 = null,
+    /// From --tee. Null when not given.
+    tee: ?[]const u8 = null,
+    show_warnings: bool = false,
     show_help: bool = false,
     show_version: bool = false,
 
@@ -415,6 +426,9 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         .silent => options.silent +|= 1,
         .skip_column_names => options.column_names = false,
         .column_names => options.column_names = true,
+        .pager => options.pager = value orelse "",
+        .tee => options.tee = try requiredValue(value),
+        .show_warnings => options.show_warnings = true,
         .help => options.show_help = true,
         .version => options.show_version = true,
     }
@@ -447,6 +461,8 @@ fn renderSpec(out: *std.Io.Writer, spec: Spec) !void {
     try left.print("--{s}", .{spec.long});
     if (spec.arg == .required) {
         try left.print("={s}", .{spec.arg_name});
+    } else if (spec.arg == .optional and spec.arg_name.len > 0) {
+        try left.print("[={s}]", .{spec.arg_name});
     }
     try out.print("  {s: <26}{s}\n", .{ left.buffered(), spec.help });
 }
@@ -811,4 +827,42 @@ test "TLS verify flag takes a boolean, with a skip form" {
 
     const bad = [_][]const u8{ "thysql", "--ssl-verify-server-cert=maybe" };
     try std.testing.expectError(Error.InvalidBoolValue, parse(std.testing.allocator, &bad, &env));
+}
+
+test "pager, tee, and show-warnings flags" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const bare = [_][]const u8{ "thysql", "--pager" };
+    var bare_pager = try parse(std.testing.allocator, &bare, &env);
+    defer bare_pager.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", bare_pager.pager.?);
+
+    const given = [_][]const u8{ "thysql", "--pager=less -S", "--tee=/tmp/out.txt", "--show-warnings" };
+    var options = try parse(std.testing.allocator, &given, &env);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("less -S", options.pager.?);
+    try std.testing.expectEqualStrings("/tmp/out.txt", options.tee.?);
+    try std.testing.expect(options.show_warnings);
+
+    const plain = [_][]const u8{"thysql"};
+    var none = try parse(std.testing.allocator, &plain, &env);
+    defer none.deinit(std.testing.allocator);
+    try std.testing.expect(none.pager == null);
+    try std.testing.expect(none.tee == null);
+    try std.testing.expect(!none.show_warnings);
+
+    const missing = [_][]const u8{ "thysql", "--tee" };
+    try std.testing.expectError(Error.MissingOptionValue, parse(std.testing.allocator, &missing, &env));
+}
+
+test "usage describes the optional pager command and the tee file" {
+    var buffer: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    try renderUsage(&out);
+    const text = out.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --pager[=command]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --tee=file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --show-warnings") != null);
 }

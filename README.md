@@ -62,6 +62,26 @@ These options match mysql.cc and are passed to the bundled Connector/C.
   `-P`, `-S`, or `--protocol` uses the socket at the library's default path.
 - Not supported: `--protocol=pipe` and `memory`.
 
+## client commands
+
+These match mysql.cc. Each works at the prompt, and the backslash forms also work
+at the start of a statement, such as `\P less` on its own line.
+
+- `quit`, `exit`, `\q`; `help`, `\h`, `?`; `status`, `\s`; `use <db>`, `\u <db>`;
+  `print`, `\p`.
+- `pager [cmd]`, `\P [cmd]`, `nopager`, `\n`: result sets go through `cmd` via the
+  shell. With no `cmd`, `$PAGER` is used.
+- `tee <file>`, `\T <file>`, `notee`, `\t`: copy everything, including the typed input,
+  to the file. Messages do not go to the file.
+- `warnings`, `\W`, `nowarning`, `\w`: show `Warning (Code N): ...` after a
+  statement with warnings.
+- Flags: `--pager[=cmd]`, `--tee=file`, `--show-warnings`. Pager and tee are
+  interactive only, as in mysql.cc.
+
+Not supported: server-side `help <topic>`, and backslash commands in the middle
+of a statement. In batch input, a named command such as `quit` must end with its
+delimiter, unless it is the last input.
+
 ## misc
 
 ```sql

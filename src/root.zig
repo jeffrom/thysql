@@ -2,8 +2,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const C = @import("mysql_c");
 const Mysql = @import("mysql.zig");
 const Batch = @import("batch.zig");
+const ClientCommand = @import("client_command.zig");
+const Client = @import("client.zig");
 const Completion = @import("completion.zig");
 const Options = @import("options.zig");
 const Readline = @import("readline.zig");
@@ -125,55 +128,108 @@ fn readHiddenLine(allocator: Allocator, io: std.Io, stderr: *std.Io.Writer, prom
     return line.toOwnedSlice(allocator);
 }
 
-fn useDatabaseName(line: []const u8) ?[]const u8 {
-    var remaining = std.mem.trim(u8, line, " \t\r\n");
-    if (remaining.len == 0) {
-        return null;
-    }
-
-    if (remaining[remaining.len - 1] == ';') {
-        remaining = std.mem.trim(u8, remaining[0 .. remaining.len - 1], " \t\r\n");
-    }
-
-    if (remaining.len < 3 or !std.ascii.eqlIgnoreCase(remaining[0..3], "use")) {
-        return null;
-    }
-
-    if (remaining.len > 3 and !std.ascii.isWhitespace(remaining[3])) {
-        return null;
-    }
-
-    var name = std.mem.trim(u8, remaining[3..], " \t\r\n");
+/// Removes the backticks around a database name given to `use`.
+fn unquoteName(name: []const u8) []const u8 {
     if (name.len >= 2 and name[0] == '`' and name[name.len - 1] == '`') {
-        name = name[1 .. name.len - 1];
+        return name[1 .. name.len - 1];
     }
-    return if (name.len == 0) null else name;
+    return name;
 }
 
-fn executeQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.Query, interactive: bool) !bool {
-    if (query.sql.len == 0) {
-        return true;
+/// Runs `use <name>`. Errors go to `err_out`, with the line number when `line` is set (batch input).
+fn useDatabase(
+    db: *Mysql.DB,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+    line: ?usize,
+    interactive: bool,
+    arg: []const u8,
+) !bool {
+    if (arg.len == 0) {
+        try err_out.print("ERROR: USE must be followed by a database name\n", .{});
+        return false;
     }
 
-    if (useDatabaseName(query.sql)) |database| {
-        const database_z = try db.allocator.dupeSentinel(u8, database, 0);
-        defer db.allocator.free(database_z);
+    const database_z = try db.allocator.dupeSentinel(u8, unquoteName(arg), 0);
+    defer db.allocator.free(database_z);
 
-        db.selectDatabase(database_z) catch |err| {
-            switch (err) {
-                Mysql.DBError.ExecError => {
-                    try db.renderLastError(stdout);
-                    return false;
-                },
-                else => return err,
-            }
-        };
-
-        if (interactive) {
-            try Readline.rebuildCompletions();
-            try stdout.print("Database changed\n", .{});
-            try stdout.flush();
+    db.selectDatabase(database_z) catch |err| {
+        switch (err) {
+            Mysql.DBError.ExecError => {
+                if (line) |number| {
+                    try db.renderLastErrorAt(err_out, number);
+                } else {
+                    try db.renderLastError(err_out);
+                }
+                return false;
+            },
+            else => return err,
         }
+    };
+
+    if (interactive) {
+        try Readline.rebuildCompletions();
+        try out.print("Database changed\n", .{});
+    }
+    return true;
+}
+
+/// Runs a client command from the REPL or batch input. `error.ClientQuit` ends the session.
+fn runClientCommand(
+    client: *Client,
+    db: *Mysql.DB,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+    line: ?usize,
+    interactive: bool,
+    delimiter: []const u8,
+    command: ClientCommand.Command,
+) !bool {
+    switch (command.kind) {
+        .quit => return error.ClientQuit,
+        .help => {
+            if (command.arg.len == 0) {
+                try ClientCommand.renderHelp(out);
+            } else {
+                try out.print("Server-side help is not supported. Type help for the client commands.\n", .{});
+            }
+        },
+        .status => try client.renderStatus(db, out, delimiter),
+        .use => return try useDatabase(db, out, err_out, line, interactive, command.arg),
+        .print => try Client.renderPrint(out, ""),
+        .pager => try client.cmdPager(out, command.arg),
+        .nopager => try client.cmdNopager(out),
+        .tee => try client.cmdTee(out, command.arg),
+        .notee => try client.cmdNotee(out),
+        .warnings => try client.cmdWarnings(out, true),
+        .nowarnings => try client.cmdWarnings(out, false),
+    }
+    return true;
+}
+
+/// Renders one result set. With a pager set, it goes through the pager. A pager that exits
+/// early makes the writes fail, which is not an error for the session.
+fn renderResult(client: *Client, result: [*c]C.struct_st_mysql_res, vertical: bool, elapsed_ns: i96, warnings: u32) !void {
+    var sink: Client.ResultSink = undefined;
+    try sink.open(client);
+    defer sink.close();
+
+    const out = sink.writer();
+    const rendered = if (vertical)
+        Mysql.render_result_vertical_timed_with_warnings(out, result, elapsed_ns, warnings)
+    else
+        Mysql.render_result_timed_with_warnings(out, result, elapsed_ns, warnings);
+    rendered catch |err| {
+        if (err == error.WriteFailed and sink.isPiped()) {
+            return;
+        }
+        return err;
+    };
+}
+
+/// Runs one SQL statement from the REPL and renders its result sets. Errors and warnings go to `stdout`.
+fn executeQuery(client: *Client, db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.Query) !bool {
+    if (query.sql.len == 0) {
         return true;
     }
 
@@ -184,32 +240,36 @@ fn executeQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.
     var exec_result = db.exec(query.sql) catch |err| {
         switch (err) {
             Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
+                const error_code = db.lastErrno();
                 try db.renderLastError(stdout);
+                try client.afterStatement(db, stdout, 0, error_code);
                 return false;
             },
             else => return err,
         }
     };
 
+    var warnings: u32 = 0;
     while (true) {
         const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
         switch (exec_result) {
             .result => |result| {
                 defer Mysql.freeResult(result);
-                const warnings = db.warningCount();
-                if (query.vertical) {
-                    try Mysql.render_result_vertical_timed_with_warnings(stdout, result, elapsed_ns, warnings);
-                } else {
-                    try Mysql.render_result_timed_with_warnings(stdout, result, elapsed_ns, warnings);
-                }
+                warnings = db.warningCount();
+                try renderResult(client, result, query.vertical, elapsed_ns, warnings);
             },
-            .ok => |ok| try Mysql.render_ok_timed(stdout, ok, elapsed_ns),
+            .ok => |ok| {
+                warnings = ok.warnings;
+                try Mysql.render_ok_timed(stdout, ok, elapsed_ns);
+            },
         }
 
         exec_result = (db.nextResult() catch |err| {
             switch (err) {
                 Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
+                    const error_code = db.lastErrno();
                     try db.renderLastError(stdout);
+                    try client.afterStatement(db, stdout, warnings, error_code);
                     return false;
                 },
                 else => return err,
@@ -217,9 +277,7 @@ fn executeQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.
         }) orelse break;
     }
 
-    // const affected = C.mysql_affected_rows(self.conn);
-    // std.debug.print("{d} row(s) affected\n", .{affected});
-
+    try client.afterStatement(db, stdout, warnings, 0);
     return true;
 }
 
@@ -445,6 +503,7 @@ const ReplContext = struct {
     last_query: *std.ArrayList(u8),
     /// Batch state for statements typed at the prompt. It carries the force flag and `source` depth.
     session: Batch.Session,
+    client: *Client,
 };
 
 /// Runs one statement typed at the prompt. Errors are printed, and the REPL keeps going.
@@ -452,11 +511,17 @@ const ReplContext = struct {
 fn executeReplQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.Io.Writer, query: Batch.Query) !bool {
     _ = stderr;
     const allocator = context.db.allocator;
+    const command = ClientCommand.parse(query.sql);
     if (context.session.depth == 0) {
-        try rememberLastQuery(allocator, context.last_query, query);
+        if (command == null) {
+            try rememberLastQuery(allocator, context.last_query, query);
+        }
         try addQueryToHistory(allocator, query, context.scanner.delimiterText());
     }
-    return try executeQuery(context.db, context.io, stdout, query, true);
+    if (command) |client_command| {
+        return try runClientCommand(context.client, context.db, stdout, stdout, null, true, context.scanner.delimiterText(), client_command);
+    }
+    return try executeQuery(context.client, context.db, context.io, stdout, query);
 }
 
 fn feedInteractiveInput(
@@ -507,6 +572,7 @@ fn readOneLine(
 
     const line = maybeLine.?;
     defer Readline.freeLine(@ptrCast(@constCast(line.ptr)));
+    context.client.echoInput(prompt, line);
     if (line.len > 1) {
         Readline.removeLastHistory();
     }
@@ -526,7 +592,23 @@ fn readOneLine(
         return false;
     }
 
-    try feedInteractiveInput(context, stdout, stderr, line, true);
+    // A client command at the start of a line runs at once, without a delimiter, as in mysql.cc.
+    if (scanner.atStatementStart() and std.mem.indexOf(u8, line, scanner.delimiterText()) == null) {
+        if (ClientCommand.parse(line)) |command| {
+            _ = runClientCommand(context.client, db, stdout, stdout, null, true, scanner.delimiterText(), command) catch |err| switch (err) {
+                error.ClientQuit => return true,
+                else => return err,
+            };
+            try stdout.flush();
+            return false;
+        }
+    }
+
+    feedInteractiveInput(context, stdout, stderr, line, true) catch |err| switch (err) {
+        error.ClientQuit => return true,
+        else => return err,
+    };
+    try stdout.flush();
     return false;
 }
 
@@ -534,6 +616,7 @@ const BatchContext = struct {
     db: *Mysql.DB,
     options: *const Options.Options,
     stdin_is_tty: bool,
+    client: *Client,
 };
 
 /// Runs one batch statement. Results go to stdout, and errors go to stderr
@@ -544,26 +627,16 @@ fn executeBatchQuery(context: BatchContext, stdout: *std.Io.Writer, stderr: *std
         return true;
     }
 
-    if (useDatabaseName(query.sql)) |database| {
-        const database_z = try db.allocator.dupeSentinel(u8, database, 0);
-        defer db.allocator.free(database_z);
-
-        db.selectDatabase(database_z) catch |err| {
-            switch (err) {
-                Mysql.DBError.ExecError => {
-                    try db.renderLastErrorAt(stderr, query.line);
-                    return false;
-                },
-                else => return err,
-            }
-        };
-        return true;
+    if (ClientCommand.parse(query.sql)) |command| {
+        return try runClientCommand(context.client, db, stdout, stderr, query.line, false, context.options.delimiter, command);
     }
 
     var exec_result = db.exec(query.sql) catch |err| {
         switch (err) {
             Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
+                const error_code = db.lastErrno();
                 try db.renderLastErrorAt(stderr, query.line);
+                try context.client.afterStatement(db, stdout, 0, error_code);
                 return false;
             },
             else => return err,
@@ -572,19 +645,23 @@ fn executeBatchQuery(context: BatchContext, stdout: *std.Io.Writer, stderr: *std
 
     const format = context.options.resultFormat(context.stdin_is_tty, query.vertical);
     const column_names = context.options.showColumnNames(format);
+    var warnings: u32 = 0;
     while (true) {
         switch (exec_result) {
             .result => |result| {
                 defer Mysql.freeResult(result);
+                warnings = db.warningCount();
                 try Mysql.render_script_result(stdout, result, format, column_names, context.options.raw);
             },
-            .ok => {},
+            .ok => |ok| warnings = ok.warnings,
         }
 
         exec_result = (db.nextResult() catch |err| {
             switch (err) {
                 Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
+                    const error_code = db.lastErrno();
                     try db.renderLastErrorAt(stderr, query.line);
+                    try context.client.afterStatement(db, stdout, warnings, error_code);
                     return false;
                 },
                 else => return err,
@@ -592,6 +669,7 @@ fn executeBatchQuery(context: BatchContext, stdout: *std.Io.Writer, stderr: *std
         }) orelse break;
     }
 
+    try context.client.afterStatement(db, stdout, warnings, 0);
     return true;
 }
 
@@ -604,6 +682,7 @@ fn runBatch(
     stderr: *std.Io.Writer,
     db: *Mysql.DB,
     options: *const Options.Options,
+    client: *Client,
 ) !u8 {
     var stdin_buffer: [8192]u8 = undefined;
     var stdin_reader = stdin.reader(io, &stdin_buffer);
@@ -623,8 +702,13 @@ fn runBatch(
         .db = db,
         .options = options,
         .stdin_is_tty = stdin_is_tty,
+        .client = client,
     };
-    return try Batch.run(db.allocator, input, stdout, stderr, run_options, context, executeBatchQuery);
+    // `quit` ends the input with success, as in mysql.cc.
+    return Batch.run(db.allocator, input, stdout, stderr, run_options, context, executeBatchQuery) catch |err| switch (err) {
+        error.ClientQuit => 0,
+        else => return err,
+    };
 }
 
 pub fn runREPL(
@@ -692,12 +776,26 @@ pub fn runREPL(
     });
     defer db.close();
 
+    var client = Client.init(allocator, io, stdout, options.isBatch(stdin_is_tty));
+    defer client.deinit();
+    client.show_warnings = options.show_warnings;
+
     if (options.isBatch(stdin_is_tty)) {
-        return try runBatch(io, stdin, stdin_is_tty, stderr_is_tty, stdout, stderr, &db, &options);
+        return try runBatch(io, stdin, stdin_is_tty, stderr_is_tty, stdout, stderr, &db, &options, &client);
     }
 
+    // The pager and the tee file are for interactive use only, as in mysql.cc.
+    try client.configurePager(options.pager, env.get("PAGER"));
+    if (options.tee) |path| {
+        try client.cmdTee(stdout, path);
+    }
+
+    // Everything the REPL prints goes through this, so the tee file gets a copy.
+    var repl_out = Client.Mirror.init(stdout, &client);
+    const out = repl_out.writer();
+
     try Readline.setup(allocator, io, env);
-    try renderConnectionBanner(stdout, db.serverName(), db.connectionId(), db.serverVersion(), Mysql.clientInfo());
+    try renderConnectionBanner(out, db.serverName(), db.connectionId(), db.serverVersion(), Mysql.clientInfo());
 
     var interrupt_worker = QueryInterruptWorker{ .db = &db };
     try interrupt_worker.start();
@@ -714,9 +812,10 @@ pub fn runREPL(
         .scanner = &interactive_scanner,
         .last_query = &last_query,
         .session = Batch.Session.init(allocator, io, options.force),
+        .client = &client,
     };
     while (true) {
-        const done = try readOneLine(&context, stdout, stderr, env);
+        const done = try readOneLine(&context, out, stderr, env);
         if (done) {
             break;
         }
@@ -733,13 +832,10 @@ test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }
 
-test "detect USE database command" {
-    try std.testing.expectEqualStrings("test", useDatabaseName("use test").?);
-    try std.testing.expectEqualStrings("test", useDatabaseName("USE test;").?);
-    try std.testing.expectEqualStrings("test", useDatabaseName("  use   test  ;  ").?);
-    try std.testing.expectEqualStrings("my-db", useDatabaseName("use `my-db`;").?);
-    try std.testing.expect(useDatabaseName("user test") == null);
-    try std.testing.expect(useDatabaseName("select 1") == null);
+test "use strips backticks around a database name" {
+    try std.testing.expectEqualStrings("my-db", unquoteName("`my-db`"));
+    try std.testing.expectEqualStrings("test", unquoteName("test"));
+    try std.testing.expectEqualStrings("`", unquoteName("`"));
 }
 
 test "connection prompt shows connection and database" {
@@ -849,6 +945,8 @@ test "trim right bytes keeps leading whitespace" {
 test {
     _ = .{
         @import("batch.zig"),
+        @import("client.zig"),
+        @import("client_command.zig"),
         @import("completion.zig"),
         @import("isocline.zig"),
         @import("mysql.zig"),

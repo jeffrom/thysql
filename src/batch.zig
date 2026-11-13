@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ClientCommand = @import("client_command.zig");
 
 pub const Query = struct {
     sql: []const u8,
@@ -88,6 +89,8 @@ pub const Scanner = struct {
         block_comment,
         /// Inside a client command line. The newline ends it.
         command_line,
+        /// A backslash command such as \W at the start of a statement. The line is the statement text, and the newline ends it.
+        client_line,
     };
 
     const Keyword = struct { text: []const u8, command: Command };
@@ -228,9 +231,22 @@ pub const Scanner = struct {
                     self.state = .normal;
                     return true;
                 }
+                if (ClientCommand.isShortChar(byte) and self.atBackslashStatementStart()) {
+                    // Keep the backslash: the line is the statement text, as in `\P less`.
+                    try self.buffer.append(allocator, byte);
+                    self.state = .client_line;
+                    return false;
+                }
 
                 self.state = .normal;
                 return self.feedNormal(allocator, byte);
+            },
+            .client_line => {
+                if (byte == '\n') {
+                    return true;
+                }
+                try self.buffer.append(allocator, byte);
+                return false;
             },
             .single_quote, .double_quote => {
                 try self.buffer.append(allocator, byte);
@@ -365,9 +381,20 @@ pub const Scanner = struct {
         return std.mem.trim(u8, self.buffer.items[self.command_arg_start..], " \t\r\n");
     }
 
+    /// True when nothing but whitespace is pending, so the next line starts a statement.
+    pub fn atStatementStart(self: *const Scanner) bool {
+        return self.state == .normal and std.mem.trim(u8, self.buffer.items, " \t\r\n").len == 0;
+    }
+
+    /// Called when the buffer ends with a backslash. True when only whitespace comes before it.
+    fn atBackslashStatementStart(self: *const Scanner) bool {
+        const before = self.buffer.items[0 .. self.buffer.items.len - 1];
+        return std.mem.trim(u8, before, " \t\r\n").len == 0;
+    }
+
     pub fn promptKind(self: *const Scanner) PromptKind {
         return switch (self.state) {
-            .normal, .keyword, .maybe_dash_comment, .maybe_block_comment, .maybe_command, .line_comment, .command_line => if (self.buffer.items.len == 0)
+            .normal, .keyword, .maybe_dash_comment, .maybe_block_comment, .maybe_command, .line_comment, .command_line, .client_line => if (self.buffer.items.len == 0)
                 .main
             else
                 .continuation,
@@ -421,7 +448,7 @@ pub const Scanner = struct {
                 else => {},
             },
             // Only feed() enters these states, so an editor buffer never reaches them.
-            .keyword, .command_line => {},
+            .keyword, .command_line, .client_line => {},
             .maybe_dash_comment => {
                 if (byte == '-') {
                     self.state = .line_comment;
@@ -1062,6 +1089,26 @@ test "a backslash clear command at the start of a statement still clears" {
     try std.testing.expectEqualStrings("", scanner.buffer.items);
     try std.testing.expectEqual(Scanner.PromptKind.main, scanner.promptKind());
     try std.testing.expectEqual(@as(?Command, null), scanner.pendingCommand());
+}
+
+test "a client command at the start of a statement is one line" {
+    var scanner: Scanner = .{};
+    defer scanner.deinit(std.testing.allocator);
+
+    for ("  \\P less") |byte| {
+        try std.testing.expect(!try scanner.feed(std.testing.allocator, byte));
+    }
+    try std.testing.expect(try scanner.feed(std.testing.allocator, '\n'));
+    try std.testing.expectEqual(@as(?Command, null), scanner.pendingCommand());
+    try std.testing.expectEqualStrings("\\P less", scanner.pendingQuery().sql);
+    scanner.reset();
+
+    // After a statement ends on the same line, a backslash command starts a new statement.
+    try expectStatements(";", "select 1;\\W\n", &.{ "select 1", "\\W" });
+}
+
+test "a backslash command inside a statement stays SQL" {
+    try expectStatements(";", "select 1\\W;", &.{"select 1\\W"});
 }
 
 test "delimiter values are checked and cut to 15 bytes" {
