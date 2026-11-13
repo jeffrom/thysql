@@ -5,10 +5,12 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Batch = @import("batch.zig");
 
 pub const Error = error{
     MissingOptionValue,
     InvalidPort,
+    InvalidDelimiter,
     TooManyDatabases,
     UnknownOption,
     UnexpectedOptionValue,
@@ -26,6 +28,7 @@ pub const Id = enum {
     password,
     execute,
     force,
+    delimiter,
     batch,
     table,
     vertical,
@@ -58,6 +61,7 @@ pub const specs = [_]Spec{
     .{ .id = .user, .long = "user", .short = 'u', .arg = .required, .arg_name = "name", .group = .connection, .help = "User for login. Defaults to $USER when set." },
     .{ .id = .password, .long = "password", .short = 'p', .arg = .optional, .group = .connection, .help = "Prompt for password without echoing input." },
     .{ .id = .execute, .long = "execute", .short = 'e', .arg = .required, .arg_name = "sql", .group = .execution, .help = "Run the statements and exit. Implies batch mode. Repeat to add more." },
+    .{ .id = .delimiter, .long = "delimiter", .arg = .required, .arg_name = "str", .group = .execution, .help = "Statement delimiter for batch and REPL input. Defaults to ';'." },
     .{ .id = .force, .long = "force", .short = 'f', .group = .execution, .help = "Keep going after SQL errors in batch and -e mode." },
     .{ .id = .batch, .long = "batch", .short = 'B', .group = .output, .help = "Tab-separated output with no footers. Implied when stdin is not a terminal." },
     .{ .id = .table, .long = "table", .short = 't', .group = .output, .help = "Table output, even in batch mode." },
@@ -86,6 +90,8 @@ pub const Options = struct {
     prompt_password: bool = false,
     execute: ?std.ArrayList(u8) = null,
     force: bool = false,
+    /// Delimiter for batch and REPL input. Checked when it is set.
+    delimiter: []const u8 = ";",
     batch: bool = false,
     table: bool = false,
     vertical: bool = false,
@@ -260,6 +266,12 @@ fn requiredValue(value: ?[]const u8) Error![]const u8 {
     return value orelse Error.MissingOptionValue;
 }
 
+fn delimiterValue(value: ?[]const u8) Error![]const u8 {
+    const text = try requiredValue(value);
+    _ = Batch.checkDelimiter(text) catch return Error.InvalidDelimiter;
+    return text;
+}
+
 fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Error!void {
     switch (id) {
         .host => options.host = try requiredValue(value),
@@ -285,6 +297,7 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
             }
         },
         .force => options.force = true,
+        .delimiter => options.delimiter = try delimiterValue(value),
         .batch => options.batch = true,
         .table => options.table = true,
         .vertical => options.vertical = true,
@@ -301,6 +314,7 @@ pub fn renderError(out: *std.Io.Writer, err: Error) !void {
     const message = switch (err) {
         Error.MissingOptionValue => "Missing value for option.",
         Error.InvalidPort => "Invalid port. Expected a base-10 unsigned integer.",
+        Error.InvalidDelimiter => "Invalid delimiter. It cannot be empty or contain a backslash.",
         Error.TooManyDatabases => "Too many database arguments.",
         Error.UnknownOption => "Unknown option. Run thysql --help for the supported options.",
         Error.UnexpectedOptionValue => "This option does not take a value.",
@@ -533,6 +547,22 @@ test "column names hide only in tab output with -ss or -N" {
     var skipped = try parse(std.testing.allocator, &dash_n, &env);
     defer skipped.deinit(std.testing.allocator);
     try std.testing.expect(!skipped.showColumnNames(.table));
+}
+
+test "delimiter option takes a value that is not empty or backslashed" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const args = [_][]const u8{ "thysql", "--delimiter=$$" };
+    var options = try parse(std.testing.allocator, &args, &env);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("$$", options.delimiter);
+
+    const empty = [_][]const u8{ "thysql", "--delimiter=" };
+    try std.testing.expectError(Error.InvalidDelimiter, parse(std.testing.allocator, &empty, &env));
+
+    const backslash = [_][]const u8{ "thysql", "--delimiter=\\" };
+    try std.testing.expectError(Error.InvalidDelimiter, parse(std.testing.allocator, &backslash, &env));
 }
 
 test "usage lists every option in its group" {

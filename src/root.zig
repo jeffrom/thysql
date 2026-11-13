@@ -279,7 +279,8 @@ fn appendHistoryChar(entry: *std.ArrayList(u8), allocator: Allocator, byte: u8, 
     }
 }
 
-fn formatHistoryEntry(allocator: Allocator, query: Batch.Query) ![:0]u8 {
+/// Formats a statement for the history. It ends with the delimiter in effect, so recalling it still runs.
+fn formatHistoryEntry(allocator: Allocator, query: Batch.Query, delimiter: []const u8) ![:0]u8 {
     var entry: std.ArrayList(u8) = .empty;
     errdefer entry.deinit(allocator);
 
@@ -291,18 +292,18 @@ fn formatHistoryEntry(allocator: Allocator, query: Batch.Query) ![:0]u8 {
     if (query.vertical) {
         try entry.appendSlice(allocator, "\\G");
     } else {
-        try entry.append(allocator, ';');
+        try entry.appendSlice(allocator, delimiter);
     }
 
     return try entry.toOwnedSliceSentinel(allocator, 0);
 }
 
-fn addQueryToHistory(allocator: Allocator, query: Batch.Query) !void {
+fn addQueryToHistory(allocator: Allocator, query: Batch.Query, delimiter: []const u8) !void {
     if (query.sql.len == 0) {
         return;
     }
 
-    const entry = try formatHistoryEntry(allocator, query);
+    const entry = try formatHistoryEntry(allocator, query, delimiter);
     defer allocator.free(entry);
     Readline.addHistory(entry);
 }
@@ -436,29 +437,50 @@ fn openEditorForQuery(
     return try std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .limited(16 * 1024 * 1024));
 }
 
-fn feedInteractiveInput(
+/// What the REPL needs to run a statement typed at the prompt.
+const ReplContext = struct {
     db: *Mysql.DB,
     io: std.Io,
-    stdout: *std.Io.Writer,
     scanner: *Batch.Scanner,
     last_query: *std.ArrayList(u8),
+    /// Batch state for statements typed at the prompt. It carries the force flag and `source` depth.
+    session: Batch.Session,
+};
+
+/// Runs one statement typed at the prompt. Errors are printed, and the REPL keeps going.
+/// Statements from a sourced file are run, but they are not added to history.
+fn executeReplQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.Io.Writer, query: Batch.Query) !bool {
+    _ = stderr;
+    const allocator = context.db.allocator;
+    if (context.session.depth == 0) {
+        try rememberLastQuery(allocator, context.last_query, query);
+        try addQueryToHistory(allocator, query, context.scanner.delimiterText());
+    }
+    return try executeQuery(context.db, context.io, stdout, query, true);
+}
+
+fn feedInteractiveInput(
+    context: *ReplContext,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
     input: []const u8,
     append_newline_if_pending: bool,
 ) !void {
+    const scanner = context.scanner;
+    const session = &context.session;
     var completed_statement = false;
     for (input) |byte| {
-        if (try scanner.feed(db.allocator, byte)) {
+        if (try scanner.feed(context.db.allocator, byte)) {
             completed_statement = true;
-            const query = scanner.pendingQuery();
-            try rememberLastQuery(db.allocator, last_query, query);
-            try addQueryToHistory(db.allocator, query);
-            _ = try executeQuery(db, io, stdout, query, true);
-            scanner.reset();
+            _ = try Batch.runStatement(session, scanner, 0, stdout, stderr, context, executeReplQuery);
         }
     }
 
     if (append_newline_if_pending and (!completed_statement or scanner.pendingQuery().sql.len != 0)) {
-        _ = try scanner.feed(db.allocator, '\n');
+        // The newline ends a client command line such as `delimiter $$`.
+        if (try scanner.feed(context.db.allocator, '\n')) {
+            _ = try Batch.runStatement(session, scanner, 0, stdout, stderr, context, executeReplQuery);
+        }
     }
     if (scanner.pendingQuery().sql.len == 0) {
         scanner.reset();
@@ -466,14 +488,15 @@ fn feedInteractiveInput(
 }
 
 fn readOneLine(
-    db: *Mysql.DB,
-    io: std.Io,
+    context: *ReplContext,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     env: *const std.process.Environ.Map,
-    scanner: *Batch.Scanner,
-    last_query: *std.ArrayList(u8),
 ) !bool {
+    const db = context.db;
+    const io = context.io;
+    const scanner = context.scanner;
+    const last_query = context.last_query;
     const prompt = try interactivePrompt(db.allocator, db, scanner);
     defer db.allocator.free(prompt);
 
@@ -503,7 +526,7 @@ fn readOneLine(
         return false;
     }
 
-    try feedInteractiveInput(db, io, stdout, scanner, last_query, line, true);
+    try feedInteractiveInput(context, stdout, stderr, line, true);
     return false;
 }
 
@@ -586,7 +609,7 @@ fn runBatch(
     var stdin_reader = stdin.reader(io, &stdin_buffer);
     var execute_reader: std.Io.Reader = undefined;
     var input: *std.Io.Reader = &stdin_reader.interface;
-    var run_options = Batch.RunOptions{ .force = options.force };
+    var run_options = Batch.RunOptions{ .force = options.force, .delimiter = options.delimiter, .io = io };
 
     if (options.executeText()) |text| {
         execute_reader = std.Io.Reader.fixed(text);
@@ -679,10 +702,18 @@ pub fn runREPL(
 
     var interactive_scanner: Batch.Scanner = .{};
     defer interactive_scanner.deinit(allocator);
+    try interactive_scanner.setDelimiter(options.delimiter);
     var last_query: std.ArrayList(u8) = .empty;
     defer last_query.deinit(allocator);
+    var context = ReplContext{
+        .db = &db,
+        .io = io,
+        .scanner = &interactive_scanner,
+        .last_query = &last_query,
+        .session = Batch.Session.init(allocator, io, options.force),
+    };
     while (true) {
-        const done = try readOneLine(&db, io, stdout, stderr, env, &interactive_scanner, &last_query);
+        const done = try readOneLine(&context, stdout, stderr, env);
         if (done) {
             break;
         }
@@ -739,17 +770,27 @@ test "history entry folds multiline query outside strings" {
     const entry = try formatHistoryEntry(std.testing.allocator, .{
         .sql = "select\n'kept\nnewline'\nfrom dual",
         .vertical = false,
-    });
+    }, ";");
     defer std.testing.allocator.free(entry);
 
     try std.testing.expectEqualStrings("select 'kept\nnewline' from dual;", entry);
+}
+
+test "history entry ends with the delimiter in effect" {
+    const entry = try formatHistoryEntry(std.testing.allocator, .{
+        .sql = "create procedure p() begin select 1; end",
+        .vertical = false,
+    }, "$$");
+    defer std.testing.allocator.free(entry);
+
+    try std.testing.expectEqualStrings("create procedure p() begin select 1; end$$", entry);
 }
 
 test "history entry keeps vertical terminator" {
     const entry = try formatHistoryEntry(std.testing.allocator, .{
         .sql = "select 1",
         .vertical = true,
-    });
+    }, ";");
     defer std.testing.allocator.free(entry);
 
     try std.testing.expectEqualStrings("select 1\\G", entry);
