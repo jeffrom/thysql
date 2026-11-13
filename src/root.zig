@@ -320,7 +320,7 @@ fn executeQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.
     }
 
     if (useDatabaseName(query.sql)) |database| {
-        const database_z = try db.allocator.dupeZ(u8, database);
+        const database_z = try db.allocator.dupeSentinel(u8, database, 0);
         defer db.allocator.free(database_z);
 
         db.selectDatabase(database_z) catch |err| {
@@ -390,11 +390,11 @@ fn executeQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.
 fn interactivePrompt(allocator: Allocator, db: *Mysql.DB, scanner: *const Batch.Scanner) ![:0]u8 {
     return switch (scanner.promptKind()) {
         .main => connectionPrompt(allocator, db.user, db.host, db.port, db.database),
-        .continuation => try allocator.dupeZ(u8, "    -> "),
-        .single_quote => try allocator.dupeZ(u8, "    '> "),
-        .double_quote => try allocator.dupeZ(u8, "    \"> "),
-        .backtick => try allocator.dupeZ(u8, "    `> "),
-        .block_comment => try allocator.dupeZ(u8, "   /*> "),
+        .continuation => try allocator.dupeSentinel(u8, "    -> ", 0),
+        .single_quote => try allocator.dupeSentinel(u8, "    '> ", 0),
+        .double_quote => try allocator.dupeSentinel(u8, "    \"> ", 0),
+        .backtick => try allocator.dupeSentinel(u8, "    `> ", 0),
+        .block_comment => try allocator.dupeSentinel(u8, "   /*> ", 0),
     };
 }
 
@@ -679,7 +679,7 @@ fn executeBatchQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: B
     const start = std.Io.Clock.Timestamp.now(io, .awake);
 
     if (useDatabaseName(query.sql)) |database| {
-        const database_z = try db.allocator.dupeZ(u8, database);
+        const database_z = try db.allocator.dupeSentinel(u8, database, 0);
         defer db.allocator.free(database_z);
 
         db.selectDatabase(database_z) catch |err| {

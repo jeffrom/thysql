@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 ARG UBUNTU_VERSION=24.04
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.1
 
 FROM ubuntu:${UBUNTU_VERSION} AS build
 

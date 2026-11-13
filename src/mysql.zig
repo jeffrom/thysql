@@ -38,13 +38,13 @@ pub const DB = struct {
     port: u32,
 
     pub fn init(allocator: Allocator, info: DBInfo) !DB {
-        const host = try allocator.dupeZ(u8, info.host);
+        const host = try allocator.dupeSentinel(u8, info.host, 0);
         errdefer allocator.free(host);
-        const user = try allocator.dupeZ(u8, info.user);
+        const user = try allocator.dupeSentinel(u8, info.user, 0);
         errdefer allocator.free(user);
-        const password = try allocator.dupeZ(u8, info.password);
+        const password = try allocator.dupeSentinel(u8, info.password, 0);
         errdefer allocator.free(password);
-        const database = try allocator.dupeZ(u8, info.database);
+        const database = try allocator.dupeSentinel(u8, info.database, 0);
         errdefer allocator.free(database);
 
         const db = try connect(host, user, password, database, info.port);
@@ -79,7 +79,7 @@ pub const DB = struct {
             }
         }
 
-        const owned_database = try self.allocator.dupeZ(u8, database);
+        const owned_database = try self.allocator.dupeSentinel(u8, database, 0);
         self.allocator.free(self.database);
         self.database = owned_database;
     }
