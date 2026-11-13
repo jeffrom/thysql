@@ -6,11 +6,11 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var stdoutBuffer: [1024]u8 = undefined;
-    var stdoutWriter = std.Io.File.stdout().writer(io, &stdoutBuffer);
+    var stdoutWriter = std.Io.File.stdout().writerStreaming(io, &stdoutBuffer);
     const stdout = &stdoutWriter.interface;
 
     var stderrBuffer: [1024]u8 = undefined;
-    var stderrWriter = std.Io.File.stderr().writer(io, &stderrBuffer);
+    var stderrWriter = std.Io.File.stderr().writerStreaming(io, &stderrBuffer);
     const stderr = &stderrWriter.interface;
 
     const status = try thysql.runREPL(gpa, io, stdout, stderr, init.minimal.args, init.environ_map);

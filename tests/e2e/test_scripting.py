@@ -261,3 +261,36 @@ class ScriptingTests(E2ETestCase):
                 result = harness.run_thysql(args, env={})
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("Password values are not accepted on the command line", result.stderr)
+
+    def test_output_appends_to_a_redirected_file(self):
+        # stdout/stderr must stream, not write at offset 0, or `>>` and `2>&1` clobber.
+        import os, subprocess, tempfile
+        for server in self.each_server():
+            with self.subTest(server=server.name), tempfile.TemporaryDirectory() as home:
+                path = os.path.join(home, "out.txt")
+                with open(path, "w") as f:
+                    f.write("header line\n")
+                with open(path, "a") as out:
+                    subprocess.run(
+                        [harness.BINARY, *server.connect_args(ROOT_USER), "--database", TEST_DB,
+                         "-f", "-e", "select 'row1' x; select * from nope; select 'row2' y"],
+                        stdout=out, stderr=subprocess.STDOUT, timeout=60,
+                        env=harness.base_env(home, {"MYSQL_PWD": ROOT_PASSWORD}),
+                    )
+                with open(path) as f:
+                    text = f.read()
+                self.assertTrue(text.startswith("header line\nx\nrow1\n"), text)
+                self.assertIn("ERROR 1146", text)
+                self.assertTrue(text.endswith("y\nrow2\n"), text)
+
+    def test_connect_failure_prints_server_error_without_a_trace(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                result = harness.run_thysql(
+                    server.connect_args(ROOT_USER) + ["-e", "select 1"],
+                    env={"MYSQL_PWD": "wrong-password"},
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Access denied", result.stderr)
+                self.assertNotIn("error: ConnectError", result.stderr)
+                self.assertNotIn(".zig:", result.stderr)
