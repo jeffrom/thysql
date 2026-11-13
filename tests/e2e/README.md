@@ -54,6 +54,12 @@ with SIGKILL, the same filter finds any leftovers.
   literal string or a compiled regex and returns the text up to and including
   the match. ANSI escapes are stripped and CRLF is normalized first.
   `wait_exit()` returns the exit code.
+  Keys matter on a pty. Send `"\r"` to submit a line, as a real Enter does.
+  `"\n"` is ctrl+J in isocline, which inserts a newline instead. Send `"\x04"`
+  (Ctrl-D) only after `expect` has seen the prompt, because the tty may still
+  be in cooked mode before that.
+- `password_env(user)` returns the `MYSQL_PWD` entry for the fixture users
+  (`{}` for the no-password user). Pass it as `env=` for interactive logins.
 - `E2ETestCase` is a `unittest.TestCase` base class. `setUp` gives each test a
   fresh `self.home`, and `self.interactive(...)` returns an `Interactive` whose
   session is closed in cleanup.

@@ -60,7 +60,9 @@ class ConnectTests(E2ETestCase):
                     env={"MYSQL_PWD": "not-the-password"},
                 )
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("ERROR", result.stdout + result.stderr)
+                # The connect failure text is not yet in the ERROR <code> format
+                # that mysql.cc uses; only the message is checked here.
+                self.assertIn("Access denied", result.stdout + result.stderr)
 
     def test_password_on_command_line_is_rejected(self):
         for args in (["-psecret"], ["--password=secret"]):

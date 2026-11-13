@@ -12,6 +12,11 @@ def root_args(server, database=TEST_DB):
 
 
 class BatchTests(E2ETestCase):
+    def assertNoRowsFooter(self, stdout):
+        # With stdin not a tty, thysql runs in batch mode, as mysql.cc does
+        # (status.batch): no "N rows in set (... sec)" footer.
+        self.assertNotRegex(stdout, r"rows? in set")
+
     def run_sql(self, server, sql, database=TEST_DB):
         return harness.run_thysql(
             root_args(server, database),
@@ -28,7 +33,7 @@ class BatchTests(E2ETestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertRegex(result.stdout, r"\|\s*1\s*\|\s*alice\s*\|\s*NULL\s*\|")
                 self.assertRegex(result.stdout, r"\|\s*2\s*\|")
-                self.assertIn("3 rows in set", result.stdout)
+                self.assertNoRowsFooter(result.stdout)
 
     def test_backslash_G_renders_vertical_output(self):
         for server in self.each_server():
@@ -37,12 +42,14 @@ class BatchTests(E2ETestCase):
                     server, "select id, name from people where id = 1\\G\n"
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                # Names are right-aligned to the longest name ("name"), so "id" is padded.
                 self.assertIn(
                     "*************************** 1. row ***************************\n"
-                    "id: 1\n"
+                    "  id: 1\n"
                     "name: alice\n",
                     result.stdout,
                 )
+                self.assertNoRowsFooter(result.stdout)
 
     def test_bad_query_prints_error_and_exits_nonzero(self):
         for server in self.each_server():
@@ -82,7 +89,7 @@ class BatchTests(E2ETestCase):
                 for expected in ("first_col", "second_col", "third_col", "2"):
                     self.assertIn(expected, result.stdout)
                 self.assertNotIn("ERROR", result.stdout)
-                self.assertEqual(result.stdout.count("1 row in set"), 4)
+                self.assertNoRowsFooter(result.stdout)
 
     def test_fixture_values_round_trip(self):
         script = (

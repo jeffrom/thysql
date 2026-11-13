@@ -230,6 +230,12 @@ def running_servers():
         stop_servers()
 
 
+def password_env(user):
+    """The MYSQL_PWD entry that logs `user` in, or {} for users without a password."""
+    password = {ROOT_USER: ROOT_PASSWORD, PW_USER: PW_PASSWORD}.get(user)
+    return {"MYSQL_PWD": password} if password else {}
+
+
 def base_env(home, extra=None):
     """A minimal environment: no inherited MYSQL_* or ~/.my.cnf influence."""
     env = {
