@@ -22,7 +22,8 @@ class ConnectTests(E2ETestCase):
                     env={"MYSQL_PWD": ROOT_PASSWORD},
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertRegex(result.stdout, r"\|\s*root@")
+                # Piped stdin gives tab output: the value is on its own line.
+                self.assertRegex(result.stdout, r"(?m)^root@")
 
     def test_long_options_with_password_user(self):
         for server in self.each_server():

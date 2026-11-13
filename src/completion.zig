@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Mysql = @import("mysql.zig");
+const Options = @import("options.zig");
 
 const CompletionRequest = struct {
     database_prefix: []const u8,
@@ -69,16 +70,15 @@ pub fn run(
     stderr: *std.Io.Writer,
     args: []const []const u8,
     env: *const std.process.Environ.Map,
-    comptime parseConnectionOptions: anytype,
-    comptime renderCliError: anytype,
 ) !u8 {
     var request = try parseRequest(allocator, args);
     defer request.deinit(allocator);
 
-    const options = parseConnectionOptions(request.connection_args.items, env) catch |err| {
-        try renderCliError(stderr, err);
+    var options = Options.parse(allocator, request.connection_args.items, env) catch |err| {
+        try Options.renderError(stderr, err);
         return 1;
     };
+    defer options.deinit(allocator);
 
     if (options.prompt_password) {
         try stderr.print("Cannot prompt for a password during completion; use MYSQL_PWD.\n", .{});

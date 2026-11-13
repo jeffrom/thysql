@@ -5,28 +5,12 @@ const Allocator = std.mem.Allocator;
 const Mysql = @import("mysql.zig");
 const Batch = @import("batch.zig");
 const Completion = @import("completion.zig");
+const Options = @import("options.zig");
 const Readline = @import("readline.zig");
 pub const Unicode = @import("unicode.zig");
 
 var sigint_requested = std.atomic.Value(bool).init(false);
 var query_executing = std.atomic.Value(bool).init(false);
-
-const CliError = error{
-    MissingOptionValue,
-    InvalidPort,
-    TooManyDatabases,
-    UnknownOption,
-    PasswordOnCommandLine,
-};
-
-const CliOptions = struct {
-    host: []const u8,
-    user: []const u8,
-    password: []const u8,
-    database: []const u8,
-    port: u32,
-    prompt_password: bool = false,
-};
 
 fn connectionPrompt(allocator: Allocator, user: []const u8, host: []const u8, port: u32, database: []const u8) ![:0]u8 {
     const db_name = if (database.len == 0) "(none)" else database;
@@ -40,157 +24,9 @@ fn envValue(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
     return env.get(name);
 }
 
-fn defaultHost(env: *const std.process.Environ.Map) []const u8 {
-    return envValue(env, "MARIADB_HOST") orelse
-        envValue(env, "MYSQL_HOST") orelse
-        "localhost";
-}
-
-fn defaultUser(env: *const std.process.Environ.Map) []const u8 {
-    return envValue(env, "USER") orelse "";
-}
-
-fn defaultPort(env: *const std.process.Environ.Map) CliError!u32 {
-    const value = envValue(env, "MYSQL_TCP_PORT") orelse return 3306;
-    return std.fmt.parseUnsigned(u32, value, 10) catch CliError.InvalidPort;
-}
-
-fn parsePort(value: []const u8) CliError!u32 {
-    return std.fmt.parseUnsigned(u32, value, 10) catch CliError.InvalidPort;
-}
-
-fn longOptionValue(args: []const []const u8, index: *usize, eq_index: ?usize, body: []const u8) CliError![]const u8 {
-    if (eq_index) |idx| {
-        return body[idx + 1 ..];
-    }
-
-    index.* += 1;
-    if (index.* >= args.len) {
-        return CliError.MissingOptionValue;
-    }
-    return args[index.*];
-}
-
-fn shortOptionValue(args: []const []const u8, index: *usize, inline_value: []const u8) CliError![]const u8 {
-    if (inline_value.len != 0) {
-        return inline_value;
-    }
-
-    index.* += 1;
-    if (index.* >= args.len) {
-        return CliError.MissingOptionValue;
-    }
-    return args[index.*];
-}
-
-fn setPositionalDatabase(options: *CliOptions, seen_positional_database: *bool, database: []const u8) CliError!void {
-    if (seen_positional_database.*) {
-        return CliError.TooManyDatabases;
-    }
-    seen_positional_database.* = true;
-    options.database = database;
-}
-
-fn parseConnectionOptions(args: []const []const u8, env: *const std.process.Environ.Map) CliError!CliOptions {
-    var options = CliOptions{
-        .host = defaultHost(env),
-        .user = defaultUser(env),
-        .password = envValue(env, "MYSQL_PWD") orelse "",
-        .database = "",
-        .port = try defaultPort(env),
-    };
-
-    var i: usize = 1;
-    var seen_positional_database = false;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (arg.len == 0) {
-            try setPositionalDatabase(&options, &seen_positional_database, arg);
-            continue;
-        }
-
-        if (std.mem.eql(u8, arg, "--")) {
-            i += 1;
-            while (i < args.len) : (i += 1) {
-                try setPositionalDatabase(&options, &seen_positional_database, args[i]);
-            }
-            break;
-        }
-
-        if (std.mem.startsWith(u8, arg, "--")) {
-            const body = arg[2..];
-            const eq_index = std.mem.indexOfScalar(u8, body, '=');
-            const name = if (eq_index) |idx| body[0..idx] else body;
-
-            if (std.mem.eql(u8, name, "host")) {
-                options.host = try longOptionValue(args, &i, eq_index, body);
-            } else if (std.mem.eql(u8, name, "database")) {
-                options.database = try longOptionValue(args, &i, eq_index, body);
-            } else if (std.mem.eql(u8, name, "port")) {
-                options.port = try parsePort(try longOptionValue(args, &i, eq_index, body));
-            } else if (std.mem.eql(u8, name, "user")) {
-                options.user = try longOptionValue(args, &i, eq_index, body);
-            } else if (std.mem.eql(u8, name, "password")) {
-                if (eq_index != null) {
-                    return CliError.PasswordOnCommandLine;
-                }
-                options.prompt_password = true;
-                options.password = "";
-            } else {
-                return CliError.UnknownOption;
-            }
-            continue;
-        }
-
-        if (arg[0] == '-' and arg.len > 1) {
-            switch (arg[1]) {
-                'h' => options.host = try shortOptionValue(args, &i, arg[2..]),
-                'D' => options.database = try shortOptionValue(args, &i, arg[2..]),
-                'P' => options.port = try parsePort(try shortOptionValue(args, &i, arg[2..])),
-                'u' => options.user = try shortOptionValue(args, &i, arg[2..]),
-                'p' => {
-                    if (arg.len > 2) {
-                        return CliError.PasswordOnCommandLine;
-                    }
-                    options.prompt_password = true;
-                    options.password = "";
-                },
-                else => return CliError.UnknownOption,
-            }
-            continue;
-        }
-
-        try setPositionalDatabase(&options, &seen_positional_database, arg);
-    }
-
-    return options;
-}
-
-fn renderUsage(out: *std.Io.Writer) !void {
-    try out.print(
-        \\Usage: thysql [OPTIONS] [database]
-        \\       thysql complete [OPTIONS] -D[prefix]
-        \\
-        \\Connection options:
-        \\  -h, --host=name       Connect to host. Defaults to $MARIADB_HOST, $MYSQL_HOST, then localhost.
-        \\  -D, --database=name   Database to use.
-        \\  -P, --port=#         Port number. Defaults to $MYSQL_TCP_PORT, then 3306.
-        \\  -u, --user=name       User for login. Defaults to $USER when set.
-        \\  -p, --password        Prompt for password without echoing input.
-        \\
-        \\Passwords are not accepted on the command line. Use -p to prompt or MYSQL_PWD for non-interactive use.
-        \\
-    , .{});
-}
-
-fn renderCliError(out: *std.Io.Writer, err: CliError) !void {
-    switch (err) {
-        CliError.MissingOptionValue => try out.print("Missing value for connection option.\n", .{}),
-        CliError.InvalidPort => try out.print("Invalid port. Expected a base-10 unsigned integer.\n", .{}),
-        CliError.TooManyDatabases => try out.print("Too many database arguments.\n", .{}),
-        CliError.UnknownOption => try out.print("Unknown connection option.\n", .{}),
-        CliError.PasswordOnCommandLine => try out.print("Password values are not accepted on the command line; use -p or MYSQL_PWD.\n", .{}),
-    }
+fn renderVersion(out: *std.Io.Writer) !void {
+    try out.print("thysql, client library {s}\n", .{Mysql.clientInfo()});
+    try out.flush();
 }
 
 fn handleSigint(_: std.posix.SIG) callconv(.c) void {
@@ -671,12 +507,19 @@ fn readOneLine(
     return false;
 }
 
-fn executeBatchQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: Batch.Query) !Batch.QueryResult {
-    if (query.sql.len == 0) {
-        return .{};
-    }
+const BatchContext = struct {
+    db: *Mysql.DB,
+    options: *const Options.Options,
+    stdin_is_tty: bool,
+};
 
-    const start = std.Io.Clock.Timestamp.now(io, .awake);
+/// Runs one batch statement. Results go to stdout, and errors go to stderr
+/// with the statement's line number. Returns false on error.
+fn executeBatchQuery(context: BatchContext, stdout: *std.Io.Writer, stderr: *std.Io.Writer, query: Batch.Query) !bool {
+    const db = context.db;
+    if (query.sql.len == 0) {
+        return true;
+    }
 
     if (useDatabaseName(query.sql)) |database| {
         const database_z = try db.allocator.dupeSentinel(u8, database, 0);
@@ -685,61 +528,80 @@ fn executeBatchQuery(db: *Mysql.DB, io: std.Io, stdout: *std.Io.Writer, query: B
         db.selectDatabase(database_z) catch |err| {
             switch (err) {
                 Mysql.DBError.ExecError => {
-                    try db.renderLastError(stdout);
-                    return .{ .success = false };
+                    try db.renderLastErrorAt(stderr, query.line);
+                    return false;
                 },
                 else => return err,
             }
         };
-
-        return .{
-            .elapsed_ns = @intCast(start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds),
-        };
+        return true;
     }
 
-    var rows_affected: u64 = 0;
     var exec_result = db.exec(query.sql) catch |err| {
         switch (err) {
             Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
-                try db.renderLastError(stdout);
-                return .{ .success = false };
+                try db.renderLastErrorAt(stderr, query.line);
+                return false;
             },
             else => return err,
         }
     };
 
+    const format = context.options.resultFormat(context.stdin_is_tty, query.vertical);
+    const column_names = context.options.showColumnNames(format);
     while (true) {
         switch (exec_result) {
             .result => |result| {
                 defer Mysql.freeResult(result);
-                if (query.vertical) {
-                    try Mysql.render_result_vertical(stdout, result);
-                } else {
-                    try Mysql.render_result(stdout, result);
-                }
+                try Mysql.render_script_result(stdout, result, format, column_names, context.options.raw);
             },
-            .ok => |ok| {
-                if (Mysql.affectedRows(ok)) |affected| {
-                    rows_affected += affected;
-                }
-            },
+            .ok => {},
         }
 
         exec_result = (db.nextResult() catch |err| {
             switch (err) {
                 Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
-                    try db.renderLastError(stdout);
-                    return .{ .success = false };
+                    try db.renderLastErrorAt(stderr, query.line);
+                    return false;
                 },
                 else => return err,
             }
         }) orelse break;
     }
 
-    return .{
-        .rows_affected = rows_affected,
-        .elapsed_ns = @intCast(start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds),
+    return true;
+}
+
+fn runBatch(
+    io: std.Io,
+    stdin: std.Io.File,
+    stdin_is_tty: bool,
+    stderr_is_tty: bool,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    db: *Mysql.DB,
+    options: *const Options.Options,
+) !u8 {
+    var stdin_buffer: [8192]u8 = undefined;
+    var stdin_reader = stdin.reader(io, &stdin_buffer);
+    var execute_reader: std.Io.Reader = undefined;
+    var input: *std.Io.Reader = &stdin_reader.interface;
+    var run_options = Batch.RunOptions{ .force = options.force };
+
+    if (options.executeText()) |text| {
+        execute_reader = std.Io.Reader.fixed(text);
+        input = &execute_reader;
+    } else {
+        run_options.progress_total = Batch.stdinProgressTotal(stdin, io);
+        run_options.show_progress = stderr_is_tty;
+    }
+
+    const context = BatchContext{
+        .db = db,
+        .options = options,
+        .stdin_is_tty = stdin_is_tty,
     };
+    return try Batch.run(db.allocator, input, stdout, stderr, run_options, context, executeBatchQuery);
 }
 
 pub fn runREPL(
@@ -760,17 +622,29 @@ pub fn runREPL(
     }
 
     if (args.items.len > 1 and std.mem.eql(u8, args.items[1], "complete")) {
-        return try Completion.run(allocator, stdout, stderr, args.items, env, parseConnectionOptions, renderCliError);
+        return try Completion.run(allocator, stdout, stderr, args.items, env);
     }
 
-    var options = parseConnectionOptions(args.items, env) catch |err| {
-        try renderCliError(stderr, err);
-        try renderUsage(stderr);
+    var options = Options.parse(allocator, args.items, env) catch |err| {
+        try Options.renderError(stderr, err);
+        try Options.renderUsage(stderr);
         return 1;
     };
+    defer options.deinit(allocator);
+
+    if (options.show_help) {
+        try Options.renderUsage(stdout);
+        try stdout.flush();
+        return 0;
+    }
+    if (options.show_version) {
+        try renderVersion(stdout);
+        return 0;
+    }
 
     const stdin = std.Io.File.stdin();
     const stdin_is_tty = try stdin.isTty(io);
+    const stderr_is_tty = try std.Io.File.stderr().isTty(io);
 
     var prompted_password: ?[]u8 = null;
     defer if (prompted_password) |password| allocator.free(password);
@@ -792,8 +666,8 @@ pub fn runREPL(
     });
     defer db.close();
 
-    if (!stdin_is_tty) {
-        return try Batch.run(db.allocator, io, stdin, stdout, stderr, &db, executeBatchQuery);
+    if (options.isBatch(stdin_is_tty)) {
+        return try runBatch(io, stdin, stdin_is_tty, stderr_is_tty, stdout, stderr, &db, &options);
     }
 
     try Readline.setup(allocator, io, env);
@@ -928,83 +802,13 @@ test "trim right bytes keeps leading whitespace" {
     try std.testing.expectEqualStrings("  \nselect 1", trimRightBytes("  \nselect 1", "\r\n"));
 }
 
-test "connection options default from environment" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put("MARIADB_HOST", "maria.example");
-    try env.put("MYSQL_HOST", "mysql.example");
-    try env.put("MYSQL_TCP_PORT", "4407");
-    try env.put("MYSQL_PWD", "env-secret");
-    try env.put("USER", "jeff");
-
-    const args = [_][]const u8{"thysql"};
-    const options = try parseConnectionOptions(&args, &env);
-    try std.testing.expectEqualStrings("maria.example", options.host);
-    try std.testing.expectEqualStrings("jeff", options.user);
-    try std.testing.expectEqualStrings("env-secret", options.password);
-    try std.testing.expectEqual(@as(u32, 4407), options.port);
-    try std.testing.expect(!options.prompt_password);
-}
-
-test "connection options parse mysql-style connection flags" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-
-    const args = [_][]const u8{ "thysql", "-h127.0.0.1", "-P", "3307", "-u", "root", "-D", "test" };
-    const options = try parseConnectionOptions(&args, &env);
-    try std.testing.expectEqualStrings("127.0.0.1", options.host);
-    try std.testing.expectEqual(@as(u32, 3307), options.port);
-    try std.testing.expectEqualStrings("root", options.user);
-    try std.testing.expectEqualStrings("test", options.database);
-}
-
-test "positional database follows password prompt flag" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put("MYSQL_PWD", "ignored-when-prompting");
-
-    const args = [_][]const u8{ "thysql", "-p", "app_db" };
-    const options = try parseConnectionOptions(&args, &env);
-    try std.testing.expect(options.prompt_password);
-    try std.testing.expectEqualStrings("", options.password);
-    try std.testing.expectEqualStrings("app_db", options.database);
-}
-
-test "positional database overrides database option" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-
-    const args = [_][]const u8{ "thysql", "--database=from_flag", "from_positional" };
-    const options = try parseConnectionOptions(&args, &env);
-    try std.testing.expectEqualStrings("from_positional", options.database);
-}
-
-test "long option with explicit empty value stays empty" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-
-    const args = [_][]const u8{ "thysql", "--database=", "from_positional" };
-    const options = try parseConnectionOptions(&args, &env);
-    try std.testing.expectEqualStrings("from_positional", options.database);
-}
-
-test "command-line password values are rejected" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-
-    const short_args = [_][]const u8{ "thysql", "-psecret" };
-    try std.testing.expectError(CliError.PasswordOnCommandLine, parseConnectionOptions(&short_args, &env));
-
-    const long_args = [_][]const u8{ "thysql", "--password=secret" };
-    try std.testing.expectError(CliError.PasswordOnCommandLine, parseConnectionOptions(&long_args, &env));
-}
-
 test {
     _ = .{
         @import("batch.zig"),
         @import("completion.zig"),
         @import("isocline.zig"),
         @import("mysql.zig"),
+        @import("options.zig"),
         @import("unicode.zig"),
     };
 }

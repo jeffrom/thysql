@@ -17,18 +17,21 @@ class BatchTests(E2ETestCase):
         # (status.batch): no "N rows in set (... sec)" footer.
         self.assertNotRegex(stdout, r"rows? in set")
 
-    def run_sql(self, server, sql, database=TEST_DB):
+    def run_sql(self, server, sql, database=TEST_DB, extra=()):
         return harness.run_thysql(
-            root_args(server, database),
+            root_args(server, database) + list(extra),
             stdin=sql,
             env={"MYSQL_PWD": ROOT_PASSWORD},
         )
 
     def test_select_renders_table_with_null(self):
+        # Piped stdin means tab output unless -t asks for the table.
         for server in self.each_server():
             with self.subTest(server=server.name):
                 result = self.run_sql(
-                    server, "select id, name, nickname from people order by id;\n"
+                    server,
+                    "select id, name, nickname from people order by id;\n",
+                    extra=["-t"],
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertRegex(result.stdout, r"\|\s*1\s*\|\s*alice\s*\|\s*NULL\s*\|")
@@ -56,9 +59,11 @@ class BatchTests(E2ETestCase):
             with self.subTest(server=server.name):
                 result = self.run_sql(server, "select * from missing_table;\n")
                 self.assertEqual(result.returncode, 1)
+                # Batch errors go to stderr, with the statement's line number.
+                self.assertNotIn("ERROR", result.stdout)
                 self.assertRegex(
-                    result.stdout,
-                    r"(?m)^ERROR 1146 \(42S02\): Table '[^']*missing_table' doesn't exist$",
+                    result.stderr,
+                    r"(?m)^ERROR 1146 \(42S02\) at line 1: Table '[^']*missing_table' doesn't exist$",
                 )
 
     def test_use_database_then_select_database(self):
@@ -70,7 +75,7 @@ class BatchTests(E2ETestCase):
                     database=None,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertRegex(result.stdout, r"\|\s*thysql_test\s*\|")
+                self.assertRegex(result.stdout, r"(?m)^thysql_test$")
 
     def test_multi_statement_script_on_stdin(self):
         script = (
@@ -107,8 +112,8 @@ class BatchTests(E2ETestCase):
                 self.assertRegex(result.stdout, re.compile("6C696E65310A6C696E6532", re.I))
                 # 'tab\there' (tab inside the value)
                 self.assertRegex(result.stdout, re.compile("7461620968657265", re.I))
-                # the NULL nickname
-                self.assertRegex(result.stdout, r"\|\s*NULL\s*\|")
+                # the NULL nickname, written as NULL in tab output
+                self.assertRegex(result.stdout, r"(?m)^NULL$")
                 # unicode text
                 self.assertIn("東京 ✓", result.stdout)
                 # binary column bytes 00 FF 10

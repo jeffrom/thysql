@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 
 const C = @import("mysql_c");
 const Unicode = @import("unicode.zig");
+const Options = @import("options.zig");
 
 const maxTableColumnDisplayWidth: usize = 1024;
 const crServerGoneError: u32 = 2006;
@@ -146,6 +147,15 @@ pub const DB = struct {
         try render_error(out, errno, if (sqlstate == null) null else std.mem.sliceTo(sqlstate, 0), std.mem.sliceTo(message, 0));
     }
 
+    /// Like renderLastError, but with the "at line N" suffix used by batch input.
+    pub fn renderLastErrorAt(self: *DB, out: *std.Io.Writer, line: usize) !void {
+        const errno = C.mysql_errno(self.conn);
+        const sqlstate = C.mysql_sqlstate(self.conn);
+        const message = C.mysql_error(self.conn);
+
+        try render_error_at_line(out, errno, if (sqlstate == null) null else std.mem.sliceTo(sqlstate, 0), std.mem.sliceTo(message, 0), line);
+    }
+
     pub fn warningCount(self: *DB) u32 {
         return C.mysql_warning_count(self.conn);
     }
@@ -242,10 +252,6 @@ pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
     C.mysql_free_result(result);
 }
 
-pub fn affectedRows(ok: OKResult) ?u64 {
-    return if (ok.affected_rows == C.MYSQL_COUNT_ERROR) null else ok.affected_rows;
-}
-
 pub fn clientInfo() []const u8 {
     const info = C.mysql_get_client_info();
     return if (info == null) "" else std.mem.sliceTo(info, 0);
@@ -311,7 +317,97 @@ pub fn render_error(out: *std.Io.Writer, errno: u32, sqlstate: ?[]const u8, mess
     try out.flush();
 }
 
+/// Error line in the mysql.cc batch format, e.g. `ERROR 1146 (42S02) at line 3: ...`.
+pub fn render_error_at_line(out: *std.Io.Writer, errno: u32, sqlstate: ?[]const u8, message: []const u8, line: usize) !void {
+    try out.print("ERROR", .{});
+    if (errno != 0) {
+        try out.print(" {}", .{errno});
+        if (sqlstate) |state| {
+            try out.print(" ({s})", .{state});
+        }
+    }
+    if (line != 0) {
+        try out.print(" at line {}", .{line});
+    }
+    try out.print(": {s}\n", .{message});
+    try out.flush();
+}
+
+/// Renders one result for batch and -e input. As in mysql.cc, a result with no
+/// rows prints nothing, and there is no footer.
+pub fn render_script_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, format: Options.ResultFormat, column_names: bool, raw: bool) !void {
+    if (C.mysql_num_rows(result) == 0) {
+        return;
+    }
+
+    switch (format) {
+        .table => try render_result_columns(out, result, column_names),
+        .tab => try render_result_tab(out, result, column_names, raw),
+        .vertical => try render_result_vertical(out, result),
+    }
+}
+
+/// Writes a value with the escaping mysql.cc uses for --batch output. With
+/// raw, bytes are written unchanged.
+fn writeTabValue(out: *std.Io.Writer, value: []const u8, raw: bool) !void {
+    if (raw) {
+        try out.writeAll(value);
+        return;
+    }
+    for (value) |byte| {
+        switch (byte) {
+            0 => try out.writeAll("\\0"),
+            '\t' => try out.writeAll("\\t"),
+            '\n' => try out.writeAll("\\n"),
+            '\\' => try out.writeAll("\\\\"),
+            else => try out.writeByte(byte),
+        }
+    }
+}
+
+/// Tab-separated rows. Column names are written as-is, as mysql.cc does. NULL is always `NULL`.
+pub fn render_result_tab(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, column_names: bool, raw: bool) !void {
+    const numFields: usize = C.mysql_num_fields(result);
+
+    if (column_names) {
+        _ = C.mysql_field_seek(result, 0);
+        for (0..numFields) |i| {
+            const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
+            if (i > 0) {
+                try out.writeByte('\t');
+            }
+            try out.writeAll(field.*.name[0..field.*.name_length]);
+        }
+        try out.writeByte('\n');
+    }
+
+    while (C.mysql_fetch_row(result)) |row| {
+        if (row == null) {
+            break;
+        }
+
+        const lengths = C.mysql_fetch_lengths(result);
+        for (0..numFields) |i| {
+            if (i > 0) {
+                try out.writeByte('\t');
+            }
+            if (row[i] == null) {
+                try out.writeAll("NULL");
+            } else {
+                try writeTabValue(out, row[i][0..lengths[i]], raw);
+            }
+        }
+        try out.writeByte('\n');
+    }
+    try out.flush();
+}
+
 pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !void {
+    try render_result_columns(out, result, true);
+}
+
+/// Table output. With column_names false the header row is omitted, as with mysql.cc -N.
+pub fn render_result_columns(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, column_names: bool) !void {
     const numFields: usize = C.mysql_num_fields(result);
 
     if (C.mysql_num_rows(result) == 0) {
@@ -353,18 +449,20 @@ pub fn render_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !vo
     try printColumnSeparators(out, result, numFields);
     try out.print("+\n", .{});
 
-    _ = C.mysql_field_seek(result, 0);
-    for (0..numFields) |_| {
-        const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
-        const name = field.*.name[0..field.*.name_length];
+    if (column_names) {
+        _ = C.mysql_field_seek(result, 0);
+        for (0..numFields) |_| {
+            const field = C.mysql_fetch_field(result) orelse return error.FetchFieldError;
+            const name = field.*.name[0..field.*.name_length];
 
-        try printHeaderCell(out, name, field.*.max_length);
+            try printHeaderCell(out, name, field.*.max_length);
+        }
+        try out.print("|\n", .{});
+
+        _ = C.mysql_field_seek(result, 0);
+        try printColumnSeparators(out, result, numFields);
+        try out.print("+\n", .{});
     }
-    try out.print("|\n", .{});
-
-    _ = C.mysql_field_seek(result, 0);
-    try printColumnSeparators(out, result, numFields);
-    try out.print("+\n", .{});
     try out.flush();
 
     while (C.mysql_fetch_row(result)) |row| {
@@ -994,6 +1092,106 @@ test "render timed empty result set with warnings" {
         \\
     ;
     try expectRenderedTimedWithWarnings(&result, 2 * std.time.ns_per_ms, 2, expect);
+}
+
+fn expectRenderedScript(result: *C.struct_st_mysql_res, format: Options.ResultFormat, column_names: bool, raw: bool, expect: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+
+    try render_script_result(&writer.writer, result, format, column_names, raw);
+
+    try std.testing.expectEqualStrings(expect, writer.written());
+}
+
+test "tab output escapes values, writes NULL, and keeps names" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("a", 1, C.MYSQL_TYPE_VAR_STRING),
+        mysqlField("b", 1, C.MYSQL_TYPE_VAR_STRING),
+        mysqlField("c", 1, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage3 = undefined;
+    initMysqlRowStorage3(&row_storage, "x\ty", "p\\q\nr", null);
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    try expectRenderedScript(&result, .tab, true, false, "a\tb\tc\nx\\ty\tp\\\\q\\nr\tNULL\n");
+}
+
+test "tab output without names and raw values" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("a", 1, C.MYSQL_TYPE_VAR_STRING),
+        mysqlField("b", 1, C.MYSQL_TYPE_VAR_STRING),
+        mysqlField("c", 1, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage3 = undefined;
+    initMysqlRowStorage3(&row_storage, "x\ty", "p\\q\nr", null);
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    try expectRenderedScript(&result, .tab, false, false, "x\\ty\tp\\\\q\\nr\tNULL\n");
+    _ = C.mysql_data_seek(&result, 0);
+    try expectRenderedScript(&result, .tab, true, true, "a\tb\tc\nx\ty\tp\\q\nr\tNULL\n");
+}
+
+test "script output prints nothing for an empty result" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("1", 0, C.MYSQL_TYPE_LONG),
+    };
+    var data = mysqlData(null, 0, fields.len);
+    var lengths = [_]c_ulong{0};
+    var result = mysqlResult(&fields, &data, &lengths);
+
+    try expectRenderedScript(&result, .table, true, false, "");
+    try expectRenderedScript(&result, .tab, true, false, "");
+    try expectRenderedScript(&result, .vertical, true, false, "");
+}
+
+test "table output without column names omits the header" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("1", 1, C.MYSQL_TYPE_LONG),
+    };
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "1");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    try expectRenderedScript(&result, .table, false, false,
+        \\+---+
+        \\| 1 |
+        \\+---+
+        \\
+    );
+}
+
+test "batch error line has the mysql.cc at-line format" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    defer buf = writer.toArrayList();
+
+    try render_error_at_line(&writer.writer, 1146, "42S02", "Table 'x.y' doesn't exist", 3);
+    try render_error_at_line(&writer.writer, 1064, null, "bad", 0);
+    try std.testing.expectEqualStrings(
+        \\ERROR 1146 (42S02) at line 3: Table 'x.y' doesn't exist
+        \\ERROR 1064: bad
+        \\
+    , writer.written());
+}
+
+test "writeTabValue escapes tab, newline, backslash, and NUL" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    defer buf = writer.toArrayList();
+
+    try writeTabValue(&writer.writer, "a\tb\nc\\d\x00e", false);
+    try std.testing.expectEqualStrings("a\\tb\\nc\\\\d\\0e", writer.written());
 }
 
 test "render SELECT 1" {

@@ -4,12 +4,8 @@ const Allocator = std.mem.Allocator;
 pub const Query = struct {
     sql: []const u8,
     vertical: bool,
-};
-
-pub const QueryResult = struct {
-    success: bool = true,
-    rows_affected: u64 = 0,
-    elapsed_ns: u64 = 0,
+    /// Line where the statement starts (1-based), for error messages.
+    line: usize = 0,
 };
 
 pub fn parseQueryInput(line: []const u8) Query {
@@ -267,7 +263,7 @@ pub const Scanner = struct {
     }
 };
 
-fn stdinProgressTotal(stdin: std.Io.File, io: std.Io) ?u64 {
+pub fn stdinProgressTotal(stdin: std.Io.File, io: std.Io) ?u64 {
     const stat = stdin.stat(io) catch return null;
     if (stat.kind != .file or stat.size == 0) {
         return null;
@@ -277,11 +273,17 @@ fn stdinProgressTotal(stdin: std.Io.File, io: std.Io) ?u64 {
 
 const Progress = struct {
     total_bytes: ?u64,
+    /// Only true when stderr is a terminal. Otherwise nothing is drawn.
+    enabled: bool = false,
     last_width: usize = 0,
 
     const bar_width = 30;
 
     fn render(self: *Progress, stderr: *std.Io.Writer, bytes_read: u64, query_count: u64, final: bool) !void {
+        if (!self.enabled) {
+            return;
+        }
+
         var line_buffer: [128]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&line_buffer);
 
@@ -330,190 +332,116 @@ const Progress = struct {
     }
 };
 
-const Summary = struct {
-    query_count: u64 = 0,
-    rows_affected: u64 = 0,
-    timings: std.ArrayList(u64) = .empty,
-    started_at: std.Io.Clock.Timestamp,
-
-    const histogram_width = 30;
-
-    fn deinit(self: *Summary, allocator: Allocator) void {
-        self.timings.deinit(allocator);
-    }
-
-    fn record(self: *Summary, allocator: Allocator, result: QueryResult) !void {
-        self.query_count += 1;
-        self.rows_affected += result.rows_affected;
-        try self.timings.append(allocator, result.elapsed_ns);
-    }
-
-    fn render(self: *Summary, stderr: *std.Io.Writer, io: std.Io) !void {
-        const total_ns: u64 = @intCast(self.started_at.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
-        try stderr.print("Batch summary\n", .{});
-        try stderr.print("  Queries: {}\n", .{self.query_count});
-        try stderr.print("  Rows affected: {}\n", .{self.rows_affected});
-        try stderr.print("  Total time: ", .{});
-        try renderDuration(stderr, total_ns);
-        try stderr.print("\n", .{});
-
-        if (self.timings.items.len == 0) {
-            try stderr.flush();
-            return;
-        }
-
-        std.mem.sort(u64, self.timings.items, {}, comptime std.sort.asc(u64));
-
-        var sum: u128 = 0;
-        for (self.timings.items) |timing| {
-            sum += timing;
-        }
-
-        const average: u64 = @intCast(@divTrunc(sum, self.timings.items.len));
-        const p95 = percentile(self.timings.items, 95);
-        const p99 = percentile(self.timings.items, 99);
-        const max = self.timings.items[self.timings.items.len - 1];
-
-        try stderr.print("  Query timings:\n", .{});
-        try renderTimingBar(stderr, "avg", average, max);
-        try renderTimingBar(stderr, "p95", p95, max);
-        try renderTimingBar(stderr, "p99", p99, max);
-        try renderTimingBar(stderr, "max", max, max);
-        try stderr.flush();
-    }
-
-    fn percentile(sorted_timings: []const u64, comptime percentile_value: u64) u64 {
-        std.debug.assert(sorted_timings.len > 0);
-        const numerator = percentile_value * sorted_timings.len;
-        const index = @min(sorted_timings.len - 1, @divTrunc(numerator + 99, 100) - 1);
-        return sorted_timings[index];
-    }
-
-    fn renderTimingBar(stderr: *std.Io.Writer, label: []const u8, value: u64, max: u64) !void {
-        const filled = if (max == 0)
-            0
-        else
-            @max(@as(usize, 1), @min(histogram_width, @as(usize, @intCast(@divTrunc(@as(u128, value) * histogram_width, max)))));
-
-        try stderr.print("    {s: >3} [", .{label});
-        for (0..histogram_width) |i| {
-            const char: u8 = if (i < filled) '=' else ' ';
-            try stderr.print("{c}", .{char});
-        }
-        try stderr.print("] ", .{});
-        try renderDuration(stderr, value);
-        try stderr.print("\n", .{});
-    }
-
-    fn renderDuration(stderr: *std.Io.Writer, ns: u64) !void {
-        if (ns < std.time.ns_per_s) {
-            const rounded_us = @divTrunc(ns + 500, std.time.ns_per_us);
-            const millis = @divTrunc(rounded_us, 1000);
-            const micros = @rem(rounded_us, 1000);
-            try stderr.print("{}.", .{millis});
-            if (micros < 100) {
-                try stderr.print("0", .{});
-            }
-            if (micros < 10) {
-                try stderr.print("0", .{});
-            }
-            try stderr.print("{} ms", .{micros});
-            return;
-        }
-
-        const rounded_ms = @divTrunc(ns + std.time.ns_per_ms / 2, std.time.ns_per_ms);
-        const seconds = @divTrunc(rounded_ms, 1000);
-        const millis = @rem(rounded_ms, 1000);
-        try stderr.print("{}.", .{seconds});
-        if (millis < 100) {
-            try stderr.print("0", .{});
-        }
-        if (millis < 10) {
-            try stderr.print("0", .{});
-        }
-        try stderr.print("{} s", .{millis});
-    }
+pub const RunOptions = struct {
+    /// Total input size, when the input is a file. Used for the progress bar.
+    progress_total: ?u64 = null,
+    /// Draw the progress meter. Set this only when stderr is a terminal.
+    show_progress: bool = false,
+    /// Keep running after a statement fails. The exit status is still 1.
+    force: bool = false,
 };
 
-fn executeStatement(
-    allocator: Allocator,
-    io: std.Io,
+const Session = struct {
+    progress: Progress,
+    force: bool,
+    query_count: u64 = 0,
+    bytes_read: u64 = 0,
+    had_error: bool = false,
+};
+
+/// Runs one statement. Returns false when the run should stop.
+fn runStatement(
+    session: *Session,
+    scanner: *Scanner,
+    line: usize,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-    scanner: *Scanner,
-    bytes_read: u64,
-    progress: *Progress,
-    summary: *Summary,
     context: anytype,
-    comptime execute: fn (@TypeOf(context), std.Io, *std.Io.Writer, Query) anyerror!QueryResult,
+    comptime execute: fn (@TypeOf(context), *std.Io.Writer, *std.Io.Writer, Query) anyerror!bool,
 ) !bool {
-    const query = scanner.pendingQuery();
+    var query = scanner.pendingQuery();
+    query.line = line;
     defer scanner.reset();
     if (query.sql.len == 0) {
         return true;
     }
 
-    const result = try execute(context, io, stdout, query);
-    if (!result.success) {
-        return false;
+    const ok = try execute(context, stdout, stderr, query);
+    session.query_count += 1;
+    if (!ok) {
+        session.had_error = true;
     }
-    try summary.record(allocator, result);
-    try progress.render(stderr, bytes_read, summary.query_count, false);
-    return true;
+    try session.progress.render(stderr, session.bytes_read, session.query_count, false);
+    return ok or session.force;
 }
 
+/// Reads statements from `input` and runs each with `execute`. Returns 0 when
+/// all statements succeeded, and 1 otherwise. Without `force`, the first
+/// failing statement stops the run.
 pub fn run(
     allocator: Allocator,
-    io: std.Io,
-    stdin: std.Io.File,
+    input: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
+    run_options: RunOptions,
     context: anytype,
-    comptime execute: fn (@TypeOf(context), std.Io, *std.Io.Writer, Query) anyerror!QueryResult,
+    comptime execute: fn (@TypeOf(context), *std.Io.Writer, *std.Io.Writer, Query) anyerror!bool,
 ) !u8 {
-    var progress = Progress{ .total_bytes = stdinProgressTotal(stdin, io) };
-    var stdin_buffer: [8192]u8 = undefined;
-    var stdin_reader = stdin.reader(io, &stdin_buffer);
+    var session = Session{
+        .progress = .{ .total_bytes = run_options.progress_total, .enabled = run_options.show_progress },
+        .force = run_options.force,
+    };
     var read_buffer: [8192]u8 = undefined;
     var scanner: Scanner = .{};
     defer scanner.deinit(allocator);
 
-    var bytes_read: u64 = 0;
-    var summary = Summary{ .started_at = std.Io.Clock.Timestamp.now(io, .awake) };
-    defer summary.deinit(allocator);
-    try progress.render(stderr, bytes_read, summary.query_count, false);
+    var line: usize = 1;
+    var statement_line: usize = 0;
+    var stopped = false;
 
-    while (true) {
-        const read = try stdin_reader.interface.readSliceShort(&read_buffer);
+    try session.progress.render(stderr, 0, 0, false);
+    read_loop: while (true) {
+        // readVec returns what is available now, so a terminal runs each line as soon as
+        // it is entered. readSliceShort would wait until the buffer is full or EOF.
+        var slices = [_][]u8{&read_buffer};
+        const read = input.readVec(&slices) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return err,
+        };
         if (read == 0) {
-            break;
+            continue;
         }
 
-        bytes_read += read;
+        session.bytes_read += read;
         for (read_buffer[0..read]) |byte| {
+            // A statement starts at its first non-whitespace byte.
+            if (statement_line == 0 and !std.ascii.isWhitespace(byte)) {
+                statement_line = line;
+            }
+            if (byte == '\n') {
+                line += 1;
+            }
+
             if (try scanner.feed(allocator, byte)) {
-                if (!try executeStatement(allocator, io, stdout, stderr, &scanner, bytes_read, &progress, &summary, context, execute)) {
-                    try progress.render(stderr, bytes_read, summary.query_count, true);
-                    try summary.render(stderr, io);
-                    return 1;
+                if (!try runStatement(&session, &scanner, statement_line, stdout, stderr, context, execute)) {
+                    stopped = true;
+                    break :read_loop;
                 }
+                statement_line = 0;
+            } else if (scanner.buffer.items.len == 0) {
+                // A client command such as \c cleared the pending input.
+                statement_line = 0;
             }
         }
-        try progress.render(stderr, bytes_read, summary.query_count, false);
+        try session.progress.render(stderr, session.bytes_read, session.query_count, false);
     }
 
-    const trailing_query = scanner.pendingQuery();
-    if (trailing_query.sql.len != 0) {
-        if (!try executeStatement(allocator, io, stdout, stderr, &scanner, bytes_read, &progress, &summary, context, execute)) {
-            try progress.render(stderr, bytes_read, summary.query_count, true);
-            try summary.render(stderr, io);
-            return 1;
-        }
+    if (!stopped and scanner.pendingQuery().sql.len != 0) {
+        _ = try runStatement(&session, &scanner, statement_line, stdout, stderr, context, execute);
     }
 
-    try progress.render(stderr, bytes_read, summary.query_count, true);
-    try summary.render(stderr, io);
-    return 0;
+    try session.progress.render(stderr, session.bytes_read, session.query_count, true);
+    return if (session.had_error) 1 else 0;
 }
 
 test "parse vertical query terminator" {
@@ -687,4 +615,67 @@ test "scanner replaces pending editor buffer and recomputes prompt state" {
     try scanner.replacePending(std.testing.allocator, "select 1;");
     try std.testing.expectEqualStrings("select 1;", scanner.buffer.items);
     try std.testing.expectEqual(Scanner.PromptKind.continuation, scanner.promptKind());
+}
+
+const RecordingContext = struct {
+    allocator: Allocator,
+    lines: std.ArrayList(usize) = .empty,
+
+    fn deinit(self: *RecordingContext) void {
+        self.lines.deinit(self.allocator);
+    }
+};
+
+/// Records each statement's start line. A statement that contains "bad" fails.
+fn recordQuery(context: *RecordingContext, stdout: *std.Io.Writer, stderr: *std.Io.Writer, query: Query) anyerror!bool {
+    _ = stdout;
+    _ = stderr;
+    try context.lines.append(context.allocator, query.line);
+    return std.mem.indexOf(u8, query.sql, "bad") == null;
+}
+
+test "batch reports the line where each statement starts" {
+    var input = std.Io.Reader.fixed("\n\nselect 1;\n  select\n2;\nselect 3;\n");
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr_buffer: [64]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    var context = RecordingContext{ .allocator = std.testing.allocator };
+    defer context.deinit();
+    const status = try run(std.testing.allocator, &input, &stdout, &stderr, .{}, &context, recordQuery);
+
+    try std.testing.expectEqual(@as(u8, 0), status);
+    try std.testing.expectEqualSlices(usize, &.{ 3, 4, 6 }, context.lines.items);
+    try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "batch stops at the first error without force" {
+    var input = std.Io.Reader.fixed("select 1;\nbad;\nselect 3;\n");
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr_buffer: [64]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    var context = RecordingContext{ .allocator = std.testing.allocator };
+    defer context.deinit();
+    const status = try run(std.testing.allocator, &input, &stdout, &stderr, .{}, &context, recordQuery);
+
+    try std.testing.expectEqual(@as(u8, 1), status);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, context.lines.items);
+}
+
+test "batch keeps going after errors with force and still exits 1" {
+    var input = std.Io.Reader.fixed("select 1;\nbad;\nselect 3;\n");
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr_buffer: [64]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    var context = RecordingContext{ .allocator = std.testing.allocator };
+    defer context.deinit();
+    const status = try run(std.testing.allocator, &input, &stdout, &stderr, .{ .force = true }, &context, recordQuery);
+
+    try std.testing.expectEqual(@as(u8, 1), status);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, context.lines.items);
 }
