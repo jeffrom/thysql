@@ -167,8 +167,8 @@ test "completion offers keywords and names for the word before the cursor" {
     const start = try completeWord(&names, line, line.len, &candidates);
     try std.testing.expectEqual(@as(usize, 7), start);
     try std.testing.expectEqual(@as(usize, 2), candidates.list.items.len);
-    try std.testing.expectEqualStrings("people", candidates.list.items[0]);
-    try std.testing.expectEqualStrings("people.name", candidates.list.items[1]);
+    try std.testing.expectEqualStrings("people", candidates.list.items[0].text);
+    try std.testing.expectEqualStrings("people.name", candidates.list.items[1].text);
 }
 
 test "completion treats dots as part of the word" {
@@ -182,7 +182,7 @@ test "completion treats dots as part of the word" {
     const line = "select people.na";
     const start = try completeWord(&names, line, line.len, &candidates);
     try std.testing.expectEqual(@as(usize, 7), start);
-    try std.testing.expectEqualStrings("people.name", candidates.list.items[0]);
+    try std.testing.expectEqualStrings("people.name", candidates.list.items[0].text);
 }
 
 test "completion with an empty word offers nothing" {

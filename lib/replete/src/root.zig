@@ -67,6 +67,9 @@ const KeyCode = enum(u8) {
 
 const MaxLine = 1024 * 1024;
 
+/// A listing with more candidates than this asks before it is shown, as readline does.
+const query_items = 100;
+
 pub const ReplConfig = struct {
     /// Text or a richer encoded prompt. Kitty PNG prompts can be produced with
     /// kitty.pngPrompt while ordinary string prompts require no special setup.
@@ -89,6 +92,30 @@ pub const ReplConfig = struct {
     history: ?*History = null,
     /// Optional tab completion. Without it, Tab does nothing.
     completer: ?Completer = null,
+    /// Colors for candidate listings and, later, highlighted text.
+    theme: highlight.Theme = .{},
+};
+
+/// What a completion names. A listing colors each candidate by its kind.
+pub const CandidateKind = enum {
+    other,
+    keyword,
+    database,
+    table,
+    column,
+    function,
+};
+
+/// One completion for the word being completed.
+pub const Candidate = struct {
+    /// The text that replaces the word.
+    text: []const u8,
+    /// Listed instead of `text`, for example with a kind in brackets.
+    display: ?[]const u8 = null,
+    kind: CandidateKind = .other,
+    /// Whether a space follows `text` when it is the only candidate. Set it to false
+    /// when the next thing typed continues the same name, as after `table.`.
+    space: bool = true,
 };
 
 /// The candidates a `Completer` offers for the word being completed. Each candidate
@@ -96,11 +123,16 @@ pub const ReplConfig = struct {
 /// that Tab press.
 pub const Candidates = struct {
     gpa: std.mem.Allocator,
-    list: std.ArrayList([]const u8) = .empty,
+    list: std.ArrayList(Candidate) = .empty,
 
     /// Offers `text`. Candidates are shown in the order they are added.
     pub fn add(self: *Candidates, text: []const u8) std.mem.Allocator.Error!void {
-        try self.list.append(self.gpa, text);
+        try self.addCandidate(.{ .text = text });
+    }
+
+    /// Offers a candidate with its display text, kind and spacing.
+    pub fn addCandidate(self: *Candidates, candidate: Candidate) std.mem.Allocator.Error!void {
+        try self.list.append(self.gpa, candidate);
     }
 
     pub fn deinit(self: *Candidates) void {
@@ -805,10 +837,10 @@ pub const Repl = struct {
         try self.refreshLine();
     }
 
-    /// Clears the whole screen and redraws the prompt and line at the top.
     /// Tab completion as in GNU Readline. The word before the cursor is replaced by the
-    /// longest common prefix of the candidates, if that is longer than the word. When it
-    /// is not, a Tab that follows another Tab lists the candidates below the line.
+    /// longest common prefix of the candidates, if that is longer than the word. A single
+    /// candidate is inserted with a space after it. When neither applies, a Tab that
+    /// follows another Tab lists the candidates below the line.
     fn editComplete(self: *Repl, list_on_miss: bool) !void {
         const completer = self.cfg.completer orelse return;
         var candidates: Candidates = .{ .gpa = self.gpa };
@@ -817,23 +849,28 @@ pub const Repl = struct {
         const start = try completer.complete(completer.context, self.buf.items, self.pos, &candidates);
         if (start > self.pos or candidates.list.items.len == 0) return;
 
-        const words = candidates.list.items;
-        var common_len = words[0].len;
-        for (words[1..]) |word| {
-            common_len = caseInsensitivePrefixLen(words[0][0..common_len], word);
+        const found = candidates.list.items;
+        var common_len = found[0].text.len;
+        for (found[1..]) |candidate| {
+            common_len = caseInsensitivePrefixLen(found[0].text[0..common_len], candidate.text);
         }
         const typed_len = self.pos - start;
-        if (common_len > typed_len) {
-            // The typed part keeps the case the user typed; the rest takes the first candidate's case.
-            var text: std.ArrayList(u8) = .empty;
-            defer text.deinit(self.gpa);
-            try text.appendSlice(self.gpa, self.buf.items[start..self.pos]);
-            try text.appendSlice(self.gpa, words[0][typed_len..common_len]);
-            try self.recordUndo(false);
-            try self.replaceBeforeCursor(start, text.items);
-        } else if (list_on_miss) {
-            try self.listCandidates(words);
+        const extend = common_len > typed_len;
+        const space = found.len == 1 and found[0].space and
+            !(self.pos < self.buf.items.len and isBlankByte(self.buf.items[self.pos]));
+        if (!extend and !space) {
+            if (list_on_miss and found.len > 1) try self.listCandidates(found);
+            return;
         }
+
+        // The typed part keeps the case the user typed; the rest takes the first candidate's case.
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(self.gpa);
+        try text.appendSlice(self.gpa, self.buf.items[start..self.pos]);
+        if (extend) try text.appendSlice(self.gpa, found[0].text[typed_len..common_len]);
+        if (space) try text.append(self.gpa, ' ');
+        try self.recordUndo(false);
+        try self.replaceBeforeCursor(start, text.items);
     }
 
     /// Replaces the text from `start` to the cursor with `text`. The cursor ends after it.
@@ -851,24 +888,41 @@ pub const Repl = struct {
         try self.refreshLine();
     }
 
-    /// Prints `words` in columns below the line, then draws the line again under them.
-    fn listCandidates(self: *Repl, words: []const []const u8) !void {
-        var width: usize = 0;
-        for (words) |word| width = @max(width, unicode.displayWidth(word));
-        const column = width + 2;
-        const per_row = @max(self.cols / column, 1);
-
+    /// Prints the candidates in columns below the line, then draws the line again under
+    /// them. Like readline, it asks first when there are more than `query_items`.
+    fn listCandidates(self: *Repl, found: []const Candidate) !void {
         // Leave the line from its last row, which may be below the cursor's.
         if (self.rendered_rows > 0 and self.rendered_rows - 1 > self.rendered_cursor_row) {
             try self.cfg.out.print("\x1b[{d}B", .{self.rendered_rows - 1 - self.rendered_cursor_row});
         }
         try self.cfg.out.writeAll("\r\n");
-        for (words, 0..) |word, i| {
-            try self.cfg.out.writeAll(word);
-            if ((i + 1) % per_row == 0 or i + 1 == words.len) {
+        if (found.len > query_items) {
+            try self.cfg.out.print("Display all {d} possibilities? (y or n)", .{found.len});
+            try self.cfg.out.flush();
+            const answer = try self.cfg.in.takeByte();
+            if (answer != 'y' and answer != 'Y' and answer != ' ') {
+                try self.cfg.out.writeAll("\r\n");
+                self.rendered_rows = 0;
+                self.rendered_cursor_row = 0;
+                return self.refreshLine();
+            }
+            try self.cfg.out.writeAll("\r\n");
+        }
+
+        var width: usize = 0;
+        for (found) |candidate| width = @max(width, unicode.displayWidth(shownText(candidate)));
+        const column = width + 2;
+        const per_row = @max(self.cols / column, 1);
+        for (found, 0..) |candidate, i| {
+            const text = shownText(candidate);
+            const sgr = self.cfg.theme.sgr(kindStyle(candidate.kind));
+            try self.cfg.out.writeAll(sgr);
+            try self.cfg.out.writeAll(text);
+            if (sgr.len > 0) try self.cfg.out.writeAll("\x1b[0m");
+            if ((i + 1) % per_row == 0 or i + 1 == found.len) {
                 try self.cfg.out.writeAll("\r\n");
             } else {
-                for (0..column - unicode.displayWidth(word)) |_| try self.cfg.out.writeByte(' ');
+                for (0..column - unicode.displayWidth(text)) |_| try self.cfg.out.writeByte(' ');
             }
         }
         // The line is drawn below the list, so the redraw must not move up.
@@ -2201,6 +2255,21 @@ test "delete escape sequence removes one UTF-8 codepoint" {
     try std.testing.expectEqual(@as(usize, 1), repl.pos);
 }
 
+/// The text a listing shows for a candidate.
+fn shownText(candidate: Candidate) []const u8 {
+    return candidate.display orelse candidate.text;
+}
+
+/// The highlight style that colors a candidate of `kind` in a listing.
+fn kindStyle(kind: CandidateKind) highlight.Style {
+    return switch (kind) {
+        .other => .plain,
+        .keyword => .keyword,
+        .database, .table, .column => .identifier,
+        .function => .function,
+    };
+}
+
 /// Returns the length of the common prefix of `a` and `b`, ignoring ASCII case.
 fn caseInsensitivePrefixLen(a: []const u8, b: []const u8) usize {
     var n: usize = 0;
@@ -2208,16 +2277,20 @@ fn caseInsensitivePrefixLen(a: []const u8, b: []const u8) usize {
     return n;
 }
 
-/// Offers the names that start with the word before the cursor, for the tests.
+/// Offers the names that start with the word before the cursor, ignoring case, for the tests.
+/// `space` is the spacing of each candidate.
 const TestCompleter = struct {
     names: []const []const u8,
+    space: bool = true,
 
     fn complete(context: ?*anyopaque, line: []const u8, cursor: usize, candidates: *Candidates) std.mem.Allocator.Error!usize {
         const self: *const TestCompleter = @ptrCast(@alignCast(context.?));
         var start = cursor;
         while (start > 0 and std.ascii.isAlphanumeric(line[start - 1])) start -= 1;
         for (self.names) |name| {
-            if (std.ascii.startsWithIgnoreCase(name, line[start..cursor])) try candidates.add(name);
+            if (std.ascii.startsWithIgnoreCase(name, line[start..cursor])) {
+                try candidates.addCandidate(.{ .text = name, .space = self.space });
+            }
         }
         return start;
     }
@@ -2239,7 +2312,45 @@ test "tab completes a single candidate" {
     var repl = try Repl.init(allocator, &cfg);
     defer repl.deinit();
 
+    try std.testing.expectEqualStrings("x people ", try repl.readline());
+}
+
+test "a single candidate with spacing turned off is inserted without a space" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("x pe" ++ testKeys.tab ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var names: TestCompleter = .{ .names = &.{ "people", "orders" }, .space = false };
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .completer = .{ .context = &names, .complete = TestCompleter.complete },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
     try std.testing.expectEqualStrings("x people", try repl.readline());
+}
+
+test "a single candidate is not followed by a second space when one already follows" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("pe rson" ++ testKeys.left ++ testKeys.left ++ testKeys.left ++ testKeys.left ++ testKeys.left ++ testKeys.tab ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var names: TestCompleter = .{ .names = &.{ "people", "orders" } };
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .completer = .{ .context = &names, .complete = TestCompleter.complete },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("people rson", try repl.readline());
 }
 
 test "tab inserts the common prefix, and a second tab lists the candidates" {
@@ -2282,6 +2393,89 @@ test "a single tab with several candidates and no common prefix lists nothing" {
 
     try std.testing.expectEqualStrings("x pe", try repl.readline());
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\r\npeople") == null);
+}
+
+const DisplayCompleter = struct {
+    fn complete(context: ?*anyopaque, line: []const u8, cursor: usize, candidates: *Candidates) std.mem.Allocator.Error!usize {
+        _ = context;
+        var start = cursor;
+        while (start > 0 and std.ascii.isAlphanumeric(line[start - 1])) start -= 1;
+        const word = line[start..cursor];
+        if (std.ascii.startsWithIgnoreCase("users", word)) {
+            try candidates.addCandidate(.{ .text = "users", .display = "users [table]", .kind = .table });
+        }
+        if (std.ascii.startsWithIgnoreCase("usage", word)) {
+            try candidates.addCandidate(.{ .text = "usage", .display = "usage [function]", .kind = .function });
+        }
+        return start;
+    }
+};
+
+test "a listing shows display text colored by candidate kind" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("us" ++ testKeys.tab ++ testKeys.tab ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .completer = .{ .context = null, .complete = DisplayCompleter.complete },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("us", try repl.readline());
+    const written = output.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "users [table]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[38;5;31musage [function]\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[38;5;31musage [function]") != null);
+}
+
+const many_names = blk: {
+    @setEvalBranchQuota(100_000);
+    var names: [query_items + 1][]const u8 = undefined;
+    for (&names, 0..) |*name, i| name.* = std.fmt.comptimePrint("name{d}", .{i});
+    const final = names;
+    break :blk final;
+};
+
+test "more than 100 candidates are listed only when the user says yes" {
+    const allocator = std.testing.allocator;
+    var yes_output: Io.Writer.Allocating = .init(allocator);
+    defer yes_output.deinit();
+    var yes_input: Io.Reader = .fixed("n" ++ testKeys.tab ++ testKeys.tab ++ "y" ++ testKeys.enter);
+    var yes_names: TestCompleter = .{ .names = &many_names };
+    const yes_cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &yes_input,
+        .out = &yes_output.writer,
+        .columns = 80,
+        .completer = .{ .context = &yes_names, .complete = TestCompleter.complete },
+    };
+    var yes_repl = try Repl.init(allocator, &yes_cfg);
+    defer yes_repl.deinit();
+    try std.testing.expectEqualStrings("name", try yes_repl.readline());
+    try std.testing.expect(std.mem.indexOf(u8, yes_output.written(), "Display all 101 possibilities? (y or n)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, yes_output.written(), "name100") != null);
+
+    var no_output: Io.Writer.Allocating = .init(allocator);
+    defer no_output.deinit();
+    var no_input: Io.Reader = .fixed("n" ++ testKeys.tab ++ testKeys.tab ++ "n" ++ testKeys.enter);
+    var no_names: TestCompleter = .{ .names = &many_names };
+    const no_cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &no_input,
+        .out = &no_output.writer,
+        .columns = 80,
+        .completer = .{ .context = &no_names, .complete = TestCompleter.complete },
+    };
+    var no_repl = try Repl.init(allocator, &no_cfg);
+    defer no_repl.deinit();
+    try std.testing.expectEqualStrings("name", try no_repl.readline());
+    try std.testing.expect(std.mem.indexOf(u8, no_output.written(), "Display all 101 possibilities? (y or n)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_output.written(), "name100") == null);
 }
 
 test "tab with no candidates, or no completer, leaves the line alone" {
