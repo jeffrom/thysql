@@ -9,6 +9,7 @@ const history_mod = @import("history.zig");
 
 pub const kitty = @import("kitty.zig");
 pub const History = history_mod.History;
+pub const FileHistory = history_mod.FileHistory;
 pub const HistoryOptions = history_mod.Options;
 pub const HistoryDeduplication = history_mod.Deduplication;
 const kill = @import("kill.zig");
