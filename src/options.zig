@@ -658,8 +658,8 @@ fn renderSpec(out: *std.Io.Writer, spec: Spec) !void {
 pub fn renderUsage(out: *std.Io.Writer) !void {
     try out.print(
         \\Usage: thysql [OPTIONS] [database]
-        \\       thysql complete [OPTIONS] -D[prefix]
-        \\       thysql keychain set|delete|status <connection>
+        \\       thysql complete -- WORDS...
+        \\       thysql keychain set|delete|status <conn>
         \\       thysql completion bash
     , .{});
     for (group_titles) |group| {
@@ -901,6 +901,19 @@ test "usage lists every option in its group" {
     try std.testing.expect(std.mem.indexOf(u8, text, "      --ssl-ca=file") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --skip-ssl") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --keychain-account=name") != null);
+}
+
+test "usage describes the complete, keychain, and completion subcommands" {
+    var buffer: [8192]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    try renderUsage(&out);
+    const text = out.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "       thysql complete -- WORDS...\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "       thysql keychain set|delete|status <conn>\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "       thysql completion bash\n") != null);
+    // The -D form of complete is gone.
+    try std.testing.expect(std.mem.indexOf(u8, text, "-D[prefix]") == null);
 }
 
 test "-P selects tcp and -S selects the socket; the last flag wins" {
