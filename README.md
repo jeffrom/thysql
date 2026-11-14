@@ -136,6 +136,9 @@ names load on connect and on `use` when the database changes. They are reloaded
 with `rehash`. The notice about loading is printed on connect and `use`, unless
 `--silent` is given.
 
+When a hint is shown at the end of the line, Tab accepts it, as Right, End, Ctrl-E and
+Ctrl-F do. Tab completes only when no hint is shown.
+
 `-A` (or `--no-auto-rehash`) skips loading. Then only keywords complete until
 `rehash` runs. `--auto-rehash` turns loading back on.
 

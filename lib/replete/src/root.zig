@@ -112,6 +112,9 @@ pub const ReplConfig = struct {
     highlighter: ?Highlighter = null,
     /// Optional suggestion of text to add after the cursor, shown dim. See `historyHinter`.
     hinter: ?Hinter = null,
+    /// Whether Tab accepts a hint shown at the end of the line instead of completing. A Tab
+    /// that accepts a hint does not start a completion, so the next Tab completes.
+    tab_accepts_hint: bool = true,
     /// Optional message about the line, drawn on the rows below it.
     diagnoser: ?Diagnoser = null,
     /// Optional work done while the input is idle, such as parsing the line for a diagnostic.
@@ -609,6 +612,7 @@ pub const Repl = struct {
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.TAB) => {
+                if (self.cfg.tab_accepts_hint and try self.acceptHint(.whole)) return ReadEditState.More;
                 try self.editComplete(after_tab);
                 self.tab_pending = true;
                 return ReadEditState.More;
@@ -2380,6 +2384,47 @@ test "the hint is drawn dim after the cursor and removed when the read ends" {
     // The last drawing of the line leaves the hint off.
     const last_hint = std.mem.lastIndexOf(u8, written, "world").?;
     try std.testing.expect(std.mem.lastIndexOf(u8, written, "> hello\x1b[0K").? > last_hint);
+}
+
+test "tab accepts the hint at the end of the line" {
+    try expectReadlineWithHinter("hello" ++ testKeys.tab ++ testKeys.enter, "hello world");
+}
+
+test "tab with a hinter and a completer still completes when no hint is shown" {
+    try expectReadlineWithHintAndCompleter("or" ++ testKeys.tab ++ testKeys.enter, true, "orders ");
+}
+
+test "tab in the middle of the line completes rather than accepting the hint" {
+    try expectReadlineWithHintAndCompleter("hello" ++ testKeys.left ++ testKeys.tab ++ testKeys.enter, true, "hello_there o");
+}
+
+test "tab ignores the hint when tab_accepts_hint is off" {
+    try expectReadlineWithHintAndCompleter("hello" ++ testKeys.tab ++ testKeys.enter, false, "hello_there ");
+}
+
+test "undo reverts a tab that accepted a hint" {
+    try expectReadlineWithHintAndCompleter("hello" ++ testKeys.tab ++ testKeys.ctrl_underscore ++ testKeys.enter, true, "hello");
+}
+
+fn expectReadlineWithHintAndCompleter(inputBytes: []const u8, tab_accepts_hint: bool, expectedLine: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed(inputBytes);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var names: TestCompleter = .{ .names = &.{ "hello_there", "orders" } };
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .hinter = hello_hinter,
+        .completer = .{ .context = &names, .complete = TestCompleter.complete },
+        .tab_accepts_hint = tab_accepts_hint,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings(expectedLine, try repl.readline());
 }
 
 fn expectReadlineWithHinter(inputBytes: []const u8, expectedLine: []const u8) !void {
