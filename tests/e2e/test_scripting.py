@@ -245,10 +245,10 @@ class ScriptingTests(E2ETestCase):
                 ):
                     self.assertIn(expected, result.stdout)
 
-    def test_version_prints_client_library(self):
+    def test_version_prints_version_and_client_library(self):
         result = harness.run_thysql(["-V"], env={})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(result.stdout.startswith("thysql, client library "), result.stdout)
+        self.assertRegex(result.stdout, r"^thysql \d+\.\d+\.\d+\S*( \(\S+\))?, client library ")
 
     def test_unknown_option_exits_nonzero(self):
         result = harness.run_thysql(["--no-such-option"], env={})
