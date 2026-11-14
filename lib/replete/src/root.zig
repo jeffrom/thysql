@@ -7,6 +7,7 @@ const terminal = @import("terminal.zig");
 const unicode = @import("unicode.zig");
 const history_mod = @import("history.zig");
 
+pub const highlight = @import("highlight.zig");
 pub const kitty = @import("kitty.zig");
 pub const History = history_mod.History;
 pub const FileHistory = history_mod.FileHistory;
