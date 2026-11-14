@@ -99,6 +99,9 @@ pub fn sqlModeFromText(text: []const u8) SqlMode {
 /// The parser and the settings it follows, for one connection. Create it with `init`, and keep it
 /// up to date with `refresh` after every connect and reconnect.
 pub const Syntax = struct {
+    /// The server's error for a syntax error, ER_PARSE_ERROR.
+    pub const parse_error_code: u32 = 1064;
+
     allocator: Allocator,
     /// False with --no-parser. The parser is then never created, and highlighting and
     /// completion use the lexer alone.
@@ -187,6 +190,28 @@ pub const Syntax = struct {
         };
     }
 
+    /// Prints the parser's first error for `sql`, which the server has rejected with a syntax error: the
+    /// message, the line of the statement that it is on, and a caret under the offending text. Nothing is
+    /// printed when the parser is off or finds no error, because the server is authoritative.
+    pub fn renderError(self: *Syntax, out: *std.Io.Writer, sql: []const u8) !void {
+        const handle = self.parser() orelse return;
+        const errors = try handle.check(sql);
+        defer handle.freeErrors(errors);
+        if (errors.len == 0) return;
+
+        const first = errors[0];
+        const line_start = if (std.mem.lastIndexOfScalar(u8, sql[0..first.start], '\n')) |newline| newline + 1 else 0;
+        const line_end = std.mem.indexOfScalarPos(u8, sql, first.start, '\n') orelse sql.len;
+        try out.print("parser: {s}\n", .{first.message});
+        try out.print("{s}\n", .{sql[line_start..line_end]});
+        // Columns are counted in code points, as the terminal draws them.
+        const column = codePoints(sql[line_start..first.start]);
+        const width = @max(1, codePoints(sql[first.start..@min(first.end, line_end)]));
+        try out.splatByteAll(' ', column);
+        try out.splatByteAll('^', width);
+        try out.writeAll("\n");
+    }
+
     fn joinWarmUp(self: *Syntax) void {
         if (self.warm_up) |thread| {
             thread.join();
@@ -233,6 +258,10 @@ fn statementAt(text: []const u8, cursor: usize, options: SqlLexer.Options) ?Span
         }
     }
     return .{ .start = start, .end = text.len };
+}
+
+fn codePoints(text: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(text) catch text.len;
 }
 
 /// Runs on the warm-up thread. It has its own parser, and the allocator is thread-safe.
@@ -369,4 +398,43 @@ test "a disabled syntax reports nothing" {
     var syntax = Syntax.init(allocator, false);
     defer syntax.deinit();
     try std.testing.expect((try syntax.firstError(allocator, "SELECT a FROM t FROM x", 22, ";")) == null);
+}
+
+test "a server syntax error is followed by the parser's message and a caret under the text" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try syntax.renderError(&out.writer, "SELECT a FROM t FROM x");
+    const written = out.written();
+    try std.testing.expect(std.mem.startsWith(u8, written, "parser: \"FROM\" is not valid at this position"));
+    try std.testing.expect(std.mem.endsWith(u8, written, "\nSELECT a FROM t FROM x\n                ^^^^\n"));
+}
+
+test "the caret goes under the line of a multi-line statement that has the error" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try syntax.renderError(&out.writer, "SELECT a\nFROM t FROM x");
+    try std.testing.expect(std.mem.endsWith(u8, out.written(), "\nFROM t FROM x\n       ^^^^\n"));
+}
+
+test "a valid statement prints nothing, and so does a disabled syntax" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try syntax.renderError(&out.writer, "SELECT a FROM t");
+    try std.testing.expectEqualStrings("", out.written());
+
+    var off = Syntax.init(allocator, false);
+    defer off.deinit();
+    try off.renderError(&out.writer, "SELECT a FROM t FROM x");
+    try std.testing.expectEqualStrings("", out.written());
 }

@@ -373,6 +373,8 @@ fn execReplStatement(context: *ReplContext, stdout: *std.Io.Writer, sql: []const
         }
 
         try db.renderLastError(stdout);
+        // The server has the last word, but the parser can say where the syntax error is.
+        if (db.lastErrno() == Syntax.parse_error_code) try context.repl.syntax.renderError(stdout, sql);
         if (retried or !canReconnect(db, &context.repl)) {
             return null;
         }
