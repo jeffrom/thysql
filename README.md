@@ -363,3 +363,9 @@ docker build --target build -t thysql-build .
 docker build -t thysql-release .
 docker run --rm --entrypoint ldd thysql-release /usr/local/bin/thysql
 ```
+
+## license
+
+thysql is licensed under GPL-2.0-or-later with an OpenSSL linking exception; see
+`LICENSE` and `COPYING`. The MySQL grammar from MySQL Workbench is GPL-2.0-only, so
+binary releases are distributed under GPL version 2.

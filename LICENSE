@@ -1,0 +1,39 @@
+thysql
+Copyright (C) 2026 Jeff Martin
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 2 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program (see COPYING); if not, write to the Free Software Foundation,
+Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+OpenSSL exception
+
+In addition, as a special exception, the copyright holders give permission to
+link the code of this program with the OpenSSL library (or with modified
+versions of OpenSSL that use the same license as OpenSSL), and distribute
+linked combinations including the two. You must obey the GNU General Public
+License in all respects for all of the code used other than OpenSSL. If you
+modify this program, you may extend this exception to your version of the
+program, but you are not obligated to do so. If you do not wish to do so,
+delete this exception statement from your version.
+
+Third-party code
+
+Some files in this repository are not covered by the notice above and keep
+their own licenses:
+
+- src/sql/grammar/ and the Oracle-copyrighted files in src/sql/antlr/ (from
+  MySQL Workbench): GPL-2.0-only, with Oracle's permission to link with
+  OpenSSL. Because of these files, binary releases of thysql are distributed
+  under the terms of GPL version 2.
+- deps/mariadb-connector-c: LGPL-2.1-or-later.
+- deps/antlr4: BSD-3-Clause.
+- deps/antlr4-c3: MIT.
