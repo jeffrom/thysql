@@ -660,6 +660,7 @@ pub fn renderUsage(out: *std.Io.Writer) !void {
         \\Usage: thysql [OPTIONS] [database]
         \\       thysql complete [OPTIONS] -D[prefix]
         \\       thysql keychain set|delete|status <connection>
+        \\       thysql completion bash
     , .{});
     for (group_titles) |group| {
         try out.print("\n{s}\n", .{group.title});

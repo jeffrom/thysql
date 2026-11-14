@@ -144,6 +144,24 @@ use Option as Meta.
 `-A` (or `--no-auto-rehash`) skips loading. Then only keywords complete until
 `rehash` runs. `--auto-rehash` turns loading back on.
 
+## shell completion
+
+`thysql completion bash` prints a bash completion script. It completes option names and
+values, connection names from `~/.config/thysql/connections`, and database names from the
+server. The script calls `thysql complete`, which never asks for a password: with `-p`, or
+when the connection fails, it offers no database names.
+
+Install it with either of these:
+
+```sh
+thysql completion bash > ~/.local/share/bash-completion/completions/thysql
+eval "$(thysql completion bash)"    # in ~/.bashrc
+```
+
+The script works with bash 3.2, the version macOS ships. Bash 3.2 has no `compopt`, so
+after `--ssl-ca=` and other options that take a value, it adds a space where newer bash
+does not.
+
 ## parser
 
 The interactive client parses SQL with the MySQL Workbench grammar, as ANTLR4 parser,

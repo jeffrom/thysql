@@ -9,6 +9,7 @@ const ClientCommand = @import("client_command.zig");
 const Client = @import("client.zig");
 const KeychainCommand = @import("keychain_command.zig");
 const Completion = @import("completion.zig");
+const CompletionScript = @import("completion_script.zig");
 const Connections = @import("connections.zig");
 const Options = @import("options.zig");
 const OptionFile = @import("option_file.zig");
@@ -905,6 +906,9 @@ pub fn runREPL(
     if (args.items.len > 1 and std.mem.eql(u8, args.items[1], "keychain")) {
         return try KeychainCommand.run(allocator, io, stdout, stderr, args.items, env);
     }
+    if (args.items.len > 1 and std.mem.eql(u8, args.items[1], "completion")) {
+        return try CompletionScript.run(stdout, stderr, args.items);
+    }
 
     // Option files come before the command line, as in mysql.cc's load_defaults.
     var loaded = OptionFile.load(allocator, io, env, args.items, stderr) catch |err| switch (err) {
@@ -1202,6 +1206,7 @@ test {
         @import("client.zig"),
         @import("client_command.zig"),
         @import("completion.zig"),
+        @import("completion_script.zig"),
         @import("connections.zig"),
         @import("history_file.zig"),
         @import("mysql.zig"),
