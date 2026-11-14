@@ -1,3 +1,9 @@
 [submodule "deps/mariadb-connector-c"]
 	path = deps/mariadb-connector-c
 	url = https://github.com/MariaDB/mariadb-connector-c.git
+[submodule "deps/antlr4-c3"]
+	path = deps/antlr4-c3
+	url = https://github.com/mike-lischke/antlr4-c3.git
+[submodule "deps/antlr4"]
+	path = deps/antlr4
+	url = https://github.com/antlr/antlr4.git
