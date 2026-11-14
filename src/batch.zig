@@ -361,6 +361,7 @@ pub const Scanner = struct {
             '-' => self.state = .maybe_dash_comment,
             '/' => self.state = .maybe_block_comment,
             '\\' => self.state = .maybe_command,
+            '#' => self.state = .line_comment,
             else => {},
         }
         try self.buffer.append(allocator, byte);
@@ -445,6 +446,7 @@ pub const Scanner = struct {
                 '`' => self.state = .backtick,
                 '-' => self.state = .maybe_dash_comment,
                 '/' => self.state = .maybe_block_comment,
+                '#' => self.state = .line_comment,
                 else => {},
             },
             // Only feed() enters these states, so an editor buffer never reaches them.
@@ -1017,6 +1019,10 @@ test "a delimiter can end a statement right after a closed quote" {
 
 test "a delimiter that starts like a comment still ends statements" {
     try expectStatements("//", "select 1 // select /* // */ 2//", &.{ "select 1", "select /* // */ 2" });
+}
+
+test "a hash starts a comment to the end of the line, so its semicolon does not end the statement" {
+    try expectStatements(";", "select 1 # a;\n2; select 3 # b; c\n;", &.{ "select 1 # a;\n2", "select 3 # b; c" });
 }
 
 test "a delimiter command is only recognized at the start of a statement" {
