@@ -31,3 +31,10 @@ Each modified file says so at the top. In short:
 `MySQLBaseLexer::keywordFromText()` is kept verbatim. Its symbol map is keyed
 by upper-case token names but looked up with lower-case text, so it does not
 match anything. Nothing in the grammar calls it.
+
+## Build
+
+`zig build` compiles the ANTLR4 runtime (`deps/antlr4`, C++17), the base
+classes above, the generated parser (`src/sql/generated`) and antlr4-c3
+(`deps/antlr4-c3`, C++20) into `libmysql_parser.a`. `zig build test` runs
+`smoke_test.cpp` against it. Nothing in thysql links the library yet.

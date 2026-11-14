@@ -1,4 +1,5 @@
 const std = @import("std");
+const parser_sources = @import("src/sql/antlr/sources.zig");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -172,6 +173,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_replete_tests = b.addRunArtifact(replete_tests);
 
+    // The ANTLR4 runtime, antlr4-c3 and the generated MySQL parser, as one
+    // static C++ library. Nothing links it yet; it is built and installed so
+    // that it stays compiling.
+    const parser_lib = addMysqlParserLibrary(b, target, optimize);
+    b.installArtifact(parser_lib);
+
     // Regenerates src/sql/generated from src/sql/grammar. Needs Java; normal
     // builds use the committed sources and do not run this step.
     const gen_parser = b.addSystemCommand(&.{ "sh", "tools/gen_parser.sh" });
@@ -185,6 +192,25 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_replete_tests.step);
+
+    // C++ smoke test for the MySQL parser: parses a valid and an invalid query.
+    const parser_smoke = b.addExecutable(.{
+        .name = "mysql_parser_smoke_test",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libcpp = true,
+        }),
+    });
+    parser_smoke.root_module.addCSourceFiles(.{
+        .root = b.path("src/sql/antlr"),
+        .files = &.{"smoke_test.cpp"},
+        .flags = parser_cxx_flags,
+    });
+    addParserIncludePaths(parser_smoke.root_module, b);
+    parser_smoke.root_module.linkLibrary(parser_lib);
+    const run_parser_smoke = b.addRunArtifact(parser_smoke);
+    test_step.dependOn(&run_parser_smoke.step);
 
     // End-to-end tests run the installed binary against Docker containers
     // (MySQL 8.4 and MariaDB 11.4). Extra arguments go to the Python runner,
@@ -256,4 +282,54 @@ fn linkMariaDbSystemLibraries(module: *std.Build.Module, target: std.Build.Resol
         },
         else => {},
     }
+}
+
+// Flags for the ANTLR runtime, the MySQL base classes, the generated parser and
+// the smoke test. The runtime targets C++17.
+const parser_cxx_flags: []const []const u8 = &.{
+    "-std=c++17",
+    // Selects the static (non-dllexport) form of the ANTLR runtime's API.
+    "-DANTLR4CPP_STATIC",
+};
+
+// antlr4-c3 needs C++20 (defaulted comparisons, ranges, contains()).
+const antlr4_c3_cxx_flags: []const []const u8 = &.{
+    "-std=c++20",
+    "-DANTLR4CPP_STATIC",
+};
+
+fn addParserIncludePaths(module: *std.Build.Module, b: *std.Build) void {
+    module.addIncludePath(b.path("deps/antlr4/runtime/Cpp/runtime/src"));
+    module.addIncludePath(b.path("deps/antlr4-c3/ports/cpp/source/antlr4-c3"));
+    // Holds the hand-written MySQL base classes and base/symbol-info.h.
+    module.addIncludePath(b.path("src/sql/antlr"));
+    module.addIncludePath(b.path("src/sql/generated"));
+}
+
+// Builds the ANTLR4 C++ runtime, antlr4-c3, the MySQL base classes and the
+// generated MySQL lexer and parser as a static library.
+fn addMysqlParserLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libcpp = true,
+    });
+    addParserIncludePaths(module, b);
+
+    module.addCSourceFiles(.{
+        .files = &(parser_sources.antlr_runtime ++ parser_sources.mysql_base ++ parser_sources.mysql_generated),
+        .flags = parser_cxx_flags,
+    });
+
+    // antlr4-c3 needs C++20, so it is compiled with its own flags.
+    module.addCSourceFiles(.{
+        .files = &parser_sources.antlr4_c3,
+        .flags = antlr4_c3_cxx_flags,
+    });
+
+    return b.addLibrary(.{
+        .name = "mysql_parser",
+        .linkage = .static,
+        .root_module = module,
+    });
 }
