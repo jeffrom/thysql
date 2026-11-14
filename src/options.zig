@@ -38,6 +38,7 @@ pub const Id = enum {
     socket,
     protocol,
     connect_timeout,
+    connection,
     ssl,
     skip_ssl,
     ssl_ca,
@@ -97,6 +98,7 @@ pub const specs = [_]Spec{
     .{ .id = .socket, .long = "socket", .short = 'S', .arg = .required, .arg_name = "path", .group = .connection, .help = "Unix socket file to use. Selects the socket protocol." },
     .{ .id = .protocol, .long = "protocol", .arg = .required, .arg_name = "name", .group = .connection, .help = "Connection protocol: tcp or socket. Socket applies only to host localhost." },
     .{ .id = .connect_timeout, .long = "connect-timeout", .arg = .required, .arg_name = "#", .group = .connection, .help = "Seconds to wait for the connection to open. Defaults to the library's timeout." },
+    .{ .id = .connection, .long = "connection", .short = 'C', .arg = .required, .arg_name = "name", .group = .connection, .help = "Connect with a saved connection from ~/.config/thysql/connections." },
     .{ .id = .ssl, .long = "ssl", .arg = .optional, .group = .connection, .help = "Use TLS when the server offers it. This is the default." },
     .{ .id = .skip_ssl, .long = "skip-ssl", .group = .connection, .help = "Do not use TLS." },
     .{ .id = .ssl_ca, .long = "ssl-ca", .arg = .required, .arg_name = "file", .group = .connection, .help = "CA certificate file in PEM format. Implies --ssl." },
@@ -169,6 +171,9 @@ pub const Options = struct {
     tls: Tls = .{},
     /// Seconds to wait for the connection to open. 0 keeps the library default.
     connect_timeout: u32 = 0,
+    /// The resolved name of the -C connection, such as "main/ro". Borrowed from the
+    /// connections.Selection that the caller keeps alive. Null without -C.
+    connection: ?[]const u8 = null,
     execute: ?std.ArrayList(u8) = null,
     force: bool = false,
     /// Delimiter for batch and REPL input. Checked when it is set.
@@ -426,6 +431,42 @@ fn setTlsPath(options: *Options, field: *[]const u8, value: ?[]const u8) Error!v
     options.tls.enabled = true;
 }
 
+/// The value of the last -C/--connection in args[first..], or null when there is none. It
+/// scans the arguments the way `parseWithSettings` does, so a -C that is the value of
+/// another option, as in `-e -C`, is not a connection. A -C with no value is null here,
+/// and parsing reports it.
+pub fn connectionArg(args: []const []const u8, first: usize) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    var positional_only = false;
+    var i: usize = first;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (positional_only or arg.len < 2 or arg[0] != '-') {
+            continue;
+        } else if (std.mem.eql(u8, arg, "--")) {
+            positional_only = true;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            const body = arg[2..];
+            const eq_index = std.mem.indexOfScalar(u8, body, '=');
+            const spec = findLong(if (eq_index) |idx| body[0..idx] else body) orelse continue;
+            const inline_value = if (eq_index) |idx| body[idx + 1 ..] else null;
+            const value = argumentValue(spec, args, &i, inline_value) catch null;
+            if (spec.id == .connection) found = value;
+        } else {
+            for (arg[1..], 0..) |flag, pos| {
+                const spec = findShort(flag) orelse break;
+                if (spec.arg == .none) continue;
+                const rest = arg[pos + 2 ..];
+                const inline_value: ?[]const u8 = if (rest.len > 0) rest else null;
+                const value = argumentValue(spec, args, &i, inline_value) catch null;
+                if (spec.id == .connection) found = value;
+                break;
+            }
+        }
+    }
+    return found;
+}
+
 /// Applies one option-file setting. Unknown names are ignored, and so are
 /// help and version, which only make sense on the command line.
 /// Passwords are allowed here, unlike on the command line.
@@ -491,6 +532,8 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         },
         .protocol => options.protocol = try protocolValue(value),
         .connect_timeout => options.connect_timeout = try connectTimeoutValue(value),
+        // -C is found by connectionArg before parsing, and the resolved name is set by the caller.
+        .connection => {},
         .ssl => options.tls.enabled = try boolValue(value),
         .skip_ssl => options.tls.enabled = false,
         .ssl_ca => try setTlsPath(options, &options.tls.ca, value),
@@ -819,6 +862,7 @@ test "usage lists every option in its group" {
     try std.testing.expect(std.mem.indexOf(u8, text, "      --column-names") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "  -?, --help") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "  -V, --version") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  -C, --connection=name") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "  -S, --socket=path") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --ssl-ca=file") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --skip-ssl") != null);
@@ -1286,4 +1330,49 @@ test "--defaults-file, --defaults-extra-file, --no-defaults, and --print-default
 
     const late_none = [_][]const u8{ "thysql", "--no-defaults" };
     try std.testing.expectError(Error.DefaultsOptionMisplaced, parse(std.testing.allocator, &late_none, &env));
+}
+
+test "connectionArg finds the last -C, in every form" {
+    const separate = [_][]const u8{ "thysql", "-C", "local", "-Cmain/ro", "--connection", "first", "--connection=last" };
+    try std.testing.expectEqualStrings("last", connectionArg(&separate, 1).?);
+
+    const attached = [_][]const u8{ "thysql", "-Clocal" };
+    try std.testing.expectEqualStrings("local", connectionArg(&attached, 1).?);
+
+    const clustered = [_][]const u8{ "thysql", "-sCmain" };
+    try std.testing.expectEqualStrings("main", connectionArg(&clustered, 1).?);
+
+    const after_positional = [_][]const u8{ "thysql", "app", "-C", "local" };
+    try std.testing.expectEqualStrings("local", connectionArg(&after_positional, 1).?);
+
+    const missing = [_][]const u8{ "thysql", "-C" };
+    try std.testing.expectEqual(@as(?[]const u8, null), connectionArg(&missing, 1));
+}
+
+test "connectionArg skips -C that is the value of another option or follows --, and starts at first" {
+    const execute = [_][]const u8{ "thysql", "-e", "-C" };
+    try std.testing.expectEqual(@as(?[]const u8, null), connectionArg(&execute, 1));
+
+    const database = [_][]const u8{ "thysql", "-D", "-C", "--database=-C" };
+    try std.testing.expectEqual(@as(?[]const u8, null), connectionArg(&database, 1));
+
+    const host_cluster = [_][]const u8{ "thysql", "-sh", "-C" };
+    try std.testing.expectEqual(@as(?[]const u8, null), connectionArg(&host_cluster, 1));
+
+    const after_dd = [_][]const u8{ "thysql", "--", "-C", "local" };
+    try std.testing.expectEqual(@as(?[]const u8, null), connectionArg(&after_dd, 1));
+
+    const before_first = [_][]const u8{ "thysql", "-C", "skipped", "-C", "used" };
+    try std.testing.expectEqualStrings("used", connectionArg(&before_first, 3).?);
+}
+
+test "-C is accepted by parse and does not set the name itself" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const args = [_][]const u8{ "thysql", "-C", "local", "-e", "select 1" };
+    var options = try parse(std.testing.allocator, &args, &env);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?[]const u8, null), options.connection);
+    try std.testing.expectEqualStrings("select 1", options.executeText().?);
 }

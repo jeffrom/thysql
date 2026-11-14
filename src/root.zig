@@ -8,6 +8,7 @@ const Batch = @import("batch.zig");
 const ClientCommand = @import("client_command.zig");
 const Client = @import("client.zig");
 const Completion = @import("completion.zig");
+const Connections = @import("connections.zig");
 const Options = @import("options.zig");
 const OptionFile = @import("option_file.zig");
 const Prompt = @import("prompt.zig");
@@ -925,18 +926,25 @@ pub fn runREPL(
         error.OptionFileFailed => return 1,
     };
     defer loaded.deinit();
+    // -C adds the saved connection's settings after the option files, so the connection wins.
+    var selection = Connections.select(allocator, io, env, stderr, args.items, loaded.next, loaded.settings) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ConnectionFailed => return 1,
+    };
+    defer selection.deinit();
     if (loaded.print_defaults) {
-        try OptionFile.renderPrintDefaults(stdout, args.items[0], loaded.settings, args.items[loaded.next..]);
+        try OptionFile.renderPrintDefaults(stdout, args.items[0], selection.settings, args.items[loaded.next..]);
         try stdout.flush();
         return 0;
     }
 
-    var options = Options.parseWithSettings(allocator, args.items, loaded.next, env, loaded.settings) catch |err| {
+    var options = Options.parseWithSettings(allocator, args.items, loaded.next, env, selection.settings) catch |err| {
         try Options.renderError(stderr, err);
         try Options.renderUsage(stderr);
         return 1;
     };
     defer options.deinit(allocator);
+    options.connection = selection.name();
 
     if (options.show_help) {
         try Options.renderUsage(stdout);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const Connections = @import("connections.zig");
 const Mysql = @import("mysql.zig");
 const OptionFile = @import("option_file.zig");
 const Options = @import("options.zig");
@@ -82,16 +83,22 @@ pub fn run(
         error.OptionFileFailed => return 1,
     };
     defer loaded.deinit();
+    var selection = Connections.select(allocator, io, env, stderr, request.connection_args.items, loaded.next, loaded.settings) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ConnectionFailed => return 1,
+    };
+    defer selection.deinit();
     if (loaded.print_defaults) {
-        try OptionFile.renderPrintDefaults(stdout, args[0], loaded.settings, request.connection_args.items[loaded.next..]);
+        try OptionFile.renderPrintDefaults(stdout, args[0], selection.settings, request.connection_args.items[loaded.next..]);
         return 0;
     }
 
-    var options = Options.parseWithSettings(allocator, request.connection_args.items, loaded.next, env, loaded.settings) catch |err| {
+    var options = Options.parseWithSettings(allocator, request.connection_args.items, loaded.next, env, selection.settings) catch |err| {
         try Options.renderError(stderr, err);
         return 1;
     };
     defer options.deinit(allocator);
+    options.connection = selection.name();
 
     if (options.prompt_password) {
         try stderr.print("Cannot prompt for a password during completion; use MYSQL_PWD.\n", .{});

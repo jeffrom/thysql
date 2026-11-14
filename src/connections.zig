@@ -76,6 +76,50 @@ pub fn resolve(
     return .{ .arena = arena, .name = found.name, .settings = found.settings };
 }
 
+/// The connection named by -C, if any, and the settings to parse with: the option-file settings
+/// `base`, then the connection's settings, so the connection wins. Free it with `deinit`.
+pub const Selection = struct {
+    gpa: Allocator,
+    /// Null when -C was not given. Then `settings` is `base`, and nothing is owned.
+    resolved: ?Resolved = null,
+    /// `base` followed by the connection's settings. Owned when `resolved` is set.
+    settings: []const OptionFile.Setting,
+
+    pub fn deinit(self: *Selection) void {
+        if (self.resolved) |*resolved| {
+            resolved.deinit();
+            self.gpa.free(self.settings);
+        }
+        self.resolved = null;
+    }
+
+    /// The resolved name, such as "main/ro", or null without -C.
+    pub fn name(self: *const Selection) ?[]const u8 {
+        return if (self.resolved) |resolved| resolved.name else null;
+    }
+};
+
+/// Resolves the -C connection in `args[first..]` (see `options.connectionArg`). Resolution errors
+/// are printed to `stderr` and `error.ConnectionFailed` is returned.
+pub fn select(
+    gpa: Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    stderr: *std.Io.Writer,
+    args: []const []const u8,
+    first: usize,
+    base: []const OptionFile.Setting,
+) Error!Selection {
+    const requested = options.connectionArg(args, first) orelse return .{ .gpa = gpa, .settings = base };
+    var resolved = try resolve(gpa, io, env, stderr, requested);
+    errdefer resolved.deinit();
+
+    const settings = try gpa.alloc(OptionFile.Setting, base.len + resolved.settings.len);
+    @memcpy(settings[0..base.len], base);
+    @memcpy(settings[base.len..], resolved.settings);
+    return .{ .gpa = gpa, .resolved = resolved, .settings = settings };
+}
+
 /// Lists the entries directly in `dir`, a directory relative to the root ("" is the root),
 /// sorted by name. Names are relative to the root, such as "main/ro". Hidden names and
 /// `config` are skipped. A missing root or a `dir` that is not a directory gives an empty list.
@@ -877,4 +921,34 @@ test "resolve and list read the root from XDG_CONFIG_HOME" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     std.testing.allocator.free(entries[0].name);
     try std.testing.expectError(error.ConnectionFailed, resolve(std.testing.allocator, std.testing.io, &env, &stderr, "nope"));
+}
+
+test "select applies the connection after the given settings, and needs no -C without one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(&tmp, "xdg/thysql/connections/local", "host = from-file\nuser = file-user\n");
+    const xdg = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/xdg", .{&tmp.sub_path});
+    defer std.testing.allocator.free(xdg);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", xdg);
+    var buffer: [512]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&buffer);
+
+    const base = [_]OptionFile.Setting{.{ .name = "host", .value = "from-option-file" }};
+    const with_c = [_][]const u8{ "thysql", "-C", "local" };
+    var selected = try select(std.testing.allocator, std.testing.io, &env, &stderr, &with_c, 1, &base);
+    defer selected.deinit();
+    try std.testing.expectEqualStrings("local", selected.name().?);
+    try expectSettings(selected.settings, &.{
+        .{ .name = "host", .value = "from-option-file" },
+        .{ .name = "host", .value = "from-file" },
+        .{ .name = "user", .value = "file-user" },
+    });
+
+    const without_c = [_][]const u8{"thysql"};
+    var plain = try select(std.testing.allocator, std.testing.io, &env, &stderr, &without_c, 1, &base);
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), plain.name());
+    try std.testing.expectEqual(@as(usize, 1), plain.settings.len);
 }
