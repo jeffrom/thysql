@@ -210,6 +210,23 @@ class CompleteTests(E2ETestCase):
         self.assertEqual(process.wait(timeout=30), 0, stderr)
         self.assertEqual(stderr, "")
 
+    def test_help_and_completion_script_to_a_closed_pipe_exit_quietly(self):
+        # The same closed pipe for output written outside `complete`.
+        for args in (["--help"], ["completion", "bash"]):
+            with self.subTest(args=args):
+                process = subprocess.Popen(
+                    [harness.BINARY, *args],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=harness.base_env(self.home),
+                    cwd=self.home,
+                )
+                process.stdout.close()
+                stderr = process.stderr.read().decode("utf-8", "replace")
+                process.stderr.close()
+                self.assertEqual(process.wait(timeout=30), 0, stderr)
+                self.assertEqual(stderr, "")
+
 
 if __name__ == "__main__":
     unittest.main()

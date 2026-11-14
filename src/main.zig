@@ -13,10 +13,15 @@ pub fn main(init: std.process.Init) !void {
     var stderrWriter = std.Io.File.stderr().writerStreaming(io, &stderrBuffer);
     const stderr = &stderrWriter.interface;
 
-    const status = try thysql.runREPL(gpa, io, stdout, stderr, init.minimal.args, init.environ_map);
+    // A reader that closes the pipe early, as in `thysql --help | head -1`, makes writes fail.
+    // That is not an error worth a stack trace: stop quietly, as `complete` does.
+    const status = thysql.runREPL(gpa, io, stdout, stderr, init.minimal.args, init.environ_map) catch |err| switch (err) {
+        error.WriteFailed => std.process.exit(0),
+        else => return err,
+    };
 
-    try stdout.flush();
-    try stderr.flush();
+    stdout.flush() catch std.process.exit(0);
+    stderr.flush() catch {};
 
     if (status != 0) {
         std.process.exit(status);
