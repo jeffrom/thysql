@@ -45,7 +45,9 @@ test "the bash script registers its completer for thysql" {
 
     const args = [_][]const u8{ "thysql", "completion", "bash" };
     try std.testing.expectEqual(@as(u8, 0), try run(&out.writer, &stderr, &args));
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "complete -o default -F _thysql thysql") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "complete -F _thysql thysql\n") != null);
+    // No -o default on the registration: the script uses the directive, so an empty list stays empty.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "complete -o default") == null);
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
 
