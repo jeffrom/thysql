@@ -6,9 +6,11 @@ Every run here sets HOME to the test's own home, so connection files live there.
 """
 
 import os
+import subprocess
 import time
 import unittest
 
+import harness
 from harness import (
     ROOT_PASSWORD,
     ROOT_USER,
@@ -190,6 +192,23 @@ class CompleteTests(E2ETestCase):
     def test_a_flag_with_no_completion_gives_nothing(self):
         candidates, directive, _ = self.complete(["-h", ""])
         self.assertEqual((candidates, directive), ([], 0))
+
+    def test_a_reader_that_closes_the_pipe_early_is_not_an_error(self):
+        # `thysql complete -- thysql - | head -1` closes the pipe while thysql is still writing.
+        # Here nothing ever reads the pipe, so the first write fails with a closed pipe. The exit
+        # status must still be 0, and no stack trace may appear on stderr.
+        process = subprocess.Popen(
+            [harness.BINARY, "complete", "--", PROG, "-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=harness.base_env(self.home),
+            cwd=self.home,
+        )
+        process.stdout.close()
+        stderr = process.stderr.read().decode("utf-8", "replace")
+        process.stderr.close()
+        self.assertEqual(process.wait(timeout=30), 0, stderr)
+        self.assertEqual(stderr, "")
 
 
 if __name__ == "__main__":

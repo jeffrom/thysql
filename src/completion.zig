@@ -488,12 +488,36 @@ pub fn run(
     var out: Candidates = .{ .allocator = arena.allocator() };
     try complete(io, env, diagnostics, debug, wordsAfterComplete(args), &out);
 
-    for (out.items.items) |item| {
+    writeCandidates(stdout, out.items.items, out.directive) catch |err| switch (err) {
+        // The reader closed the pipe, as with `thysql complete -- ... | head -1`. That is not an
+        // error. Drop what is still buffered, so the flush in main does not fail the same way.
+        error.WriteFailed => {
+            stdout.end = 0;
+        },
+    };
+    return 0;
+}
+
+fn writeCandidates(stdout: *std.Io.Writer, items: []const []const u8, directive: u8) std.Io.Writer.Error!void {
+    for (items) |item| {
         try stdout.print("{s}\n", .{item});
     }
-    try stdout.print(":{d}\n", .{out.directive});
+    try stdout.print(":{d}\n", .{directive});
     try stdout.flush();
-    return 0;
+}
+
+test "a reader that closes the pipe early is not an error" {
+    // A 4-byte writer fills up on the first candidate, as a closed pipe does on the first write.
+    var buffer: [4]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&buffer);
+    var stderr_buffer: [64]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    const args = [_][]const u8{ "thysql", "complete", "--", "thysql", "--ss" };
+    try std.testing.expectEqual(@as(u8, 0), try run(std.testing.allocator, std.testing.io, &stdout, &stderr, &args, &env));
+    try std.testing.expectEqualStrings("", stderr.buffered());
 }
 
 test "an empty first word offers the subcommands and databases" {
