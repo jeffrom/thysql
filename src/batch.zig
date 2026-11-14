@@ -65,6 +65,11 @@ fn isLiteral(state: Scanner.State) bool {
     };
 }
 
+/// True for a byte that lets `--` start a comment: whitespace or a control byte, as mysql.cc reads it.
+fn isDashCommentEnd(byte: u8) bool {
+    return byte <= ' ' or byte == 0x7f;
+}
+
 pub const Scanner = struct {
     pub const PromptKind = enum {
         main,
@@ -80,6 +85,8 @@ pub const Scanner = struct {
         /// At the start of a statement, matching the word of a client command.
         keyword,
         maybe_dash_comment,
+        /// After `--`. Whether it is a comment depends on the byte that follows.
+        dash_pair,
         maybe_block_comment,
         maybe_command,
         single_quote,
@@ -150,7 +157,7 @@ pub const Scanner = struct {
 
     fn canStartDelimiter(self: *const Scanner) bool {
         return switch (self.state) {
-            .normal, .keyword, .maybe_dash_comment, .maybe_block_comment, .maybe_command => true,
+            .normal, .keyword, .maybe_dash_comment, .dash_pair, .maybe_block_comment, .maybe_command => true,
             else => false,
         };
     }
@@ -198,12 +205,17 @@ pub const Scanner = struct {
             },
             .maybe_dash_comment => {
                 if (byte == '-') {
-                    self.state = .line_comment;
+                    self.state = .dash_pair;
                     try self.buffer.append(allocator, byte);
                     return false;
                 }
                 self.state = .normal;
                 return self.feedNormal(allocator, byte);
+            },
+            .dash_pair => {
+                // As in mysql.cc, `--` needs a space, a control byte or the end of the text after it.
+                self.state = if (isDashCommentEnd(byte)) .line_comment else .normal;
+                return self.feedState(allocator, byte);
             },
             .maybe_block_comment => {
                 if (byte == '*') {
@@ -395,7 +407,7 @@ pub const Scanner = struct {
 
     pub fn promptKind(self: *const Scanner) PromptKind {
         return switch (self.state) {
-            .normal, .keyword, .maybe_dash_comment, .maybe_block_comment, .maybe_command, .line_comment, .command_line, .client_line => if (self.buffer.items.len == 0)
+            .normal, .keyword, .maybe_dash_comment, .dash_pair, .maybe_block_comment, .maybe_command, .line_comment, .command_line, .client_line => if (self.buffer.items.len == 0)
                 .main
             else
                 .continuation,
@@ -453,11 +465,15 @@ pub const Scanner = struct {
             .keyword, .command_line, .client_line => {},
             .maybe_dash_comment => {
                 if (byte == '-') {
-                    self.state = .line_comment;
+                    self.state = .dash_pair;
                 } else {
                     self.state = .normal;
                     self.scanPromptState(byte);
                 }
+            },
+            .dash_pair => {
+                self.state = if (isDashCommentEnd(byte)) .line_comment else .normal;
+                self.scanPromptState(byte);
             },
             .maybe_block_comment => {
                 if (byte == '*') {
@@ -1023,6 +1039,10 @@ test "a delimiter that starts like a comment still ends statements" {
 
 test "a hash starts a comment to the end of the line, so its semicolon does not end the statement" {
     try expectStatements(";", "select 1 # a;\n2; select 3 # b; c\n;", &.{ "select 1 # a;\n2", "select 3 # b; c" });
+}
+
+test "a double dash starts a comment only before whitespace or a control byte" {
+    try expectStatements(";", "select 1--1; select 2--;3; select 4 -- a;\n5;", &.{ "select 1--1", "select 2--", "3", "select 4 -- a;\n5" });
 }
 
 test "a delimiter command is only recognized at the start of a statement" {

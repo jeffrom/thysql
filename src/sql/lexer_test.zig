@@ -482,6 +482,7 @@ test "lexer and batch scanner agree on statement boundaries" {
         .{ .input = "select 1 // select 2//", .delimiter = "//" },
         .{ .input = "select 1 /* a ; b */ ; select `a;b`;", .delimiter = ";" },
         .{ .input = "select 1 # a;b\n; select 2 #x;\n; select 3 #", .delimiter = ";" },
+        .{ .input = "select 1--1; select 2 --\n; select 3--x; 4 --\t;\n; select 5 --", .delimiter = ";" },
     };
     for (boundaries) |boundary| {
         const lexed = try lexerBoundaries(gpa, boundary.input, boundary.delimiter);
