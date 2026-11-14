@@ -38,7 +38,8 @@ pub const PasswordSource = union(enum) {
     prompt,
     /// `--auth-command`: the command prints the password, on every connect.
     command: []const u8,
-    /// The keychain item for this account.
+    /// The keychain item for this account. Empty means the connection name, which
+    /// `password.fetch` fills in.
     keychain: []const u8,
 };
 
@@ -53,6 +54,8 @@ pub const Id = enum {
     connect_timeout,
     connection,
     auth_command,
+    keychain,
+    keychain_account,
     ssl,
     skip_ssl,
     ssl_ca,
@@ -114,6 +117,8 @@ pub const specs = [_]Spec{
     .{ .id = .connect_timeout, .long = "connect-timeout", .arg = .required, .arg_name = "#", .group = .connection, .help = "Seconds to wait for the connection to open. Defaults to the library's timeout." },
     .{ .id = .connection, .long = "connection", .short = 'C', .arg = .required, .arg_name = "name", .group = .connection, .help = "Connect with a saved connection from ~/.config/thysql/connections." },
     .{ .id = .auth_command, .long = "auth-command", .arg = .required, .arg_name = "command", .group = .connection, .help = "Run this shell command to get the password, on every connect and reconnect." },
+    .{ .id = .keychain, .long = "keychain", .group = .connection, .help = "Get the password from the macOS keychain, for the connection name or --keychain-account." },
+    .{ .id = .keychain_account, .long = "keychain-account", .arg = .required, .arg_name = "name", .group = .connection, .help = "Keychain account for the password. Defaults to the connection name." },
     .{ .id = .ssl, .long = "ssl", .arg = .optional, .group = .connection, .help = "Use TLS when the server offers it. This is the default." },
     .{ .id = .skip_ssl, .long = "skip-ssl", .group = .connection, .help = "Do not use TLS." },
     .{ .id = .ssl_ca, .long = "ssl-ca", .arg = .required, .arg_name = "file", .group = .connection, .help = "CA certificate file in PEM format. Implies --ssl." },
@@ -178,6 +183,8 @@ pub const Options = struct {
     host: []const u8 = "",
     user: []const u8 = "",
     password_source: PasswordSource = .{ .literal = "" },
+    /// From --keychain-account. Null when not given. It names the account whenever a keychain source is set.
+    keychain_account: ?[]const u8 = null,
     database: []const u8 = "",
     port: u32 = 3306,
     socket: []const u8 = "",
@@ -504,6 +511,12 @@ fn applySetting(allocator: Allocator, options: *Options, setting: OptionFile.Set
     try apply(allocator, options, spec.id, setting.value);
 }
 
+/// Makes the keychain the password source. The account is --keychain-account when it was given, else
+/// the connection name, which `password.fetch` fills in.
+fn useKeychain(options: *Options) void {
+    options.password_source = .{ .keychain = options.keychain_account orelse "" };
+}
+
 /// Applies a flag from an option file with its value (a bare flag means on).
 /// As in MariaDB, `skip-x=0` turns the positive form on, and `x=0` turns the flag off.
 fn applyFileFlag(options: *Options, id: Id, enabled: bool) void {
@@ -524,6 +537,8 @@ fn applyFileFlag(options: *Options, id: Id, enabled: bool) void {
         .reconnect => options.reconnect = enabled,
         .skip_reconnect => options.reconnect = !enabled,
         .no_parser => options.parser = !enabled,
+        // keychain = 0 leaves the password source as it is.
+        .keychain => if (enabled) useKeychain(options),
         // Every other flag is caught by the spec-coverage test below.
         else => unreachable,
     }
@@ -547,6 +562,12 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         // -C is found by connectionArg before parsing, and the resolved name is set by the caller.
         .connection => {},
         .auth_command => options.password_source = .{ .command = try requiredValue(value) },
+        .keychain => useKeychain(options),
+        .keychain_account => {
+            const account = try requiredValue(value);
+            options.keychain_account = account;
+            options.password_source = .{ .keychain = account };
+        },
         .ssl => options.tls.enabled = try boolValue(value),
         .skip_ssl => options.tls.enabled = false,
         .ssl_ca => try setTlsPath(options, &options.tls.ca, value),
@@ -860,7 +881,7 @@ test "delimiter option takes a value that is not empty or backslashed" {
 }
 
 test "usage lists every option in its group" {
-    var buffer: [4096]u8 = undefined;
+    var buffer: [8192]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buffer);
     try renderUsage(&out);
     const text = out.buffered();
@@ -877,6 +898,7 @@ test "usage lists every option in its group" {
     try std.testing.expect(std.mem.indexOf(u8, text, "  -S, --socket=path") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --ssl-ca=file") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --skip-ssl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --keychain-account=name") != null);
 }
 
 test "-P selects tcp and -S selects the socket; the last flag wins" {
@@ -1084,7 +1106,7 @@ test "prompt, auto-rehash, and reconnect flags, with their negative forms" {
 }
 
 test "usage describes the optional pager command and the tee file" {
-    var buffer: [4096]u8 = undefined;
+    var buffer: [8192]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buffer);
     try renderUsage(&out);
     const text = out.buffered();

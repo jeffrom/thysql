@@ -5,6 +5,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Options = @import("options.zig");
+const Keychain = @import("keychain.zig");
 
 /// A password for one connect. It is NUL-terminated for the C library. `deinit` zeroes
 /// the bytes before freeing them.
@@ -64,9 +65,34 @@ pub fn fetch(allocator: Allocator, io: std.Io, source: Options.PasswordSource, c
             return .{ .bytes = try readHiddenLine(allocator, io, context.stderr, "Enter password: "), .allocator = allocator };
         },
         .command => |command| return runCommand(allocator, io, command, context),
-        // Later step: the keychain.
-        .keychain => return error.Unsupported,
+        .keychain => |account| return fetchKeychain(allocator, io, account, context),
     }
+}
+
+/// Reads the keychain password for `account`, or for the connection name when `account` is "".
+/// When it is not stored, the hint says how to store it. Interactive, a prompt follows the hint;
+/// otherwise the connect fails with `error.KeychainNotFound`.
+fn fetchKeychain(allocator: Allocator, io: std.Io, account: []const u8, context: FetchContext) !Secret {
+    const from_connection = account.len == 0;
+    const name = if (from_connection) context.target.connection else account;
+    if (name.len == 0) {
+        try report(context, "keychain needs -C or --keychain-account\n", .{});
+        return error.KeychainNeedsAccount;
+    }
+    return Keychain.get(allocator, Keychain.pathFromEnv(context.env), name, context.stderr) catch |err| switch (err) {
+        error.NotFound => {
+            if (from_connection) {
+                try report(context, "No keychain password for \"{s}\"; store one with: thysql keychain set {s}\n", .{ name, name });
+            } else {
+                try report(context, "No keychain password for \"{s}\"; store one with: thysql keychain set --account={s}\n", .{ name, name });
+            }
+            if (!context.interactive) {
+                return error.KeychainNotFound;
+            }
+            return .{ .bytes = try readHiddenLine(allocator, io, context.stderr, "Enter password: "), .allocator = allocator };
+        },
+        else => return err,
+    };
 }
 
 /// Runs `/bin/sh -c command` and returns the first line of its stdout. stderr is inherited,
@@ -230,6 +256,15 @@ pub const Supplier = struct {
     }
 };
 
+/// Reads a password line for `thysql keychain set`. A terminal gets a hidden prompt on stderr.
+/// Piped input is read as it is, and the prompt is not shown.
+pub fn readPassword(allocator: Allocator, io: std.Io, stderr: *std.Io.Writer, prompt: []const u8, interactive: bool) ![:0]u8 {
+    if (interactive) {
+        return readHiddenLine(allocator, io, stderr, prompt);
+    }
+    return readStdinLine(allocator, io);
+}
+
 /// Reads a line from stdin with echo off. The prompt goes to stderr.
 fn readHiddenLine(allocator: Allocator, io: std.Io, stderr: *std.Io.Writer, prompt: []const u8) ![:0]u8 {
     try stderr.print("{s}", .{prompt});
@@ -243,6 +278,11 @@ fn readHiddenLine(allocator: Allocator, io: std.Io, stderr: *std.Io.Writer, prom
     defer std.posix.tcsetattr(stdin_fd, .NOW, original_term) catch {};
     defer stderr.print("\n", .{}) catch {};
 
+    return readStdinLine(allocator, io);
+}
+
+/// Reads one line from stdin, without its line ending. It stops at a newline or a carriage return.
+fn readStdinLine(allocator: Allocator, io: std.Io) ![:0]u8 {
     var stdin_buffer: [128]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
     var line: std.ArrayList(u8) = .empty;
@@ -350,6 +390,16 @@ test "auth command failures are reported on stderr, and an empty password is an 
     const printed = stderr.buffered();
     try std.testing.expect(std.mem.indexOf(u8, printed, "auth command failed with exit status 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, printed, "auth command printed no password\n") != null);
+}
+
+test "keychain without an account or -C says what to add, and does not reach the keychain" {
+    var env = testEnv();
+    defer env.deinit();
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+    const context: FetchContext = .{ .interactive = false, .stderr = &stderr, .env = &env };
+    try std.testing.expectError(error.KeychainNeedsAccount, fetch(std.testing.allocator, std.testing.io, .{ .keychain = "" }, context));
+    try std.testing.expectEqualStrings("keychain needs -C or --keychain-account\n", stderr.buffered());
 }
 
 test "auth command that runs too long is killed at the timeout" {
