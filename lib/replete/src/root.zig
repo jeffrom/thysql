@@ -189,6 +189,12 @@ pub const Repl = struct {
         // std.debug.print("key: {}\n", .{c});
     }
 
+    /// Like `readline`, but returns a sentinel-terminated copy that the caller
+    /// owns and frees with `allocator`. The copy stays valid across later lines.
+    pub fn readlineOwned(self: *Repl, allocator: std.mem.Allocator) ![:0]u8 {
+        return allocator.dupeSentinel(u8, try self.readline(), 0);
+    }
+
     /// Reads one line with the terminal `fd` in raw mode. The previous settings
     /// are restored before this returns, whether the line was accepted,
     /// cancelled, hit end of input, or failed. Callers that need raw mode across
@@ -1122,6 +1128,27 @@ test "setPrompt and readlinePrompt change the prompt for later lines" {
     try std.testing.expect(std.mem.indexOf(u8, written, "db> one") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "db2-> two") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "-> three") != null);
+}
+
+test "readlineOwned copies the line so it survives the next read" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("first" ++ testKeys.enter ++ "second" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    const first = try repl.readlineOwned(allocator);
+    defer allocator.free(first);
+    try std.testing.expectEqualStrings("second", try repl.readlinePrompt("> "));
+    try std.testing.expectEqualStrings("first", first);
+    try std.testing.expectEqual(@as(u8, 0), first[first.len]);
 }
 
 test "readlineTerminal fails without reading input when fd is not a terminal" {
