@@ -50,6 +50,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // Vendored readline library (see lib/replete). Built from its own sources,
+    // not from replete's build.zig, which does not build under Zig 0.17.
+    const replete_mod = b.createModule(.{
+        .root_source_file = b.path("lib/replete/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const isocline_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -84,6 +92,7 @@ pub fn build(b: *std.Build) void {
 
     mod.addImport("mysql_c", mysql_c);
     mod.addImport("isocline_c", isocline_c);
+    mod.addImport("replete", replete_mod);
 
     mod.link_libc = true;
     mod.linkLibrary(isocline_artifact);
@@ -182,12 +191,19 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // Tests for the vendored replete readline library.
+    const replete_tests = b.addTest(.{
+        .root_module = replete_mod,
+    });
+    const run_replete_tests = b.addRunArtifact(replete_tests);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_replete_tests.step);
 
     // End-to-end tests run the installed binary against Docker containers
     // (MySQL 8.4 and MariaDB 11.4). Extra arguments go to the Python runner,
