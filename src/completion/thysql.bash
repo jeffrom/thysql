@@ -95,4 +95,6 @@ _thysql() {
     done
 }
 
-complete -o default -F _thysql thysql
+# No -o default: when the engine offers nothing (after -h, say), bash offers nothing
+# rather than file names. The files and dirs directives cover the options that take paths.
+complete -F _thysql thysql
