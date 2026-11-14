@@ -95,9 +95,12 @@ pub const Repl = struct {
     rendered_cursor_row: usize,
     quoted_next: bool,
     bracketed_paste_enabled: bool,
-    prompt_setup_written: bool,
-    prompt_selected: bool,
+    /// Prompt for the next `readline`; see `setPrompt`.
+    prompt: []const u8,
+    /// Prompt drawn for the current line; `prompt`, or the fallback when Kitty graphics are unavailable.
     active_prompt: []const u8,
+    /// Whether the terminal answered the Kitty graphics query. Null until queried.
+    kitty_graphics: ?bool,
     kills: kill.Ring,
     history_index: usize,
     saved_line: std.ArrayList(u8),
@@ -118,9 +121,9 @@ pub const Repl = struct {
             .rendered_cursor_row = 0,
             .quoted_next = false,
             .bracketed_paste_enabled = false,
-            .prompt_setup_written = false,
-            .prompt_selected = false,
+            .prompt = cfg.prompt,
             .active_prompt = cfg.prompt,
+            .kitty_graphics = null,
             .kills = try kill.Ring.init(gpa),
             .history_index = 0,
             .saved_line = .empty,
@@ -136,6 +139,22 @@ pub const Repl = struct {
         self.last_search.deinit(self.gpa);
     }
 
+    /// Sets the prompt used by later `readline` calls. The slice is not copied:
+    /// it must stay valid until the prompt is changed or the last call finishes.
+    pub fn setPrompt(self: *Repl, prompt: []const u8) void {
+        self.prompt = prompt;
+    }
+
+    /// Sets the prompt with `setPrompt`, then reads one line.
+    pub fn readlinePrompt(self: *Repl, prompt: []const u8) ![]u8 {
+        self.setPrompt(prompt);
+        return self.readline();
+    }
+
+    /// Reads one line and returns it without the newline. The slice points into
+    /// the Repl's own buffer, so it is valid only until the next call that reads
+    /// or edits a line, or until `deinit`. Copy it to keep it longer, or use
+    /// `readlineOwned`.
     pub fn readline(self: *Repl) ![]u8 {
         errdefer {
             self.disableBracketedPaste() catch {};
@@ -183,26 +202,28 @@ pub const Repl = struct {
         self.saved_line_valid = false;
         self.history_index = if (self.cfg.history) |history| history.len() else 0;
 
-        if (!self.prompt_selected) {
-            if (self.cfg.fallback_prompt) |fallback| {
-                if (std.mem.indexOf(u8, self.cfg.prompt, "\x1b_G") != null and
-                    !try self.detectKittyGraphics())
-                {
-                    self.active_prompt = fallback;
-                }
-            }
-            self.prompt_selected = true;
-        }
+        try self.selectPrompt();
 
         if (self.cfg.bracketed_paste) {
             try self.cfg.out.writeAll("\x1b[?2004h");
             self.bracketed_paste_enabled = true;
         }
-        if (!self.prompt_setup_written) {
-            try self.writePromptSetup();
-            self.prompt_setup_written = true;
-        }
+        // Each line may use a different prompt, so its Kitty setup is sent
+        // here, once per line, rather than while the line is repainted.
+        try self.writePromptSetup();
         try self.refreshLine();
+    }
+
+    /// Chooses `active_prompt` for this line. The Kitty graphics query runs at
+    /// most once per Repl, and only when a fallback exists for a Kitty prompt.
+    fn selectPrompt(self: *Repl) !void {
+        self.active_prompt = self.prompt;
+        const fallback = self.cfg.fallback_prompt orelse return;
+        if (std.mem.indexOf(u8, self.prompt, "\x1b_G") == null) return;
+        if (self.kitty_graphics == null) {
+            self.kitty_graphics = try self.detectKittyGraphics();
+        }
+        if (!self.kitty_graphics.?) self.active_prompt = fallback;
     }
 
     fn writePromptSetup(self: *Repl) !void {
@@ -1065,6 +1086,56 @@ fn expectReadline(inputBytes: []const u8, columns: usize, expectedLine: []const 
 
 test "readline reads an ordinary line" {
     try expectReadline("hello" ++ testKeys.enter, 80, "hello");
+}
+
+test "setPrompt and readlinePrompt change the prompt for later lines" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("one" ++ testKeys.enter ++ "two" ++ testKeys.enter ++ "three" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "db> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("one", try repl.readline());
+    repl.setPrompt("db2-> ");
+    try std.testing.expectEqualStrings("two", try repl.readline());
+    try std.testing.expectEqualStrings("three", try repl.readlinePrompt("-> "));
+
+    const written = output.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "db> one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "db2-> two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "-> three") != null);
+}
+
+test "kitty fallback prompt is chosen once and used for every line" {
+    const allocator = std.testing.allocator;
+    // A device-attributes reply without the Kitty OK means no graphics support.
+    var input: Io.Reader = .fixed("\x1b[?1;2c" ++ "a" ++ testKeys.enter ++ "b" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const setup = "\x1b_Ga=p,U=1,i=42,c=1,r=1,q=2\x1b\\";
+    const cfg: ReplConfig = .{
+        .prompt = "\x01" ++ setup ++ "\x02> ",
+        .fallback_prompt = "$ ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .rows = 24,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("a", try repl.readline());
+    try std.testing.expectEqualStrings("b", try repl.readline());
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, output.written(), setup));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "$ b") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), "a=q,t=d"));
 }
 
 test "kitty prompt setup is emitted only once while placeholders repaint" {
