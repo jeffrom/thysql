@@ -112,6 +112,8 @@ pub const ReplConfig = struct {
     highlighter: ?Highlighter = null,
     /// Optional suggestion of text to add after the cursor, shown dim. See `historyHinter`.
     hinter: ?Hinter = null,
+    /// Optional message about the line, drawn on the rows below it.
+    diagnoser: ?Diagnoser = null,
 };
 
 /// What a completion names. A listing colors each candidate by its kind.
@@ -154,6 +156,16 @@ pub const Hinter = struct {
     /// Passed to `hint` as its first argument.
     context: ?*anyopaque = null,
     hint: *const fn (context: ?*anyopaque, line: []const u8, cursor: usize) ?[]const u8,
+};
+
+/// Reports a problem with the line. `diagnose` gets the whole line and returns the
+/// message, or null when there is none. The message is drawn on the rows below the line
+/// and is removed when the line is accepted or cancelled. The slice it returns must stay
+/// valid until the next call.
+pub const Diagnoser = struct {
+    /// Passed to `diagnose` as its first argument.
+    context: ?*anyopaque = null,
+    diagnose: *const fn (context: ?*anyopaque, line: []const u8) ?[]const u8,
 };
 
 /// A `Hinter` whose context is a `*const History`. It suggests the rest of the newest
@@ -250,8 +262,8 @@ pub const Repl = struct {
     /// Set while the line is drawn for the last time, when it is accepted or cancelled.
     /// The hint is then left off, so that it does not stay on screen.
     final_draw: bool = false,
-    /// Whether the last drawing of the line showed a hint.
-    hint_drawn: bool = false,
+    /// Whether the last drawing of the line showed a hint or a diagnostic.
+    decorated: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
         return .{
@@ -315,13 +327,13 @@ pub const Repl = struct {
             const state: ReadEditState = try self.readEditKey();
             switch (state) {
                 ReadEditState.EOF => {
-                    try self.redrawWithoutHint();
+                    try self.redrawUndecorated();
                     try self.finishAtBottom();
                     return Io.Reader.Error.EndOfStream;
                 },
 
                 ReadEditState.Cancel => {
-                    try self.redrawWithoutHint();
+                    try self.redrawUndecorated();
                     try self.finishAtBottom();
                     return ReplError.Cancelled;
                     // try self.editStart();
@@ -329,7 +341,7 @@ pub const Repl = struct {
                 },
                 ReadEditState.Done => {
                     try self.saveEditedHistoryEntry();
-                    try self.redrawWithoutHint();
+                    try self.redrawUndecorated();
                     try self.finishAtBottom();
                     return self.buf.items;
                 },
@@ -756,10 +768,17 @@ pub const Repl = struct {
         return true;
     }
 
-    /// Redraws the line without the hint, when the hint is on screen. This is done
-    /// before the caller takes over the terminal, so the hint does not stay there.
-    fn redrawWithoutHint(self: *Repl) !void {
-        if (!self.hint_drawn) return;
+    /// The message from the diagnoser for the line, or null for none.
+    fn currentDiagnostic(self: *const Repl) ?[]const u8 {
+        const diagnoser = self.cfg.diagnoser orelse return null;
+        const message = diagnoser.diagnose(diagnoser.context, self.buf.items) orelse return null;
+        return if (message.len == 0) null else message;
+    }
+
+    /// Redraws the line without its hint and diagnostic, when either is on screen. This is
+    /// done before the caller takes over the terminal, so they do not stay there.
+    fn redrawUndecorated(self: *Repl) !void {
+        if (!self.decorated) return;
         self.final_draw = true;
         defer self.final_draw = false;
         try self.refreshLine();
@@ -1485,11 +1504,13 @@ pub const Repl = struct {
         const styles = try self.lineStyles();
         defer if (styles) |byte_styles| self.gpa.free(byte_styles);
         const hint = if (self.final_draw) "" else self.currentHint() orelse "";
-        self.hint_drawn = hint.len > 0;
+        const diagnostic = if (self.final_draw) "" else self.currentDiagnostic() orelse "";
+        self.decorated = hint.len > 0 or diagnostic.len > 0;
         var next = try display.layoutWith(self.gpa, self.active_prompt, self.buf.items, self.pos, self.cols, .{
             .styles = styles,
             .theme = self.cfg.theme,
             .hint = hint,
+            .diagnostic = diagnostic,
         });
         defer next.deinit(self.gpa);
 
@@ -2331,6 +2352,64 @@ test "history hinter suggests the rest of the newest matching entry" {
     try std.testing.expect(historyHinter(&history, "select 2 from t", 15) == null);
     try std.testing.expect(historyHinter(&history, "", 0) == null);
     try std.testing.expect(historyHinter(&history, "drop", 4) == null);
+}
+
+/// Reports "syntax error" for any line that contains "bad".
+const TestDiagnoser = struct {
+    fn diagnose(context: ?*anyopaque, line: []const u8) ?[]const u8 {
+        _ = context;
+        if (std.mem.indexOf(u8, line, "bad") != null) return "syntax error";
+        return null;
+    }
+};
+
+test "diagnostic is drawn below the line and removed when the line is accepted" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("bad" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .diagnoser = .{ .diagnose = TestDiagnoser.diagnose },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    try std.testing.expectEqualStrings("bad", try repl.readline());
+
+    const written = output.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[38;5;160msyntax error\x1b[0m") != null);
+    const last_message = std.mem.lastIndexOf(u8, written, "syntax error").?;
+    try std.testing.expect(std.mem.lastIndexOf(u8, written, "> bad\x1b[0K") .? > last_message);
+}
+
+test "diagnostic rows are counted, so that a redraw without them clears them" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("");
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .rows = 24,
+        .diagnoser = .{ .diagnose = TestDiagnoser.diagnose },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    repl.cols = 80;
+    repl.rows = 24;
+    try repl.buf.appendSlice(allocator, "bad");
+    repl.pos = 3;
+
+    try repl.refreshLine();
+    try std.testing.expectEqual(@as(usize, 2), repl.rendered_rows);
+    try repl.editBackspace();
+    try std.testing.expectEqual(@as(usize, 1), repl.rendered_rows);
+    try std.testing.expectEqual(@as(usize, 0), repl.rendered_cursor_row);
 }
 
 test "readline ctrl-c cancels the current line" {
