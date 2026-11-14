@@ -1186,6 +1186,7 @@ test {
         @import("options.zig"),
         @import("prompt.zig"),
         @import("readline.zig"),
+        @import("sql/keywords.zig"),
         @import("sql_completion.zig"),
         @import("unicode.zig"),
     };
