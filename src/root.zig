@@ -747,7 +747,11 @@ fn readOneLine(
 
     const line = switch (try context.readline.one(prompt)) {
         .line => |text| text,
-        .cancelled => return false,
+        .cancelled => {
+            // Ctrl-C drops the whole pending statement, as \c does, so the next prompt is the primary one.
+            scanner.reset();
+            return false;
+        },
         .eof => return true,
     };
     defer db.allocator.free(line);
@@ -1153,6 +1157,21 @@ test "editor command falls back past empty environment values" {
 test "trim right bytes keeps leading whitespace" {
     try std.testing.expectEqualStrings("  select 1", trimRightBytes("  select 1\r\n", "\r\n"));
     try std.testing.expectEqualStrings("  \nselect 1", trimRightBytes("  \nselect 1", "\r\n"));
+}
+
+test "ctrl-c at a continuation prompt discards the pending statement" {
+    // readOneLine calls scanner.reset() when the line is cancelled. The next prompt must then be the main one.
+    var scanner: Batch.Scanner = .{};
+    defer scanner.deinit(std.testing.allocator);
+
+    for ("select 1") |byte| {
+        _ = try scanner.feed(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqual(Batch.Scanner.PromptKind.continuation, scanner.promptKind());
+
+    scanner.reset();
+    try std.testing.expectEqual(Batch.Scanner.PromptKind.main, scanner.promptKind());
+    try std.testing.expectEqualStrings("", scanner.buffer.items);
 }
 
 test {
