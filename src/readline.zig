@@ -5,8 +5,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const replete = @import("replete");
 
+const Batch = @import("batch.zig");
 const history_file = @import("history_file.zig");
 const SqlCompletion = @import("sql_completion.zig");
+const SqlLexer = @import("sql/lexer.zig");
 
 /// What `Session.one` read.
 pub const Outcome = union(enum) {
@@ -36,6 +38,10 @@ pub const Session = struct {
     history: ?replete.FileHistory = null,
     /// The highlight spans of the line being drawn. The highlighter returns them.
     spans: std.ArrayList(replete.Span) = .empty,
+    /// The statement being typed, while `one` reads a line. The highlighter lexes it with the line.
+    scanner: ?*Batch.Scanner = null,
+    /// Scratch space where the highlighter joins the statement so far and the line.
+    joined: std.ArrayList(u8) = .empty,
 
     /// Sets up the line editor for the interactive client. Lines are read from stdin and
     /// written to `out`. Tab completes the SQL keywords and the words in `names`, which the
@@ -77,14 +83,18 @@ pub const Session = struct {
         self.repl.deinit();
         if (self.history) |*file| file.deinit();
         self.spans.deinit(self.gpa);
+        self.joined.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
-    /// Reads one line, shown after `prompt`. Ctrl-C and Ctrl-D come back as outcomes rather
-    /// than errors. The terminal is in raw mode only while the line is being edited, so a
-    /// query that runs afterwards gets the normal terminal settings.
-    pub fn one(self: *Session, prompt: []const u8) !Outcome {
+    /// Reads one line, shown after `prompt`. `pending` is the statement that the line continues,
+    /// which the highlighter reads. Ctrl-C and Ctrl-D come back as outcomes rather than errors.
+    /// The terminal is in raw mode only while the line is being edited, so a query that runs
+    /// afterwards gets the normal terminal settings.
+    pub fn one(self: *Session, prompt: []const u8, pending: *Batch.Scanner) !Outcome {
         self.repl.setPrompt(prompt);
+        self.scanner = pending;
+        defer self.scanner = null;
         const term = try replete.TermState.enable(self.fd);
         defer term.disable();
 
@@ -134,55 +144,60 @@ fn openHistory(allocator: Allocator, io: std.Io, env: *const std.process.Environ
 fn highlightLine(context: ?*anyopaque, line: []const u8) []const replete.Span {
     const session: *Session = @ptrCast(@alignCast(context.?));
     session.spans.clearRetainingCapacity();
-    sqlSpans(session.gpa, line, &session.spans) catch {};
+    appendSpans(session.gpa, &session.joined, &session.spans, session.scanner, line) catch {};
     return session.spans.items;
 }
 
-/// Appends spans for the SQL keywords (whole words, any case) and the quoted strings in `line`.
-fn sqlSpans(gpa: Allocator, line: []const u8, spans: *std.ArrayList(replete.Span)) Allocator.Error!void {
-    var i: usize = 0;
-    while (i < line.len) {
-        if (line[i] == '\'' or line[i] == '"') {
-            const end = quotedEnd(line, i);
-            try spans.append(gpa, .{ .start = i, .len = end - i, .style = .string });
-            i = end;
-        } else if (isSqlWordByte(line[i])) {
-            var end = i;
-            while (end < line.len and isSqlWordByte(line[end])) end += 1;
-            if (isKeyword(line[i..end])) {
-                try spans.append(gpa, .{ .start = i, .len = end - i, .style = .keyword });
-            }
-            i = end;
-        } else {
-            i += 1;
+/// Appends spans for the SQL in `line`. The statement so far, which `scanner` holds, is lexed
+/// before the line, so that a string or comment opened on an earlier line is styled here too.
+/// Only the bytes of `line` get spans. `joined` is scratch space for the two parts.
+fn appendSpans(
+    gpa: Allocator,
+    joined: *std.ArrayList(u8),
+    spans: *std.ArrayList(replete.Span),
+    scanner: ?*Batch.Scanner,
+    line: []const u8,
+) Allocator.Error!void {
+    var options: SqlLexer.Options = .{};
+    var prefix: usize = 0;
+    joined.clearRetainingCapacity();
+    if (scanner) |batch| {
+        options.delimiter = batch.delimiterText();
+        const pending = batch.pendingQuery().sql;
+        if (pending.len > 0) {
+            try joined.appendSlice(gpa, pending);
+            try joined.append(gpa, '\n');
+            prefix = joined.items.len;
         }
+    }
+    try joined.appendSlice(gpa, line);
+
+    var lexer = SqlLexer.Lexer.init(joined.items, options);
+    while (lexer.next()) |tok| {
+        const style = styleOf(tok.kind) orelse continue;
+        if (tok.end <= prefix) continue;
+        const start = @max(tok.start, prefix);
+        try spans.append(gpa, .{ .start = start - prefix, .len = tok.end - start, .style = style });
     }
 }
 
-/// The end of the quoted string that starts at `start`: just past its closing quote, or the end of
-/// the line when it is not closed. A doubled quote and a backslash-escaped byte stay inside it.
-fn quotedEnd(line: []const u8, start: usize) usize {
-    const quote = line[start];
-    var i = start + 1;
-    while (i < line.len) : (i += 1) {
-        if (line[i] == '\\') {
-            i += 1;
-        } else if (line[i] == quote) {
-            if (i + 1 < line.len and line[i + 1] == quote) {
-                i += 1;
-            } else {
-                return i + 1;
-            }
-        }
-    }
-    return line.len;
-}
-
-fn isKeyword(word: []const u8) bool {
-    for (SqlCompletion.keywords) |keyword| {
-        if (std.ascii.eqlIgnoreCase(keyword, word)) return true;
-    }
-    return false;
+/// The style for a token of `kind`. Null for the text that is drawn plain.
+fn styleOf(kind: SqlLexer.Kind) ?replete.Style {
+    return switch (kind) {
+        .reserved_keyword => .keyword,
+        .keyword => .keyword_nonreserved,
+        .function => .function,
+        .identifier => .identifier,
+        .quoted_identifier => .quoted_identifier,
+        .string => .string,
+        .number => .number,
+        .comment, .optimizer_hint, .version_comment_start, .version_comment_end => .comment,
+        .variable, .placeholder => .variable,
+        .operator => .operator,
+        .delimiter => .delimiter,
+        .client_command => .client_command,
+        .whitespace, .dot, .punctuation, .unknown => null,
+    };
 }
 
 /// Offers the keywords and names that start with the word before the cursor. A word is
@@ -246,40 +261,91 @@ test "completion treats dots as part of the word" {
     try std.testing.expectEqualStrings("people.name", candidates.list.items[0].text);
 }
 
-fn expectSpans(line: []const u8, expected: []const replete.Span) !void {
+fn expectSpans(scanner: ?*Batch.Scanner, line: []const u8, expected: []const replete.Span) !void {
+    const allocator = std.testing.allocator;
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(allocator);
     var spans: std.ArrayList(replete.Span) = .empty;
-    defer spans.deinit(std.testing.allocator);
-    try sqlSpans(std.testing.allocator, line, &spans);
+    defer spans.deinit(allocator);
+    try appendSpans(allocator, &joined, &spans, scanner, line);
     try std.testing.expectEqualSlices(replete.Span, expected, spans.items);
 }
 
-test "highlighting marks keywords in any case and quoted strings" {
-    try expectSpans("select 'a b' FROM t", &.{
+test "highlighting marks keywords, functions, names and operators" {
+    try expectSpans(null, "select a.b, count(*) from t -- x", &.{
         .{ .start = 0, .len = 6, .style = .keyword },
-        .{ .start = 7, .len = 5, .style = .string },
-        .{ .start = 13, .len = 4, .style = .keyword },
+        .{ .start = 7, .len = 1, .style = .identifier },
+        .{ .start = 9, .len = 1, .style = .identifier },
+        .{ .start = 12, .len = 5, .style = .function },
+        .{ .start = 18, .len = 1, .style = .operator },
+        .{ .start = 21, .len = 4, .style = .keyword },
+        .{ .start = 26, .len = 1, .style = .identifier },
+        .{ .start = 28, .len = 4, .style = .comment },
     });
 }
 
+test "highlighting marks keywords in any case and quoted strings" {
+    try expectSpans(null, "select 'a b' FROM t", &.{
+        .{ .start = 0, .len = 6, .style = .keyword },
+        .{ .start = 7, .len = 5, .style = .string },
+        .{ .start = 13, .len = 4, .style = .keyword },
+        .{ .start = 18, .len = 1, .style = .identifier },
+    });
+}
+
+test "a non-reserved keyword has its own style" {
+    try expectSpans(null, "account", &.{.{ .start = 0, .len = 7, .style = .keyword_nonreserved }});
+}
+
 test "highlighting skips keywords inside names and strings" {
-    try expectSpans("selected 'select' \"and\" x_and", &.{
+    try expectSpans(null, "selected 'select' \"and\" x_and", &.{
+        .{ .start = 0, .len = 8, .style = .identifier },
         .{ .start = 9, .len = 8, .style = .string },
         .{ .start = 18, .len = 5, .style = .string },
+        .{ .start = 24, .len = 5, .style = .identifier },
     });
 }
 
 test "a doubled quote or a backslash keeps a string going, and an open string runs to the end" {
-    try expectSpans("'select''x' select", &.{
+    try expectSpans(null, "'select''x' select", &.{
         .{ .start = 0, .len = 11, .style = .string },
         .{ .start = 12, .len = 6, .style = .keyword },
     });
-    try expectSpans("'it\\'s' and", &.{
+    try expectSpans(null, "'it\\'s' and", &.{
         .{ .start = 0, .len = 7, .style = .string },
         .{ .start = 8, .len = 3, .style = .keyword },
     });
-    try expectSpans("x 'abc and", &.{
+    try expectSpans(null, "x 'abc and", &.{
+        .{ .start = 0, .len = 1, .style = .identifier },
         .{ .start = 2, .len = 8, .style = .string },
     });
+}
+
+test "a string opened on an earlier line is styled on the line that continues it" {
+    const allocator = std.testing.allocator;
+    var scanner: Batch.Scanner = .{};
+    defer scanner.deinit(allocator);
+    for ("select 'first\n") |byte| {
+        _ = try scanner.feed(allocator, byte);
+    }
+    try expectSpans(&scanner, "second' from t", &.{
+        .{ .start = 0, .len = 7, .style = .string },
+        .{ .start = 8, .len = 4, .style = .keyword },
+        .{ .start = 13, .len = 1, .style = .identifier },
+    });
+}
+
+test "the statement delimiter from the scanner and client commands are styled" {
+    const allocator = std.testing.allocator;
+    var scanner: Batch.Scanner = .{};
+    defer scanner.deinit(allocator);
+    try scanner.setDelimiter("$$");
+    try expectSpans(&scanner, "a$$", &.{
+        .{ .start = 0, .len = 1, .style = .identifier },
+        .{ .start = 1, .len = 2, .style = .delimiter },
+    });
+    try expectSpans(null, "DELIMITER $$", &.{.{ .start = 0, .len = 12, .style = .client_command }});
+    try expectSpans(null, "\\G", &.{.{ .start = 0, .len = 2, .style = .client_command }});
 }
 
 test "completion with an empty word offers nothing" {

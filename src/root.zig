@@ -745,7 +745,7 @@ fn readOneLine(
     const prompt = try interactivePrompt(context, scanner);
     defer db.allocator.free(prompt);
 
-    const line = switch (try context.readline.one(prompt)) {
+    const line = switch (try context.readline.one(prompt, context.scanner)) {
         .line => |text| text,
         .cancelled => {
             // Ctrl-C drops the whole pending statement, as \c does, so the next prompt is the primary one.
