@@ -38,6 +38,17 @@ const LastCommand = enum {
     insert,
 };
 
+/// How much of a hint `acceptHint` takes.
+const HintPart = enum { whole, word };
+
+/// The end of the first word of a hint: its leading blanks, then the non-blank bytes after them.
+fn hintWordEnd(hint: []const u8) usize {
+    var end: usize = 0;
+    while (end < hint.len and std.ascii.isWhitespace(hint[end])) end += 1;
+    while (end < hint.len and !std.ascii.isWhitespace(hint[end])) end += 1;
+    return end;
+}
+
 const KeyCode = enum(u8) {
     KEY_NULL = 0,
     CTRL_A = 1,
@@ -99,6 +110,8 @@ pub const ReplConfig = struct {
     theme: highlight.Theme = .{},
     /// Optional syntax highlighting, run on each redraw of the line.
     highlighter: ?Highlighter = null,
+    /// Optional suggestion of text to add after the cursor, shown dim. See `historyHinter`.
+    hinter: ?Hinter = null,
 };
 
 /// What a completion names. A listing colors each candidate by its kind.
@@ -131,6 +144,33 @@ pub const Highlighter = struct {
     context: ?*anyopaque = null,
     highlight: *const fn (context: ?*anyopaque, line: []const u8) []const highlight.Span,
 };
+
+/// Suggests text to add at the end of the line. It is called only with the cursor at the
+/// end, and `hint` returns the suggestion, or null for none. The suggestion is drawn after
+/// the cursor and is not part of the line; Right, Ctrl-F or End at the end of the line
+/// accepts all of it, and Meta-F accepts its first word. The slice it returns must stay
+/// valid until the line is accepted or the next call.
+pub const Hinter = struct {
+    /// Passed to `hint` as its first argument.
+    context: ?*anyopaque = null,
+    hint: *const fn (context: ?*anyopaque, line: []const u8, cursor: usize) ?[]const u8,
+};
+
+/// A `Hinter` whose context is a `*const History`. It suggests the rest of the newest
+/// history entry that starts with the line, and nothing for an empty line.
+pub fn historyHinter(context: ?*anyopaque, line: []const u8, cursor: usize) ?[]const u8 {
+    if (line.len == 0 or cursor != line.len) return null;
+    const history: *const History = @ptrCast(@alignCast(context.?));
+    var index = history.len();
+    while (index > 0) {
+        index -= 1;
+        const entry = history.get(index) orelse continue;
+        if (entry.line.len > line.len and std.mem.startsWith(u8, entry.line, line)) {
+            return entry.line[line.len..];
+        }
+    }
+    return null;
+}
 
 /// The candidates a `Completer` offers for the word being completed. Each candidate
 /// must stay valid until the completer returns, since replete only reads it during
@@ -207,6 +247,11 @@ pub const Repl = struct {
     lastCommand: LastCommand = .other,
     /// Whether the previous key was Tab, so a second Tab lists the candidates.
     tab_pending: bool = false,
+    /// Set while the line is drawn for the last time, when it is accepted or cancelled.
+    /// The hint is then left off, so that it does not stay on screen.
+    final_draw: bool = false,
+    /// Whether the last drawing of the line showed a hint.
+    hint_drawn: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
         return .{
@@ -270,11 +315,13 @@ pub const Repl = struct {
             const state: ReadEditState = try self.readEditKey();
             switch (state) {
                 ReadEditState.EOF => {
+                    try self.redrawWithoutHint();
                     try self.finishAtBottom();
                     return Io.Reader.Error.EndOfStream;
                 },
 
                 ReadEditState.Cancel => {
+                    try self.redrawWithoutHint();
                     try self.finishAtBottom();
                     return ReplError.Cancelled;
                     // try self.editStart();
@@ -282,6 +329,7 @@ pub const Repl = struct {
                 },
                 ReadEditState.Done => {
                     try self.saveEditedHistoryEntry();
+                    try self.redrawWithoutHint();
                     try self.finishAtBottom();
                     return self.buf.items;
                 },
@@ -676,7 +724,45 @@ pub const Repl = struct {
         if (self.pos < self.buf.items.len) {
             self.pos += unicode.codepointLenAt(self.buf.items, self.pos);
             try self.refreshLine();
+        } else {
+            _ = try self.acceptHint(.whole);
         }
+    }
+
+    /// The End key. At the end of the line it accepts the hint, and otherwise it moves to the end.
+    fn editEndKey(self: *Repl) !void {
+        if (try self.acceptHint(.whole)) return;
+        try self.editEndOfLine();
+    }
+
+    /// The hint for the line, when the cursor is at its end and the hinter has one.
+    fn currentHint(self: *const Repl) ?[]const u8 {
+        const hinter = self.cfg.hinter orelse return null;
+        if (self.pos != self.buf.items.len) return null;
+        const hint = hinter.hint(hinter.context, self.buf.items, self.pos) orelse return null;
+        return if (hint.len == 0) null else hint;
+    }
+
+    /// Inserts the hint, or its first word, at the end of the line. Returns false when no
+    /// hint is shown.
+    fn acceptHint(self: *Repl, part: HintPart) !bool {
+        const hint = self.currentHint() orelse return false;
+        const take = switch (part) {
+            .whole => hint.len,
+            .word => hintWordEnd(hint),
+        };
+        try self.recordUndo(false);
+        try self.editInsertSlice(hint[0..take]);
+        return true;
+    }
+
+    /// Redraws the line without the hint, when the hint is on screen. This is done
+    /// before the caller takes over the terminal, so the hint does not stay there.
+    fn redrawWithoutHint(self: *Repl) !void {
+        if (!self.hint_drawn) return;
+        self.final_draw = true;
+        defer self.final_draw = false;
+        try self.refreshLine();
     }
 
     fn replaceBuffer(self: *Repl, line: []const u8, point: ?usize) !void {
@@ -1286,7 +1372,8 @@ pub const Repl = struct {
                 return .other;
             },
             'f', 'F' => {
-                try self.editForwardWord();
+                // With a hint shown, Meta-F accepts its first word.
+                if (!(try self.acceptHint(.word))) try self.editForwardWord();
                 return .other;
             },
             'd', 'D' => {
@@ -1354,14 +1441,14 @@ pub const Repl = struct {
             'C' => try self.editMoveRight(),
             'D' => try self.editMoveLeft(),
             'H' => try self.editStartOfLine(),
-            'F' => try self.editEndOfLine(),
+            'F' => try self.editEndKey(),
             '~' => switch (parameter orelse return) {
                 1, 7 => try self.editStartOfLine(),
                 3 => if (self.pos < self.buf.items.len) {
                     try self.recordUndo(false);
                     try self.editDelete();
                 },
-                4, 8 => try self.editEndOfLine(),
+                4, 8 => try self.editEndKey(),
                 200 => try self.editBracketedPaste(),
                 else => {},
             },
@@ -1397,9 +1484,12 @@ pub const Repl = struct {
         }
         const styles = try self.lineStyles();
         defer if (styles) |byte_styles| self.gpa.free(byte_styles);
+        const hint = if (self.final_draw) "" else self.currentHint() orelse "";
+        self.hint_drawn = hint.len > 0;
         var next = try display.layoutWith(self.gpa, self.active_prompt, self.buf.items, self.pos, self.cols, .{
             .styles = styles,
             .theme = self.cfg.theme,
+            .hint = hint,
         });
         defer next.deinit(self.gpa);
 
@@ -1527,6 +1617,7 @@ const testKeys = struct {
     const ctrl_w = "\x17";
     const ctrl_y = "\x19";
     const left = "\x1b[D";
+    const right = "\x1b[C";
     const up = "\x1b[A";
     const down = "\x1b[B";
     const home = "\x1b[H";
@@ -2148,6 +2239,98 @@ test "errors are drawn as a curly underline, or a straight one without undercurl
     defer plain_repl.deinit();
     try std.testing.expectEqualStrings("x", try plain_repl.readline());
     try std.testing.expect(std.mem.indexOf(u8, plain_output.written(), "\x1b[4mx\x1b[0m") != null);
+}
+
+/// Suggests " world" after "hello", and " world again" after nothing else.
+const TestHinter = struct {
+    fn hint(context: ?*anyopaque, line: []const u8, cursor: usize) ?[]const u8 {
+        _ = context;
+        _ = cursor;
+        if (std.mem.eql(u8, line, "hello")) return " world";
+        return null;
+    }
+};
+
+const hello_hinter: Hinter = .{ .hint = TestHinter.hint };
+
+test "right arrow accepts the hint at the end of the line" {
+    try expectReadlineWithHinter("hello" ++ testKeys.right ++ testKeys.enter, "hello world");
+}
+
+test "ctrl-f accepts the hint at the end of the line" {
+    try expectReadlineWithHinter("hello" ++ testKeys.ctrl_f ++ testKeys.enter, "hello world");
+}
+
+test "end accepts the hint at the end of the line" {
+    try expectReadlineWithHinter("hello" ++ testKeys.end ++ testKeys.enter, "hello world");
+}
+
+test "right arrow in the middle of the line does not accept the hint" {
+    try expectReadlineWithHinter("hello" ++ testKeys.left ++ testKeys.right ++ testKeys.enter, "hello");
+}
+
+test "a hint is not part of the line unless it is accepted" {
+    try expectReadlineWithHinter("hello" ++ testKeys.enter, "hello");
+}
+
+test "meta-f accepts the first word of the hint" {
+    try expectReadlineWithHinter("hello" ++ testKeys.meta_f ++ testKeys.enter, "hello world");
+}
+
+test "the hint is drawn dim after the cursor and gone once the line is accepted" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("hello" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .hinter = hello_hinter,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    try std.testing.expectEqualStrings("hello", try repl.readline());
+
+    const written = output.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "> hello\x1b[2m world\x1b[0m") != null);
+    // The last drawing of the line leaves the hint off.
+    const last_hint = std.mem.lastIndexOf(u8, written, "world").?;
+    try std.testing.expect(std.mem.lastIndexOf(u8, written, "> hello\x1b[0K") .? > last_hint);
+}
+
+fn expectReadlineWithHinter(inputBytes: []const u8, expectedLine: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed(inputBytes);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .hinter = hello_hinter,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings(expectedLine, try repl.readline());
+}
+
+test "history hinter suggests the rest of the newest matching entry" {
+    const allocator = std.testing.allocator;
+    var history = History.init(allocator, .{});
+    defer history.deinit();
+    _ = try history.add("select 1", 0);
+    _ = try history.add("select 2 from t", 0);
+    _ = try history.add("show tables", 0);
+
+    try std.testing.expectEqualStrings(" 2 from t", historyHinter(&history, "select", 6).?);
+    try std.testing.expectEqualStrings("ables", historyHinter(&history, "show t", 6).?);
+    try std.testing.expect(historyHinter(&history, "select 2 from t", 15) == null);
+    try std.testing.expect(historyHinter(&history, "", 0) == null);
+    try std.testing.expect(historyHinter(&history, "drop", 4) == null);
 }
 
 test "readline ctrl-c cancels the current line" {
