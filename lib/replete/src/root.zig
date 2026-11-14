@@ -371,6 +371,10 @@ pub const Repl = struct {
                 try self.editBackwardsKillLine();
                 return ReadEditState.More;
             },
+            @intFromEnum(KeyCode.CTRL_L) => {
+                try self.editClearScreen();
+                return ReadEditState.More;
+            },
             @intFromEnum(KeyCode.CTRL_T) => {
                 try self.editTransposeChars();
                 return ReadEditState.More;
@@ -621,6 +625,15 @@ pub const Repl = struct {
         // Rotating left by the first segment's length swaps the two segments in place.
         std.mem.rotate(u8, buf[first..end], middle - first);
         self.pos = next_pos;
+        try self.refreshLine();
+    }
+
+    /// Clears the whole screen and redraws the prompt and line at the top.
+    fn editClearScreen(self: *Repl) !void {
+        try self.cfg.out.writeAll("\x1b[H\x1b[2J");
+        // Nothing above the cursor is rendered any more, so the redraw must not move up.
+        self.rendered_rows = 0;
+        self.rendered_cursor_row = 0;
         try self.refreshLine();
     }
 
@@ -1161,6 +1174,7 @@ const testKeys = struct {
     const ctrl_c = "\x03";
     const ctrl_d = "\x04";
     const ctrl_f = "\x06";
+    const ctrl_l = "\x0c";
     const ctrl_n = "\x0e";
     const ctrl_p = "\x10";
     const ctrl_r = "\x12";
@@ -1528,6 +1542,25 @@ test "meta-d kills the Readline word after the cursor" {
         80,
         "!one two",
     );
+}
+
+test "ctrl-l clears the screen and redraws the line at the top" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("abc" ++ testKeys.ctrl_l ++ "d" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .rows = 24,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("abcd", try repl.readline());
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[H\x1b[2J> abc") != null);
 }
 
 test "ctrl-t at the end of the line swaps the last two characters" {
