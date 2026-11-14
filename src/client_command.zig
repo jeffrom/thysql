@@ -137,7 +137,7 @@ fn parseShort(text: []const u8, body: []const u8) ?Command {
 }
 
 /// Lines for `help`, in mysql.cc's order. Only commands that thysql runs are listed.
-const help_items = [_]struct { name: []const u8, char: u8, doc: []const u8 }{
+pub const help_items = [_]struct { name: []const u8, char: u8, doc: []const u8 }{
     .{ .name = "?", .char = '?', .doc = "Synonym for `help'." },
     .{ .name = "clear", .char = 'c', .doc = "Clear the current input statement." },
     .{ .name = "connect", .char = 'r', .doc = "Reconnect to the server. Optional arguments are db and host." },
