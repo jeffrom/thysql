@@ -25,11 +25,14 @@
 #pragma once
 
 /*
- * thysql: modified from MySQL Workbench (library/parsers at dc3590db). Removed the
- * functionSymbolsForVersion() declaration (it needs Workbench symbol tables) and the
- * base/symbol-info.h include.
+ * thysql: modified from MySQL Workbench (library/parsers at dc3590db). functionSymbolsForVersion()
+ * returns the system function names as a set instead of a SymbolTable, which is not vendored.
  */
 
+#include <set>
+#include <string>
+
+#include "base/symbol-info.h"
 #include "parsers-common.h"
 
 namespace antlr4 {
@@ -82,5 +85,8 @@ namespace parsers {
                                                         std::pair<size_t, size_t> position);
     static antlr4::tree::ParseTree* contextFromPosition(antlr4::tree::ParseTree *root, size_t position);
   };
+
+  // The system function names of a server version (lower case). The set lives as long as the program.
+  std::set<std::string> const& functionSymbolsForVersion(base::MySQLVersion version);
 
 }

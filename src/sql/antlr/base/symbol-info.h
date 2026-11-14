@@ -1,53 +1,62 @@
 /*
- * Local replacement for the MySQL Workbench header base/symbol-info.h.
+ * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
  *
- * Workbench's version carries per-release keyword and reserved word tables.
- * Only the entry points used by MySQLBaseLexer.cpp are provided here, with
- * the following simplifications (see src/sql/antlr/README.md):
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License, version 2.0,
+ * as published by the Free Software Foundation.
  *
- *   - isKeyword() accepts any non-empty name.
- *   - isReservedKeyword() accepts no name, so no keyword is reserved.
+ * This program is designed to work with certain software (including
+ * but not limited to OpenSSL) that is licensed under separate terms, as
+ * designated in a particular file or component or in included license
+ * documentation.  The authors of MySQL hereby grant you an additional
+ * permission to link the program and your derivative works with the
+ * separately licensed software that they have either included with
+ * the program or referenced in the documentation.
+ * This program is distributed in the hope that it will be useful,  but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
+ * the GNU General Public License, version 2.0, for more details.
  *
- * Version gating in the grammar itself ({serverVersion >= N}? predicates) is
- * unaffected. Replace these with the real keyword tables before relying on
- * isIdentifier() or keyword classification.
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+/*
+ * thysql: modified from MySQL Workbench (library/base at dc3590db). Changes:
+ *   - BASELIBRARY_PUBLIC_FUNC removed (no export macros in this build).
+ *   - MySQL84 added, with its own keyword table (keyword_list84.h).
+ *   - The keyword lookups accept any letter case (see symbol-info.cpp).
+ * See src/sql/antlr/README.md.
  */
 
 #pragma once
 
+// Provides MySQL symbol information for various tasks, like symbol tables, identifier quoting + code completion.
+
+#include <set>
 #include <string>
 
 namespace base {
 
-  // A MySQL server version, encoded like MySQLRecognizerCommon::serverVersion
-  // (major * 10000 + minor * 100 + patch, e.g. 80400 for 8.4.0).
-  struct MySQLVersion {
-    long number = 0;
+// Currently supported MySQL versions.
+enum class MySQLVersion {
+  Unknown,
+  MySQL56,
+  MySQL57,
+  MySQL80,
+  MySQL84,
+};
 
-    bool operator<(const MySQLVersion &other) const { return number < other.number; }
-    bool operator==(const MySQLVersion &other) const { return number == other.number; }
-  };
+class MySQLSymbolInfo {
+public:
+  static std::set<std::string> const& systemFunctionsForVersion(MySQLVersion version);
+  static std::set<std::string> const& keywordsForVersion(MySQLVersion version);
 
-  class MySQLSymbolInfo {
-  public:
-    static MySQLVersion numberToVersion(long number) {
-      MySQLVersion version;
-      version.number = number;
-      return version;
-    }
+  static bool isReservedKeyword(std::string const& identifier, MySQLVersion version);
+  static bool isKeyword(std::string const& identifier, MySQLVersion version);
 
-    // True if the name (lower case, without quotes) is a keyword of the given version.
-    static bool isKeyword(const std::string &name, MySQLVersion version) {
-      (void)version;
-      return !name.empty();
-    }
+  static MySQLVersion numberToVersion(long version);
+};
 
-    // True if the name is a reserved word of the given version (cannot be an unquoted identifier).
-    static bool isReservedKeyword(const std::string &name, MySQLVersion version) {
-      (void)name;
-      (void)version;
-      return false;
-    }
-  };
-
-} // namespace base
+}

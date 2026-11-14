@@ -9,6 +9,7 @@
 #include "antlr4-runtime.h"
 #include "MySQLLexer.h"
 #include "MySQLParser.h"
+#include "base/symbol-info.h"
 
 namespace {
 
@@ -40,9 +41,37 @@ int main() {
   const Case cases[] = {
     {"SELECT a FROM t WHERE b = 1", true},
     {"SELECT a FROM t WHERE", false},
+    {"SELECT 1 AS status", true},   // STATUS is not reserved.
+    {"SELECT 1 AS select", false},  // SELECT is reserved.
   };
 
   int failures = 0;
+
+  // Symbol tables: reserved words are a subset of keywords, and lookups ignore case.
+  struct SymbolCase {
+    const char *word;
+    base::MySQLVersion version;
+    bool keyword;
+    bool reserved;
+  };
+  const SymbolCase symbols[] = {
+    {"SELECT", base::MySQLVersion::MySQL84, true, true},
+    {"select", base::MySQLVersion::MySQL84, true, true},
+    {"STATUS", base::MySQLVersion::MySQL84, true, false},
+    {"NOSUCHWORD", base::MySQLVersion::MySQL84, false, false},
+    {"GROUPS", base::MySQLVersion::MySQL80, true, true},   // Reserved since 8.0.2 (window frames).
+    {"GROUPS", base::MySQLVersion::MySQL57, false, false}, // Not a keyword before 8.0.2.
+    {"SELECT", base::MySQLVersion::MySQL57, true, true},
+  };
+  for (const SymbolCase &c : symbols) {
+    bool keyword = base::MySQLSymbolInfo::isKeyword(c.word, c.version);
+    bool reserved = base::MySQLSymbolInfo::isReservedKeyword(c.word, c.version);
+    bool ok = keyword == c.keyword && reserved == c.reserved;
+    std::printf("%s symbol %s (keyword %d, reserved %d)\n", ok ? "ok  " : "FAIL", c.word, keyword, reserved);
+    if (!ok)
+      ++failures;
+  }
+
   for (const Case &c : cases) {
     size_t errors = countSyntaxErrors(c.sql);
     bool ok = c.valid ? errors == 0 : errors > 0;

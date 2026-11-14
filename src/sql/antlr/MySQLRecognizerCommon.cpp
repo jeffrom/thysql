@@ -23,8 +23,8 @@
  */
 
 /*
- * thysql: modified from MySQL Workbench (library/parsers at dc3590db). Removed
- * functionSymbolsForVersion(), which depends on Workbench symbol tables.
+ * thysql: modified from MySQL Workbench (library/parsers at dc3590db). functionSymbolsForVersion()
+ * returns the function name set directly (see MySQLRecognizerCommon.h).
  */
 
 #include "MySQLLexer.h"
@@ -339,4 +339,10 @@ ParseTree* MySQLRecognizerCommon::contextFromPosition(ParseTree *root, size_t po
   return root;
 }
 
-//-----------------------------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------------------------
+
+std::set<std::string> const& parsers::functionSymbolsForVersion(base::MySQLVersion version) {
+  return base::MySQLSymbolInfo::systemFunctionsForVersion(version);
+}
+
+//----------------------------------------------------------------------------------------------------------------------

@@ -147,6 +147,7 @@ pub const antlr_runtime = [_][]const u8{
 /// MySQL base classes from MySQL Workbench, with local changes (see
 /// src/sql/antlr/README.md). Built as C++17.
 pub const mysql_base = [_][]const u8{
+    "src/sql/antlr/base/symbol-info.cpp",
     "src/sql/antlr/MySQLBaseLexer.cpp",
     "src/sql/antlr/MySQLBaseRecognizer.cpp",
     "src/sql/antlr/MySQLRecognizerCommon.cpp",
