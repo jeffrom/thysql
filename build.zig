@@ -89,6 +89,20 @@ pub fn build(b: *std.Build) void {
     mod.addObjectFile(mariadb.static_library);
     linkMariaDbSystemLibraries(mod, target, openssl_lib_dir);
 
+    // The macOS keychain: a C shim over Security.framework, behind src/keychain.zig. Only
+    // macOS targets compile it and link the frameworks.
+    if (target.result.os.tag == .macos) {
+        const keychain_translate = b.addTranslateC(.{
+            .root_source_file = b.path("src/keychain/keychain.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("keychain_c", keychain_translate.createModule());
+        mod.addCSourceFile(.{ .file = b.path("src/keychain/keychain_darwin.c") });
+        mod.linkFramework("Security", .{});
+        mod.linkFramework("CoreFoundation", .{});
+    }
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
