@@ -371,6 +371,11 @@ pub const Repl = struct {
                 try self.editBackwardsKillLine();
                 return ReadEditState.More;
             },
+            @intFromEnum(KeyCode.CTRL_W) => {
+                command = .kill;
+                try self.editUnixWordRubout();
+                return ReadEditState.More;
+            },
             @intFromEnum(KeyCode.CTRL_Y) => {
                 command = .yank;
                 try self.editYank();
@@ -587,26 +592,56 @@ pub const Repl = struct {
         if (self.pos == self.buf.items.len) {
             return;
         }
-
-        try self.kills.push(self.buf.items, self.pos, self.buf.items.len, self.lastCommand == .kill);
-        self.buf.items.len -= self.buf.items.len - self.pos;
-
-        try self.refreshLine();
+        try self.killTo(self.buf.items.len);
     }
 
     fn editBackwardsKillLine(self: *Repl) !void {
         if (self.pos == 0) {
             return;
         }
+        try self.killTo(0);
+    }
 
-        try self.kills.push(self.buf.items, self.pos, 0, self.lastCommand == .kill);
+    /// Kills the text between the cursor and `target` (either side of it) onto
+    /// the kill ring. Consecutive kills join the same ring entry, appending
+    /// forward kills and prepending backward ones, as in GNU Readline.
+    fn killTo(self: *Repl, target: usize) !void {
+        const start = @min(self.pos, target);
+        const end = @max(self.pos, target);
+        if (start == end) return;
 
-        const headLen = self.buf.items.len - self.pos;
-        @memmove(self.buf.items[0..self.pos][0..headLen], self.buf.items[self.pos..self.buf.items.len]);
-
-        self.buf.items.len -= self.pos;
-        self.pos = 0;
+        try self.kills.push(self.buf.items, self.pos, target, self.lastCommand == .kill);
+        const tail = self.buf.items[end..];
+        @memmove(self.buf.items[start..][0..tail.len], tail);
+        self.buf.items.len -= end - start;
+        self.pos = start;
         try self.refreshLine();
+    }
+
+    /// Start of the word behind the cursor when whitespace (space or tab) is the
+    /// only word boundary, as in readline's unix-word-rubout.
+    fn unixWordStart(self: *const Repl) usize {
+        var start = self.pos;
+        while (start > 0) {
+            const previous = unicode.codepointStartBefore(self.buf.items, start);
+            if (!isBlankByte(self.buf.items[previous])) break;
+            start = previous;
+        }
+        while (start > 0) {
+            const previous = unicode.codepointStartBefore(self.buf.items, start);
+            if (isBlankByte(self.buf.items[previous])) break;
+            start = previous;
+        }
+        return start;
+    }
+
+    fn isBlankByte(byte: u8) bool {
+        return byte == ' ' or byte == '\t';
+    }
+
+    fn editUnixWordRubout(self: *Repl) !void {
+        if (self.pos == 0) return;
+        try self.killTo(self.unixWordStart());
     }
 
     fn editYank(self: *Repl) !void {
@@ -1071,6 +1106,7 @@ const testKeys = struct {
     const ctrl_p = "\x10";
     const ctrl_r = "\x12";
     const ctrl_s = "\x13";
+    const ctrl_w = "\x17";
     const ctrl_y = "\x19";
     const left = "\x1b[D";
     const up = "\x1b[A";
@@ -1397,6 +1433,31 @@ test "yank pop replaces differently sized kills without removing following text"
     try repl.kills.push("most-recent", 0, 11, false);
 
     try std.testing.expectEqualStrings("leftmediumright", try repl.readline());
+}
+
+test "ctrl-w kills the word behind the cursor up to whitespace" {
+    try expectReadline(
+        "one two-three" ++ testKeys.ctrl_w ++ "!" ++ testKeys.enter,
+        80,
+        "one !",
+    );
+}
+
+test "consecutive ctrl-w kills join one kill ring entry in order" {
+    // Killing "c", then "b " backwards, prepends so the yank restores "b c".
+    try expectReadline(
+        "a b c" ++ testKeys.ctrl_w ++ testKeys.ctrl_w ++ testKeys.ctrl_y ++ testKeys.enter,
+        80,
+        "a b c",
+    );
+}
+
+test "ctrl-w at the start of the line does nothing" {
+    try expectReadline(
+        testKeys.home ++ testKeys.ctrl_w ++ "x" ++ testKeys.enter,
+        80,
+        "x",
+    );
 }
 
 test "meta-b and meta-f move by Readline words" {
