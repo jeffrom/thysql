@@ -69,8 +69,9 @@ pub fn fetch(allocator: Allocator, io: std.Io, source: Options.PasswordSource, c
     }
 }
 
-/// Runs `/bin/sh -c command` and returns the first line of its stdout. The command's stdin
-/// and stderr are inherited, so it can prompt and print progress. A failure is reported on
+/// Runs `/bin/sh -c command` and returns the first line of its stdout. stderr is inherited,
+/// so it can print progress. stdin is inherited only from a terminal, so it can prompt; when
+/// SQL comes in on stdin the command gets /dev/null instead and cannot eat the script. A failure is reported on
 /// `context.stderr` here. A timeout has no message, so the caller can report it.
 fn runCommand(allocator: Allocator, io: std.Io, command: []const u8, context: FetchContext) !Secret {
     var env = try commandEnvironment(allocator, context);
@@ -79,7 +80,7 @@ fn runCommand(allocator: Allocator, io: std.Io, command: []const u8, context: Fe
     var child = std.process.spawn(io, .{
         .argv = &.{ "/bin/sh", "-c", command },
         .environ_map = &env,
-        .stdin = .inherit,
+        .stdin = if (context.interactive) .inherit else .ignore,
         .stdout = .pipe,
         .stderr = .inherit,
     }) catch |err| {

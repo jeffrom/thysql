@@ -119,6 +119,18 @@ class AuthCommandTests(E2ETestCase):
                 self.assertEqual(self.log_lines(), [f"connect|127.0.0.1|{server.port}|root|"])
                 os.remove(self.log_path)
 
+    def test_command_cannot_read_sql_piped_on_stdin(self):
+        # The command drains its stdin. It must get /dev/null, not the script.
+        script = self.write_script("drain-stdin", f"cat >/dev/null\ncat '{self.password_path}'\n")
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                result = self.invoke(
+                    server.connect_args(ROOT_USER) + [f"--auth-command={script}", TEST_DB],
+                    stdin="select 'script-survived' as marker;\n",
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("script-survived", result.stdout)
+
     def test_connection_file_auth_command_runs_with_the_connection_name(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
