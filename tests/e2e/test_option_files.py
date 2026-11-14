@@ -210,9 +210,10 @@ class OptionFileTests(E2ETestCase):
         for server in self.each_server():
             with self.subTest(server=server.name):
                 self.home_cnf(self.connection_block(server))
-                result = run_thysql(["complete", f"-D{TEST_DB[:9]}"], env=self.home_env())
+                result = run_thysql(["complete", "--", "thysql", f"-D{TEST_DB[:9]}"], env=self.home_env())
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn(TEST_DB, result.stdout)
+                self.assertEqual(result.stdout, f"-D{TEST_DB}\n:0\n")
+                self.assertEqual(result.stderr, "")
 
     def test_option_before_any_group_is_an_error(self):
         self.home_cnf("user=root\n[client]\n")

@@ -150,6 +150,33 @@ pub fn rootDir(allocator: Allocator, env: *const std.process.Environ.Map) Alloca
     return null;
 }
 
+/// The `default-conn` of the directory `dir` (relative to the root, "" for the root), or null when it
+/// has none. A file that cannot be read or parsed counts as having none; completion uses this and
+/// must stay quiet. The result is allocated in `allocator`.
+pub fn defaultConn(allocator: Allocator, io: std.Io, env: *const std.process.Environ.Map, dir: []const u8) Allocator.Error!?[]const u8 {
+    const root = (try rootDir(allocator, env)) orelse return null;
+    const config_path = if (dir.len == 0)
+        try std.fs.path.join(allocator, &.{ root, config_name })
+    else
+        try std.fs.path.join(allocator, &.{ root, dir, config_name });
+
+    var discard_buffer: [1]u8 = undefined;
+    var discard = std.Io.Writer.Discarding.init(&discard_buffer);
+    const ctx: Context = .{
+        .allocator = allocator,
+        .io = io,
+        .root = root,
+        .home = nonEmpty(env.get("HOME")),
+        .stderr = &discard.writer,
+    };
+    const parsed = parseFile(ctx, config_path, .directory_config) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ConnectionFailed => return null,
+    };
+    const config = parsed orelse return null;
+    return config.default_conn;
+}
+
 fn nonEmpty(value: ?[]const u8) ?[]const u8 {
     const text = value orelse return null;
     return if (text.len > 0) text else null;

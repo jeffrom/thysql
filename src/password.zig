@@ -48,6 +48,9 @@ pub const FetchContext = struct {
     /// For `.command` only. The command is killed after this many milliseconds, and
     /// `error.Timeout` is returned. 0 means no limit, because an SSO helper can wait on a browser.
     timeout_ms: u64 = 0,
+    /// For `.command` only. The command's stderr goes to /dev/null instead of the terminal.
+    /// `thysql complete` sets this, so a helper cannot print during tab completion.
+    discard_command_stderr: bool = false,
 };
 
 /// Output from the auth command past this many bytes is read and dropped.
@@ -108,7 +111,7 @@ fn runCommand(allocator: Allocator, io: std.Io, command: []const u8, context: Fe
         .environ_map = &env,
         .stdin = if (context.interactive) .inherit else .ignore,
         .stdout = .pipe,
-        .stderr = .inherit,
+        .stderr = if (context.discard_command_stderr) .ignore else .inherit,
     }) catch |err| {
         try report(context, "auth command failed to start: {s}\n", .{@errorName(err)});
         return error.AuthCommandFailed;
@@ -218,6 +221,8 @@ pub const Supplier = struct {
     context: FetchContext,
     /// The -C connection name, or "" without -C. The auth command gets it as THYSQL_CONNECTION.
     connection: []const u8 = "",
+    /// When set, every fetch reports this reason instead of the one the caller passes. Completion uses `.complete`.
+    fixed_reason: ?Reason = null,
     prompted: ?Secret = null,
 
     pub fn deinit(self: *Supplier) void {
@@ -242,7 +247,7 @@ pub const Supplier = struct {
             var context = self.context;
             context.target = target;
             context.target.connection = self.connection;
-            context.reason = reason;
+            context.reason = self.fixed_reason orelse reason;
             return fetch(self.allocator, self.io, self.source, context);
         }
         try self.prime();

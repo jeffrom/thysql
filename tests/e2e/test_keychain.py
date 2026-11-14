@@ -7,35 +7,19 @@ skipped off macOS.
 """
 
 import os
-import subprocess
-import sys
 import unittest
 
-from harness import ROOT_PASSWORD, ROOT_USER, TEST_DB, E2ETestCase, run_thysql
+from harness import ROOT_PASSWORD, ROOT_USER, TEST_DB, E2ETestCase, keychain_available, run_thysql
 
 ENTER = "\r"
 ACCOUNT = "main/ro"
-KEYCHAIN_PASSWORD = "e2e-keychain-pw"
-SECURITY = "/usr/bin/security"
 
 
-@unittest.skipUnless(sys.platform == "darwin" and os.path.exists(SECURITY), "the keychain tests need macOS")
+@unittest.skipUnless(keychain_available(), "the keychain tests need macOS")
 class KeychainTests(E2ETestCase):
     def setUp(self):
         super().setUp()
-        self.keychain = os.path.join(self.home, "thysql-e2e.keychain-db")
-        self.security("create-keychain", "-p", KEYCHAIN_PASSWORD, self.keychain)
-        self.security("unlock-keychain", "-p", KEYCHAIN_PASSWORD, self.keychain)
-        # Auto-lock off, so the keychain stays unlocked for the whole test.
-        self.security("set-keychain-settings", self.keychain)
-        # Added after the home directory's cleanup, so it runs first and the file is still there.
-        self.addCleanup(self.security, "delete-keychain", self.keychain, check=False)
-
-    def security(self, *args, check=True):
-        result = subprocess.run([SECURITY, *args], capture_output=True, text=True)
-        if check:
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        return result
+        self.keychain = self.make_keychain()
 
     def thysql(self, args, stdin="", extra_env=None):
         env = {"HOME": self.home, "THYSQL_KEYCHAIN": self.keychain, **(extra_env or {})}

@@ -56,6 +56,8 @@ pub const DBInfo = struct {
     tls: Options.Tls = .{},
     /// Seconds to wait for the connection to open. 0 keeps the library default.
     connect_timeout: u32 = 0,
+    /// Do not print a failed connect to stderr. `thysql complete` sets this unless it is debugging.
+    quiet_connect_error: bool = false,
 };
 
 /// TLS settings as NUL-terminated strings for the C library. An empty string means unset.
@@ -145,7 +147,7 @@ pub const DB = struct {
         };
         var failure: ConnectFailure = .{};
         const db = connectWith(connect_params, info.password_provider, .connect, &failure) catch |err| {
-            if (err == error.ConnectError) {
+            if (err == error.ConnectError and !info.quiet_connect_error) {
                 std.debug.print("Connect to database failed: {s}\n", .{failure.message()});
             }
             return err;

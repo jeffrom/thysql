@@ -26,6 +26,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -46,6 +47,10 @@ AUTH_PASSWORD = "e2e-auth-pw"
 
 LABEL = "thysql-e2e"
 READY_TIMEOUT = 240
+
+# The macOS keychain tests use this tool and this throwaway password.
+SECURITY = "/usr/bin/security"
+KEYCHAIN_PASSWORD = "e2e-keychain-pw"
 
 # Where the TLS material is mounted inside each server container.
 TLS_MOUNT = "/etc/thysql-tls"
@@ -542,3 +547,29 @@ class E2ETestCase(unittest.TestCase):
         session = Interactive(args, home=self.home, **kwargs)
         self.addCleanup(session.close)
         return session
+
+    def security(self, *args, check=True):
+        """Runs /usr/bin/security. A nonzero exit fails the test unless check is False."""
+        result = subprocess.run([SECURITY, *args], capture_output=True, text=True)
+        if check:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def make_keychain(self):
+        """Creates a throwaway keychain under self.home, unlocked, with auto-lock off.
+
+        It is not added to the user's search list, and it is deleted at cleanup. Pass its path
+        as THYSQL_KEYCHAIN. Call this only on macOS (see `keychain_available`).
+        """
+        path = os.path.join(self.home, "thysql-e2e.keychain-db")
+        self.security("create-keychain", "-p", KEYCHAIN_PASSWORD, path)
+        self.security("unlock-keychain", "-p", KEYCHAIN_PASSWORD, path)
+        self.security("set-keychain-settings", path)
+        # Added after setUp's home cleanup, so it runs first and the file is still there.
+        self.addCleanup(self.security, "delete-keychain", path, check=False)
+        return path
+
+
+def keychain_available():
+    """True where the keychain tests can run: macOS with /usr/bin/security."""
+    return sys.platform == "darwin" and os.path.exists(SECURITY)
