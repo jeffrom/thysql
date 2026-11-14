@@ -1,8 +1,10 @@
 //! Names for tab completion in the REPL: the databases, tables, routines, and the columns
 //! of the current database. The SQL keywords and functions come from `sql/keywords.zig`.
 //! The names are loaded on connect and on `use`, and by `rehash`, as mysql.cc's
-//! build_completion_hash does. Tables and routines are loaded for every database, so that
-//! `db.` can be completed; columns only for the current one, as mysql.cc does.
+//! build_completion_hash does: the list of databases, and the tables, columns and routines of
+//! the current one. The tables and routines of another database are loaded the first time
+//! completion asks for them, after `db.`, so that a server with many databases connects as fast
+//! as mysql.cc does.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -32,6 +34,12 @@ pub const Names = struct {
     databases: std.ArrayList([:0]u8) = .empty,
     tables: std.ArrayList(Table) = .empty,
     routines: std.ArrayList(Routine) = .empty,
+    /// The connection that `loadSchema` reads from. Set by `load`, so that it is null when the
+    /// names were not loaded from a server: in the tests, and with `-A` until `rehash`.
+    db: ?*Mysql.DB = null,
+    /// The databases whose tables and routines are listed: the current one from `load`, and each
+    /// other one that `loadSchema` was asked for, whether or not its queries worked.
+    loaded: std.ArrayList([:0]u8) = .empty,
 
     pub fn init(allocator: Allocator) Names {
         return .{ .allocator = allocator };
@@ -42,6 +50,7 @@ pub const Names = struct {
         self.databases.deinit(self.allocator);
         self.tables.deinit(self.allocator);
         self.routines.deinit(self.allocator);
+        self.loaded.deinit(self.allocator);
     }
 
     /// Forgets every name, so that they can be loaded again.
@@ -60,6 +69,8 @@ pub const Names = struct {
             self.allocator.free(routine.name);
         }
         self.routines.clearRetainingCapacity();
+        freeWords(self.allocator, &self.loaded);
+        self.db = null;
     }
 
     /// Sets the current database. An empty name means there is none.
@@ -121,11 +132,73 @@ pub const Names = struct {
         return null;
     }
 
+    /// The listed database that `name` names, ignoring ASCII case, or null when none does.
+    pub fn findDatabase(self: *const Names, name: []const u8) ?[:0]const u8 {
+        for (self.databases.items) |database| {
+            if (std.ascii.eqlIgnoreCase(database, name)) return database;
+        }
+        return null;
+    }
+
+    /// True when the tables and routines of `schema` are listed, or were asked for.
+    pub fn isLoaded(self: *const Names, schema: []const u8) bool {
+        for (self.loaded.items) |name| {
+            if (std.ascii.eqlIgnoreCase(name, schema)) return true;
+        }
+        return false;
+    }
+
+    /// Loads the tables and routines of `schema` the first time completion asks for them. Only a
+    /// listed database is loaded, and only once: a failed query is not retried, so a lost
+    /// connection costs one try per database. Does nothing when the names did not come from a
+    /// server. Columns stay those of the current database, as in mysql.cc.
+    pub fn loadSchema(self: *Names, schema: []const u8) Allocator.Error!void {
+        const db = self.db orelse return;
+        const name = self.findDatabase(schema) orelse return;
+        if (self.isLoaded(name)) return;
+        try self.markLoaded(name);
+        try self.loadTablesAndRoutines(db, name);
+    }
+
+    fn markLoaded(self: *Names, schema: []const u8) Allocator.Error!void {
+        const owned = try self.allocator.dupeSentinel(u8, schema, 0);
+        errdefer self.allocator.free(owned);
+        try self.loaded.append(self.allocator, owned);
+    }
+
+    /// Adds the tables and routines of `schema`. The name goes in the queries as a hex literal,
+    /// which needs no escaping in any sql_mode.
+    fn loadTablesAndRoutines(self: *Names, db: *Mysql.DB, schema: []const u8) Allocator.Error!void {
+        const literal = try schemaLiteral(self.allocator, schema);
+        defer self.allocator.free(literal);
+
+        const tables_sql = try std.fmt.allocPrint(self.allocator, "SELECT TABLE_NAME FROM information_schema.TABLES " ++
+            "WHERE TABLE_SCHEMA = {s}", .{literal});
+        defer self.allocator.free(tables_sql);
+        if (try db.rowsCopy(self.allocator, tables_sql)) |rows| {
+            defer Mysql.freeRowsCopy(self.allocator, rows);
+            for (rows) |row| {
+                if (row[0]) |name| try self.addTable(schema, name);
+            }
+        }
+
+        const routines_sql = try std.fmt.allocPrint(self.allocator, "SELECT ROUTINE_NAME FROM information_schema.ROUTINES " ++
+            "WHERE ROUTINE_SCHEMA = {s}", .{literal});
+        defer self.allocator.free(routines_sql);
+        if (try db.rowsCopy(self.allocator, routines_sql)) |rows| {
+            defer Mysql.freeRowsCopy(self.allocator, rows);
+            for (rows) |row| {
+                if (row[0]) |name| try self.addRoutine(schema, name);
+            }
+        }
+    }
+
     /// Replaces the names with those of the server. Returns the number of tables in the
     /// current database, so the caller can decide whether to print a notice. A failed query
     /// leaves its names out, and the session carries on.
     pub fn load(self: *Names, db: *Mysql.DB) !u32 {
         self.clear();
+        self.db = db;
 
         if (try db.rowsCopy(self.allocator, "SELECT DATABASE()")) |rows| {
             defer Mysql.freeRowsCopy(self.allocator, rows);
@@ -141,27 +214,9 @@ pub const Names = struct {
             }
         }
 
-        const tables_sql = "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES";
-        if (try db.rowsCopy(self.allocator, tables_sql)) |rows| {
-            defer Mysql.freeRowsCopy(self.allocator, rows);
-            for (rows) |row| {
-                if (row[0]) |schema| {
-                    if (row[1]) |name| try self.addTable(schema, name);
-                }
-            }
-        }
-
-        const routines_sql = "SELECT ROUTINE_SCHEMA, ROUTINE_NAME FROM information_schema.ROUTINES";
-        if (try db.rowsCopy(self.allocator, routines_sql)) |rows| {
-            defer Mysql.freeRowsCopy(self.allocator, rows);
-            for (rows) |row| {
-                if (row[0]) |schema| {
-                    if (row[1]) |name| try self.addRoutine(schema, name);
-                }
-            }
-        }
-
         if (self.database) |current| {
+            try self.markLoaded(current);
+            try self.loadTablesAndRoutines(db, current);
             const columns_sql = "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS " ++
                 "WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION";
             if (try db.rowsCopy(self.allocator, columns_sql)) |rows| {
@@ -174,15 +229,16 @@ pub const Names = struct {
             }
         }
 
-        var table_count: u32 = 0;
-        for (self.tables.items) |table| {
-            if (self.database) |current| {
-                if (std.ascii.eqlIgnoreCase(table.schema, current)) table_count += 1;
-            }
-        }
-        return table_count;
+        // Only the current database's tables are listed now.
+        return @intCast(self.tables.items.len);
     }
 };
+
+/// `schema` as an SQL expression: a utf8mb4 string from a hex literal, as in
+/// `CONVERT(X'6170' USING utf8mb4)`.
+fn schemaLiteral(allocator: Allocator, schema: []const u8) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(allocator, "CONVERT(X'{x}' USING utf8mb4)", .{schema});
+}
 
 /// True when `table` is named `name` in `schema`, ignoring ASCII case.
 fn matchesTable(table: *const Table, schema: []const u8, name: []const u8) bool {
@@ -265,4 +321,23 @@ test "prefix matching ignores case and needs the prefix at the start" {
     try std.testing.expect(matches("people.name", "PEOPLE."));
     try std.testing.expect(!matches("people", "ople"));
     try std.testing.expect(matches("anything", ""));
+}
+
+test "a schema goes in a query as a hex literal, whatever it holds" {
+    const allocator = std.testing.allocator;
+    const literal = try schemaLiteral(allocator, "a'b\\c");
+    defer allocator.free(literal);
+    try std.testing.expectEqualStrings("CONVERT(X'6127625c63' USING utf8mb4)", literal);
+}
+
+test "without a connection, loadSchema lists nothing and asks no server" {
+    const allocator = std.testing.allocator;
+    var names = Names.init(allocator);
+    defer names.deinit();
+    try names.addDatabase("app");
+    try names.addDatabase("Other");
+    try names.loadSchema("other");
+    try std.testing.expect(!names.isLoaded("other"));
+    try std.testing.expectEqualStrings("Other", names.findDatabase("OTHER").?);
+    try std.testing.expect(names.findDatabase("missing") == null);
 }

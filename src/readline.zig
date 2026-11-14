@@ -341,7 +341,9 @@ fn styleOf(kind: SqlLexer.Kind) ?replete.Style {
 /// What tab completion reads. `scratch` holds the strings that candidates point to, such as
 /// quoted names. It is reset at each Tab press, and the candidates last until the next one.
 const Completion = struct {
-    names: *const SqlCompletion.Names,
+    /// Mutable so that completion can load the tables of another database the first time it is
+    /// named, with `Names.loadSchema`.
+    names: *SqlCompletion.Names,
     /// The parser gives the candidates, and the lexer settings come from here. Null in the tests,
     /// which then use the lexer alone.
     syntax: ?*Syntax = null,
@@ -400,7 +402,7 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
             }
         },
         .column_of => |ref| try offerColumnsOf(&offers, names, &.{ref}, false),
-        .routine => for (names.routines.items) |routine| try offers.name(routine.name, .function, true),
+        .routine => try offerRoutines(&offers, names),
     }
     return start;
 }
@@ -453,7 +455,7 @@ fn offerParsed(offers: *Offers, completion: *const Completion, line: []const u8,
         .table => |schema| schema,
         else => null,
     });
-    if (wanted.routines) for (names.routines.items) |routine| try offers.name(routine.name, .function, true);
+    if (wanted.routines) try offerRoutines(offers, names);
     if (wanted.functions) try offerFunctions(offers);
     if (wanted.columns) try offerExpectedColumns(offers, names, expect);
     return true;
@@ -635,11 +637,22 @@ fn quoteIdentifier(scratch: std.mem.Allocator, name: []const u8) std.mem.Allocat
     return out.toOwnedSlice(scratch);
 }
 
-/// Offers the tables of `schema`, or of the current database when there is no schema.
-fn offerTables(offers: *Offers, names: *const SqlCompletion.Names, schema: ?[]const u8) std.mem.Allocator.Error!void {
+/// Offers the tables of `schema`, or of the current database when there is no schema. Another
+/// database's tables are loaded from the server the first time they are asked for.
+fn offerTables(offers: *Offers, names: *SqlCompletion.Names, schema: ?[]const u8) std.mem.Allocator.Error!void {
     const wanted = schema orelse (names.database orelse return);
+    try names.loadSchema(wanted);
     for (names.tables.items) |table| {
         if (std.ascii.eqlIgnoreCase(table.schema, wanted)) try offers.name(table.name, .table, true);
+    }
+}
+
+/// Offers the stored functions and procedures of the current database, which is where an
+/// unqualified name finds them.
+fn offerRoutines(offers: *Offers, names: *const SqlCompletion.Names) std.mem.Allocator.Error!void {
+    const current = names.database orelse return;
+    for (names.routines.items) |routine| {
+        if (std.ascii.eqlIgnoreCase(routine.schema, current)) try offers.name(routine.name, .function, true);
     }
 }
 
@@ -673,8 +686,13 @@ fn offerEverything(offers: *Offers, names: *const SqlCompletion.Names) std.mem.A
     for (SqlKeywords.keywords) |keyword| try offers.keyword(keyword.name, .keyword);
     try offerFunctions(offers);
     for (names.databases.items) |name| try offers.name(name, .database, true);
-    for (names.tables.items) |table| try offers.name(table.name, .table, true);
-    for (names.routines.items) |routine| try offers.name(routine.name, .function, true);
+    // Other databases' tables, once loaded, need their `db.` and are not offered bare.
+    if (names.database) |current| {
+        for (names.tables.items) |table| {
+            if (std.ascii.eqlIgnoreCase(table.schema, current)) try offers.name(table.name, .table, true);
+        }
+    }
+    try offerRoutines(offers, names);
     for (names.tables.items) |table| {
         for (table.columns.items) |column| {
             try offers.name(column, .column, true);
@@ -722,7 +740,7 @@ fn hintLine(context: ?*anyopaque, line: []const u8, cursor: usize) ?[]const u8 {
 }
 
 /// A completion context over `names` for the tests. The caller frees its scratch arena.
-fn testCompletion(allocator: std.mem.Allocator, names: *const SqlCompletion.Names) Completion {
+fn testCompletion(allocator: std.mem.Allocator, names: *SqlCompletion.Names) Completion {
     return .{ .names = names, .scratch = .init(allocator) };
 }
 
@@ -1180,6 +1198,30 @@ test "names keep their own case whatever the case typed" {
     try expectOffered("select * from peo", "People");
     try expectOffered("SELECT * FROM PEO", "People");
     try expectOffered("select na", "Name");
+}
+
+test "bare tables and routines come from the current database only" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.addTable("app", "people");
+    try names.addTable("other", "pending");
+    try names.addRoutine("app", "app_proc");
+    try names.addRoutine("other", "other_proc");
+    try names.setDatabase("app");
+    var completion = testCompletion(allocator, &names);
+    defer completion.scratch.deinit();
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    _ = try completeLine(&completion, "select * from pe", &candidates);
+    try std.testing.expect(offersAs(&candidates, .table, "people"));
+    try std.testing.expect(!offersAs(&candidates, .table, "pending"));
+
+    candidates.list.clearRetainingCapacity();
+    _ = try completeLine(&completion, "call ", &candidates);
+    try std.testing.expect(offersAs(&candidates, .function, "app_proc"));
+    try std.testing.expect(!offersAs(&candidates, .function, "other_proc"));
 }
 
 test "the hint is the rest of the one context candidate, and nothing when there are several" {
