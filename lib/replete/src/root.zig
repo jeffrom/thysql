@@ -189,6 +189,17 @@ pub const Repl = struct {
         // std.debug.print("key: {}\n", .{c});
     }
 
+    /// Reads one line with the terminal `fd` in raw mode. The previous settings
+    /// are restored before this returns, whether the line was accepted,
+    /// cancelled, hit end of input, or failed. Callers that need raw mode across
+    /// several lines should use `TermState` and `readline` directly.
+    /// The returned slice follows the rules of `readline`.
+    pub fn readlineTerminal(self: *Repl, fd: i32) ![]u8 {
+        const term = try TermState.enable(fd);
+        defer term.disable();
+        return self.readline();
+    }
+
     fn editStart(self: *Repl) !void {
         self.buf.clearRetainingCapacity();
         self.pos = 0;
@@ -1111,6 +1122,30 @@ test "setPrompt and readlinePrompt change the prompt for later lines" {
     try std.testing.expect(std.mem.indexOf(u8, written, "db> one") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "db2-> two") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "-> three") != null);
+}
+
+test "readlineTerminal fails without reading input when fd is not a terminal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(io, "not-a-tty", .{});
+    defer file.close(io);
+
+    var input: Io.Reader = .fixed("x" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectError(error.NotATerminal, repl.readlineTerminal(file.handle));
+    try std.testing.expectEqual(@as(u8, 'x'), try input.takeByte());
 }
 
 test "kitty fallback prompt is chosen once and used for every line" {
