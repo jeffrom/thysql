@@ -9,6 +9,9 @@ const history_mod = @import("history.zig");
 
 pub const highlight = @import("highlight.zig");
 pub const kitty = @import("kitty.zig");
+pub const Span = highlight.Span;
+pub const Style = highlight.Style;
+pub const Theme = highlight.Theme;
 pub const History = history_mod.History;
 pub const FileHistory = history_mod.FileHistory;
 pub const HistoryOptions = history_mod.Options;
@@ -92,8 +95,10 @@ pub const ReplConfig = struct {
     history: ?*History = null,
     /// Optional tab completion. Without it, Tab does nothing.
     completer: ?Completer = null,
-    /// Colors for candidate listings and, later, highlighted text.
+    /// Colors for candidate listings and highlighted text.
     theme: highlight.Theme = .{},
+    /// Optional syntax highlighting, run on each redraw of the line.
+    highlighter: ?Highlighter = null,
 };
 
 /// What a completion names. A listing colors each candidate by its kind.
@@ -116,6 +121,15 @@ pub const Candidate = struct {
     /// Whether a space follows `text` when it is the only candidate. Set it to false
     /// when the next thing typed continues the same name, as after `table.`.
     space: bool = true,
+};
+
+/// Styles parts of the line as it is drawn. `highlight` gets the whole line and
+/// returns its spans; the slice it returns must stay valid until the next call.
+/// Spans may overlap or come in any order, and bytes they miss are plain.
+pub const Highlighter = struct {
+    /// Passed to `highlight` as its first argument.
+    context: ?*anyopaque = null,
+    highlight: *const fn (context: ?*anyopaque, line: []const u8) []const highlight.Span,
 };
 
 /// The candidates a `Completer` offers for the word being completed. Each candidate
@@ -1381,13 +1395,12 @@ pub const Repl = struct {
             if (self.cfg.columns == null) self.cols = current_size.columns;
             if (self.cfg.rows == null) self.rows = current_size.rows;
         }
-        var next = try display.layout(
-            self.gpa,
-            self.active_prompt,
-            self.buf.items,
-            self.pos,
-            self.cols,
-        );
+        const styles = try self.lineStyles();
+        defer if (styles) |byte_styles| self.gpa.free(byte_styles);
+        var next = try display.layoutWith(self.gpa, self.active_prompt, self.buf.items, self.pos, self.cols, .{
+            .styles = styles,
+            .theme = self.cfg.theme,
+        });
         defer next.deinit(self.gpa);
 
         const visible_rows = @min(next.rows.items.len, @max(self.rows, 1));
@@ -1426,6 +1439,14 @@ pub const Repl = struct {
 
         self.rendered_rows = visible_rows;
         self.rendered_cursor_row = cursor_row;
+    }
+
+    /// The style of each byte of the line, from the highlighter. Null without one.
+    /// The caller frees the result with `self.gpa`.
+    fn lineStyles(self: *Repl) !?[]highlight.Style {
+        const highlighter = self.cfg.highlighter orelse return null;
+        const spans = highlighter.highlight(highlighter.context, self.buf.items);
+        return try highlight.styleBytes(self.gpa, self.buf.items.len, spans);
     }
 
     fn finishAtBottom(self: *Repl) !void {
@@ -2064,6 +2085,69 @@ test "readline editing respects UTF-8 boundaries" {
         80,
         "a界",
     );
+}
+
+/// Marks the word "select" at the start of the line, and the first byte of an error.
+const KeywordHighlighter = struct {
+    fn highlight(context: ?*anyopaque, line: []const u8) []const Span {
+        _ = context;
+        if (std.mem.startsWith(u8, line, "select")) return &.{.{ .start = 0, .len = 6, .style = .keyword }};
+        if (std.mem.startsWith(u8, line, "x")) return &.{.{ .start = 0, .len = 1, .style = .@"error" }};
+        return &.{};
+    }
+};
+
+test "highlighter styles the line when it is drawn and does not change it" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("select 1" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .highlighter = .{ .highlight = KeywordHighlighter.highlight },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("select 1", try repl.readline());
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[1;38;5;32mselect\x1b[0m 1") != null);
+}
+
+test "errors are drawn as a curly underline, or a straight one without undercurl" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("x" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .highlighter = .{ .highlight = KeywordHighlighter.highlight },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    try std.testing.expectEqualStrings("x", try repl.readline());
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[4:3mx\x1b[0m") != null);
+
+    var plain_input: Io.Reader = .fixed("x" ++ testKeys.enter);
+    var plain_output: Io.Writer.Allocating = .init(allocator);
+    defer plain_output.deinit();
+    const plain_cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &plain_input,
+        .out = &plain_output.writer,
+        .columns = 80,
+        .theme = .{ .undercurl = false },
+        .highlighter = .{ .highlight = KeywordHighlighter.highlight },
+    };
+    var plain_repl = try Repl.init(allocator, &plain_cfg);
+    defer plain_repl.deinit();
+    try std.testing.expectEqualStrings("x", try plain_repl.readline());
+    try std.testing.expect(std.mem.indexOf(u8, plain_output.written(), "\x1b[4mx\x1b[0m") != null);
 }
 
 test "readline ctrl-c cancels the current line" {
