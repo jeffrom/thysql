@@ -1,6 +1,7 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const build_options = @import("build_options");
 
 const C = @import("mysql_c");
 const Mysql = @import("mysql.zig");
@@ -236,9 +237,18 @@ fn envValue(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
     return env.get(name);
 }
 
+/// Writes the --version output for this build.
 fn renderVersion(out: *std.Io.Writer) !void {
-    try out.print("thysql, client library {s}\n", .{Mysql.clientInfo()});
+    try writeVersion(out, build_options.version, build_options.commit, Mysql.clientInfo());
     try out.flush();
+}
+
+/// Writes `thysql <version> (<commit>), client library <client>`. The commit part is
+/// left out when it is empty.
+fn writeVersion(out: *std.Io.Writer, version: []const u8, commit: []const u8, client: []const u8) !void {
+    try out.print("thysql {s}", .{version});
+    if (commit.len > 0) try out.print(" ({s})", .{commit});
+    try out.print(", client library {s}\n", .{client});
 }
 
 fn handleSigint(_: std.posix.SIG) callconv(.c) void {
@@ -1281,6 +1291,26 @@ test "connection prompt shows connection and database" {
     const without_database = try connectionPrompt(std.testing.allocator, "", "localhost", 3306, "");
     defer std.testing.allocator.free(without_database);
     try std.testing.expectEqualStrings("localhost:3306/(none)> ", without_database);
+}
+
+test "version line shows the build version and commit" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    defer buf = writer.toArrayList();
+
+    try writeVersion(&writer.writer, "0.1.0", "abc123", "3.4.9");
+    try std.testing.expectEqualStrings("thysql 0.1.0 (abc123), client library 3.4.9\n", writer.written());
+}
+
+test "version line leaves out an empty commit" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    defer buf = writer.toArrayList();
+
+    try writeVersion(&writer.writer, "0.1.0", "", "3.4.9");
+    try std.testing.expectEqualStrings("thysql 0.1.0, client library 3.4.9\n", writer.written());
 }
 
 test "connection banner shows connection and version details" {

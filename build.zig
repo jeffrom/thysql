@@ -25,6 +25,20 @@ pub fn build(b: *std.Build) void {
         .macos => @as(?[]const u8, "/opt/homebrew/lib"),
         else => @as(?[]const u8, null),
     };
+    // The version comes from build.zig.zon unless -Dversion overrides it. The commit is
+    // optional and empty by default. Both reach the code as the build_options module.
+    const zon_version: []const u8 = @import("build.zig.zon").version;
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", b.option(
+        []const u8,
+        "version",
+        "Version to report with --version (default: build.zig.zon)",
+    ) orelse zon_version);
+    build_options.addOption([]const u8, "commit", b.option(
+        []const u8,
+        "commit",
+        "Commit to report with --version, such as a short SHA (default: none)",
+    ) orelse "");
     const mariadb = addMariaDbConnectorC(b);
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
@@ -82,6 +96,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("mysql_c", mysql_c);
     mod.addImport("mysql_parser_c", parser_shim_c);
     mod.addImport("replete", replete_mod);
+    mod.addImport("build_options", build_options.createModule());
 
     mod.link_libc = true;
     mod.link_libcpp = true;
