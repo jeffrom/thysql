@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const replete = @import("replete");
 
 const Batch = @import("batch.zig");
+const Connections = @import("connections.zig");
 const history_file = @import("history_file.zig");
 const ClientCommand = @import("client_command.zig");
 const SqlCompletion = @import("sql_completion.zig");
@@ -82,7 +83,7 @@ pub const Session = struct {
         self.history = openHistory(allocator, io, env);
         errdefer if (self.history) |*file| file.deinit();
 
-        self.completion = .{ .names = names, .syntax = syntax, .scratch = .init(allocator) };
+        self.completion = .{ .names = names, .syntax = syntax, .io = io, .env = env, .scratch = .init(allocator) };
         errdefer self.completion.scratch.deinit();
         self.config = .{
             .prompt = "",
@@ -349,6 +350,9 @@ const Completion = struct {
     syntax: ?*Syntax = null,
     /// The statement being typed, while `Session.one` reads a line. It gives the context of the line.
     scanner: ?*Batch.Scanner = null,
+    /// Where the saved connections are read from, for `\C name`. Null in the tests, which offer none.
+    io: ?std.Io = null,
+    env: ?*const std.process.Environ.Map = null,
     scratch: std.heap.ArenaAllocator,
 };
 
@@ -360,6 +364,10 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
     const completion: *Completion = @ptrCast(@alignCast(context.?));
     _ = completion.scratch.reset(.retain_capacity);
     const scratch = completion.scratch.allocator();
+    if (connectionContext(completion, line, cursor)) |start| {
+        try offerConnections(candidates, completion, scratch, line[start..cursor]);
+        return start;
+    }
     const expect = contextAt(scratch, completion, line, cursor) catch return cursor;
 
     var start = cursor;
@@ -405,6 +413,26 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
         .routine => try offerRoutines(&offers, names),
     }
     return start;
+}
+
+/// Where the connection name starts, when the cursor is in the name of `\C name` or `connection name`
+/// on a line that starts a statement. A line of pending SQL is not such a context, because `readOneLine`
+/// runs a client command only at a statement start.
+fn connectionContext(completion: *const Completion, line: []const u8, cursor: usize) ?usize {
+    if (completion.scanner) |scanner| {
+        if (!scanner.atStatementStart()) return null;
+    }
+    return ClientCommand.connectionNameStart(line, cursor);
+}
+
+/// Offers the saved connections that start with `typed`, as `connections.completions` lists them.
+/// Nothing is offered when the connections cannot be read, as in the tests.
+fn offerConnections(candidates: *replete.Candidates, completion: *const Completion, scratch: std.mem.Allocator, typed: []const u8) std.mem.Allocator.Error!void {
+    const io = completion.io orelse return;
+    const env = completion.env orelse return;
+    for (try Connections.completions(scratch, io, env, typed)) |name| {
+        try candidates.addCandidate(.{ .text = name.text, .kind = .other, .space = name.space });
+    }
 }
 
 /// Offers what the parser expects at the cursor, from its candidates, and returns true. Keywords are
@@ -706,7 +734,8 @@ fn offerEverything(offers: *Offers, names: *const SqlCompletion.Names) std.mem.A
 fn offerClientCommands(offers: *Offers) std.mem.Allocator.Error!void {
     for (ClientCommand.help_items) |item| {
         const letter = try offers.scratch.dupe(u8, &[_]u8{item.char});
-        if (!SqlCompletion.matches(letter, offers.prefix)) continue;
+        // The letters are case-sensitive: \c clears and \C switches connections.
+        if (!std.mem.startsWith(u8, letter, offers.prefix)) continue;
         const shown = try std.fmt.allocPrint(offers.scratch, "\\{c}  {s}", .{ item.char, item.name });
         try offers.candidates.addCandidate(.{ .text = letter, .display = shown, .kind = .other, .space = false });
     }
@@ -896,6 +925,23 @@ test "a client command is offered by its letter after a backslash" {
     try std.testing.expectEqual(@as(usize, 1), candidates.list.items.len);
     try std.testing.expectEqualStrings("c", candidates.list.items[0].text);
     try std.testing.expect(!candidates.list.items[0].space);
+}
+
+test "the name after \\C starts at the name, and no SQL is offered there" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    var completion = testCompletion(allocator, &names);
+    defer completion.scratch.deinit();
+    try names.addTable("app", "people");
+    try names.setDatabase("app");
+
+    // Without the connections (as in the tests) the context is still found, and nothing is offered.
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    const start = try completeLine(&completion, "\\C pe", &candidates);
+    try std.testing.expectEqual(@as(usize, 3), start);
+    try std.testing.expectEqual(@as(usize, 0), candidates.list.items.len);
 }
 
 test "inside a string nothing is offered" {
