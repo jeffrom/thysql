@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const C = @import("mysql_c");
 const Unicode = @import("unicode.zig");
 const Options = @import("options.zig");
+const Password = @import("password.zig");
 
 const maxTableColumnDisplayWidth: usize = 1024;
 const crServerGoneError: u32 = 2006;
@@ -34,10 +35,20 @@ pub const ConnectFailure = struct {
     }
 };
 
+/// Supplies the password for each connect, so a reconnect gets a fresh one. The DB
+/// keeps no password when a provider is set.
+pub const PasswordProvider = struct {
+    ctx: *anyopaque,
+    fetchFn: *const fn (ctx: *anyopaque) anyerror!Password.Secret,
+};
+
 pub const DBInfo = struct {
     host: []const u8,
     user: []const u8,
-    password: []const u8,
+    /// Used only when `password_provider` is null.
+    password: []const u8 = "",
+    /// When set, the password comes from here on every connect, and `password` is ignored.
+    password_provider: ?PasswordProvider = null,
     database: []const u8,
     port: u32 = 3306,
     socket: []const u8 = "",
@@ -74,7 +85,8 @@ const ConnectParams = struct {
     connect_timeout: u32,
 };
 
-pub const DBError = error{ ExecError, StoreResultError, ConnectError, OutOfMemory };
+/// PasswordFailed means the password provider could not give a password for a connect.
+pub const DBError = error{ ExecError, StoreResultError, ConnectError, OutOfMemory, PasswordFailed };
 
 pub const OKResult = struct {
     affected_rows: u64,
@@ -102,13 +114,15 @@ pub const DB = struct {
     tls: Tls,
     connect_timeout: u32,
     connect_failure: ConnectFailure = .{},
+    password_provider: ?PasswordProvider,
 
     pub fn init(allocator: Allocator, info: DBInfo) !DB {
         const host = try allocator.dupeSentinel(u8, info.host, 0);
         errdefer allocator.free(host);
         const user = try allocator.dupeSentinel(u8, info.user, 0);
         errdefer allocator.free(user);
-        const password = try allocator.dupeSentinel(u8, info.password, 0);
+        // With a provider, the password is fetched for each connect and not kept here.
+        const password = try allocator.dupeSentinel(u8, if (info.password_provider == null) info.password else "", 0);
         errdefer allocator.free(password);
         const database = try allocator.dupeSentinel(u8, info.database, 0);
         errdefer allocator.free(database);
@@ -130,7 +144,7 @@ pub const DB = struct {
             .connect_timeout = info.connect_timeout,
         };
         var failure: ConnectFailure = .{};
-        const db = connect(connect_params, &failure) catch |err| {
+        const db = connectWith(connect_params, info.password_provider, &failure) catch |err| {
             if (err == error.ConnectError) {
                 std.debug.print("Connect to database failed: {s}\n", .{failure.message()});
             }
@@ -150,6 +164,7 @@ pub const DB = struct {
             .protocol = info.protocol,
             .tls = tls,
             .connect_timeout = info.connect_timeout,
+            .password_provider = info.password_provider,
         };
     }
 
@@ -406,7 +421,11 @@ pub const DB = struct {
         if (new_database) |name| next_params.database = name;
         if (new_host) |name| next_params.host = name;
 
-        const conn = connect(next_params, &self.connect_failure) catch return error.ConnectError;
+        const conn = connectWith(next_params, self.password_provider, &self.connect_failure) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.PasswordFailed => return error.PasswordFailed,
+            else => return error.ConnectError,
+        };
         C.mysql_close(self.conn);
         self.conn = conn;
         if (new_database) |name| {
@@ -531,6 +550,23 @@ fn applyConnectOptions(db: *C.struct_st_mysql, params: ConnectParams) void {
     _ = C.mysql_options(db, C.MYSQL_OPT_TLS_VERSION, optionalCString(tls.tls_version));
     var verify: C.my_bool = @intFromBool(tls.verify_server_cert);
     _ = C.mysql_options(db, C.MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &verify);
+}
+
+/// Opens a connection. With a provider, the password comes from it for this connect only.
+/// The secret is zeroed when this function returns, after the connect attempt.
+fn connectWith(params: ConnectParams, provider: ?PasswordProvider, failure: *ConnectFailure) !*C.struct_st_mysql {
+    const source = provider orelse return connect(params, failure);
+    var secret = source.fetchFn(source.ctx) catch |err| {
+        if (err == error.OutOfMemory) {
+            return error.OutOfMemory;
+        }
+        return error.PasswordFailed;
+    };
+    defer secret.deinit();
+
+    var with_password = params;
+    with_password.password = secret.bytes;
+    return connect(with_password, failure);
 }
 
 /// Opens a connection. On failure, `failure` holds the error and the handle is closed.

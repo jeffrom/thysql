@@ -29,6 +29,19 @@ pub const ResultFormat = enum { table, tab, vertical };
 /// host "localhost", TCP otherwise. -P selects tcp and -S selects socket.
 pub const Protocol = enum { default, tcp, socket };
 
+/// Where the password comes from. The last source set wins, as with the other options.
+/// `password.fetch` turns it into the password for each connect.
+pub const PasswordSource = union(enum) {
+    /// MYSQL_PWD, a my.cnf `password=`, or "" for none.
+    literal: []const u8,
+    /// -p, or a bare `password` in an option file.
+    prompt,
+    /// `--auth-command`: the command prints the password.
+    command: []const u8,
+    /// The keychain item for this account.
+    keychain: []const u8,
+};
+
 pub const Id = enum {
     host,
     database,
@@ -162,10 +175,9 @@ pub const Tls = struct {
 pub const Options = struct {
     host: []const u8 = "",
     user: []const u8 = "",
-    password: []const u8 = "",
+    password_source: PasswordSource = .{ .literal = "" },
     database: []const u8 = "",
     port: u32 = 3306,
-    prompt_password: bool = false,
     socket: []const u8 = "",
     protocol: Protocol = .default,
     tls: Tls = .{},
@@ -255,7 +267,7 @@ fn defaultOptions(env: *const std.process.Environ.Map) Error!Options {
     return .{
         .host = envValue(env, "MARIADB_HOST") orelse envValue(env, "MYSQL_HOST") orelse "localhost",
         .user = envValue(env, "USER") orelse "",
-        .password = envValue(env, "MYSQL_PWD") orelse "",
+        .password_source = .{ .literal = envValue(env, "MYSQL_PWD") orelse "" },
         .port = try defaultPort(env),
     };
 }
@@ -477,11 +489,9 @@ fn applySetting(allocator: Allocator, options: *Options, setting: OptionFile.Set
 
     if (spec.id == .password) {
         if (setting.value) |password| {
-            options.password = password;
-            options.prompt_password = false;
+            options.password_source = .{ .literal = password };
         } else {
-            options.prompt_password = true;
-            options.password = "";
+            options.password_source = .prompt;
         }
         return;
     }
@@ -550,8 +560,7 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
             if (value != null) {
                 return Error.PasswordOnCommandLine;
             }
-            options.prompt_password = true;
-            options.password = "";
+            options.password_source = .prompt;
         },
         .execute => {
             const sql = try requiredValue(value);
@@ -656,9 +665,9 @@ test "connection options default from environment" {
     defer options.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("maria.example", options.host);
     try std.testing.expectEqualStrings("jeff", options.user);
-    try std.testing.expectEqualStrings("env-secret", options.password);
+    try std.testing.expectEqualStrings("env-secret", options.password_source.literal);
     try std.testing.expectEqual(@as(u32, 4407), options.port);
-    try std.testing.expect(!options.prompt_password);
+    try std.testing.expect(options.password_source != .prompt);
 }
 
 test "connection options parse mysql-style connection flags" {
@@ -682,8 +691,7 @@ test "positional database follows password prompt flag" {
     const args = [_][]const u8{ "thysql", "-p", "app_db" };
     var options = try parse(std.testing.allocator, &args, &env);
     defer options.deinit(std.testing.allocator);
-    try std.testing.expect(options.prompt_password);
-    try std.testing.expectEqualStrings("", options.password);
+    try std.testing.expect(options.password_source == .prompt);
     try std.testing.expectEqualStrings("app_db", options.database);
 }
 
@@ -1100,7 +1108,7 @@ test "option-file settings sit between the environment and the command line" {
     try std.testing.expectEqualStrings("file-host", options.host);
     try std.testing.expectEqualStrings("cli-user", options.user);
     try std.testing.expectEqual(@as(u32, 4000), options.port);
-    try std.testing.expectEqualStrings("env-secret", options.password);
+    try std.testing.expectEqualStrings("env-secret", options.password_source.literal);
 }
 
 test "parseWithSettings parses from the given index, skipping earlier arguments" {
@@ -1123,26 +1131,23 @@ test "a password in an option file beats MYSQL_PWD; a bare one prompts; an empty
     const from_file = [_]OptionFile.Setting{.{ .name = "password", .value = "file-secret" }};
     var with_password = try parseWithSettings(std.testing.allocator, &args, 1, &env, &from_file);
     defer with_password.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("file-secret", with_password.password);
-    try std.testing.expect(!with_password.prompt_password);
+    try std.testing.expectEqualStrings("file-secret", with_password.password_source.literal);
 
     const bare = [_]OptionFile.Setting{.{ .name = "password", .value = null }};
     var prompting = try parseWithSettings(std.testing.allocator, &args, 1, &env, &bare);
     defer prompting.deinit(std.testing.allocator);
-    try std.testing.expect(prompting.prompt_password);
-    try std.testing.expectEqualStrings("", prompting.password);
+    try std.testing.expect(prompting.password_source == .prompt);
 
     const empty = [_]OptionFile.Setting{.{ .name = "password", .value = "" }};
     var cleared = try parseWithSettings(std.testing.allocator, &args, 1, &env, &empty);
     defer cleared.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("", cleared.password);
-    try std.testing.expect(!cleared.prompt_password);
+    try std.testing.expectEqualStrings("", cleared.password_source.literal);
 
     // -p on the command line still prompts over a password from the file.
     const prompt_flag = [_][]const u8{ "thysql", "-p" };
     var cli_prompt = try parseWithSettings(std.testing.allocator, &prompt_flag, 1, &env, &from_file);
     defer cli_prompt.deinit(std.testing.allocator);
-    try std.testing.expect(cli_prompt.prompt_password);
+    try std.testing.expect(cli_prompt.password_source == .prompt);
 }
 
 test "option-file names treat dashes and underscores alike, accept loose-, and ignore unknown names" {

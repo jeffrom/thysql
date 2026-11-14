@@ -5,6 +5,7 @@ const Connections = @import("connections.zig");
 const Mysql = @import("mysql.zig");
 const OptionFile = @import("option_file.zig");
 const Options = @import("options.zig");
+const Password = @import("password.zig");
 
 const CompletionRequest = struct {
     database_prefix: []const u8,
@@ -100,15 +101,23 @@ pub fn run(
     defer options.deinit(allocator);
     options.connection = selection.name();
 
-    if (options.prompt_password) {
+    if (options.password_source == .prompt) {
         try stderr.print("Cannot prompt for a password during completion; use MYSQL_PWD.\n", .{});
         return 1;
     }
 
+    var password_supplier: Password.Supplier = .{
+        .allocator = allocator,
+        .io = io,
+        .source = options.password_source,
+        .context = .{ .interactive = false, .stderr = stderr },
+    };
+    defer password_supplier.deinit();
+
     var db = try Mysql.DB.init(allocator, .{
         .host = options.host,
         .user = options.user,
-        .password = options.password,
+        .password_provider = .{ .ctx = &password_supplier, .fetchFn = Password.Supplier.fetchOpaque },
         .database = "",
         .port = options.port,
         .socket = options.socket,

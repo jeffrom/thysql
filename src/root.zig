@@ -11,6 +11,7 @@ const Completion = @import("completion.zig");
 const Connections = @import("connections.zig");
 const Options = @import("options.zig");
 const OptionFile = @import("option_file.zig");
+const Password = @import("password.zig");
 const Prompt = @import("prompt.zig");
 const Readline = @import("readline.zig");
 const SqlCompletion = @import("sql_completion.zig");
@@ -116,38 +117,6 @@ fn beginInterruptibleQuery() void {
 fn endInterruptibleQuery() void {
     query_executing.store(false, .release);
     sigint_requested.store(false, .release);
-}
-
-fn readHiddenLine(allocator: Allocator, io: std.Io, stderr: *std.Io.Writer, prompt: []const u8) ![]u8 {
-    try stderr.print("{s}", .{prompt});
-    try stderr.flush();
-
-    const stdin_fd = std.posix.STDIN_FILENO;
-    const original_term = try std.posix.tcgetattr(stdin_fd);
-    var hidden_term = original_term;
-    hidden_term.lflag.ECHO = false;
-    try std.posix.tcsetattr(stdin_fd, .NOW, hidden_term);
-    defer std.posix.tcsetattr(stdin_fd, .NOW, original_term) catch {};
-    defer stderr.print("\n", .{}) catch {};
-
-    var stdin_buffer: [128]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
-    var line: std.ArrayList(u8) = .empty;
-    errdefer line.deinit(allocator);
-
-    while (true) {
-        var byte: [1]u8 = undefined;
-        const read = try stdin_reader.interface.readSliceShort(&byte);
-        if (read == 0 or byte[0] == '\n') {
-            break;
-        }
-        if (byte[0] == '\r') {
-            break;
-        }
-        try line.append(allocator, byte[0]);
-    }
-
-    return line.toOwnedSlice(allocator);
 }
 
 /// Removes the backticks around a database name given to `use`.
@@ -963,21 +932,26 @@ pub fn runREPL(
     const stdin_is_tty = try stdin.isTty(io);
     const stderr_is_tty = try std.Io.File.stderr().isTty(io);
 
-    var prompted_password: ?[]u8 = null;
-    defer if (prompted_password) |password| allocator.free(password);
-    if (options.prompt_password) {
-        if (!stdin_is_tty) {
+    // The password is fetched on every connect. A prompt is asked once, here, and kept for reconnects.
+    var password_supplier: Password.Supplier = .{
+        .allocator = allocator,
+        .io = io,
+        .source = options.password_source,
+        .context = .{ .interactive = stdin_is_tty, .stderr = stderr },
+    };
+    defer password_supplier.deinit();
+    password_supplier.prime() catch |err| switch (err) {
+        error.NeedsPrompt => {
             try stderr.print("Cannot prompt for a password while reading SQL from stdin; use MYSQL_PWD.\n", .{});
             return 1;
-        }
-        prompted_password = try readHiddenLine(allocator, io, stderr, "Enter password: ");
-        options.password = prompted_password.?;
-    }
+        },
+        else => return err,
+    };
 
     var db = Mysql.DB.init(allocator, .{
         .host = options.host,
         .user = options.user,
-        .password = options.password,
+        .password_provider = .{ .ctx = &password_supplier, .fetchFn = Password.Supplier.fetchOpaque },
         .database = options.database,
         .port = options.port,
         .socket = options.socket,
@@ -1211,6 +1185,7 @@ test {
         @import("mysql.zig"),
         @import("option_file.zig"),
         @import("options.zig"),
+        @import("password.zig"),
         @import("prompt.zig"),
         @import("readline.zig"),
         @import("sql/keywords.zig"),
