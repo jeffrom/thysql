@@ -139,6 +139,29 @@ with `rehash`. The notice about loading is printed on connect and `use`, unless
 `-A` (or `--no-auto-rehash`) skips loading. Then only keywords complete until
 `rehash` runs. `--auto-rehash` turns loading back on.
 
+## parser
+
+The interactive client parses SQL with the MySQL Workbench grammar, as ANTLR4 parser,
+for the version and `sql_mode` of the server. Both are read on connect and reconnect.
+The parser is used three ways:
+
+- **As you type.** When input has been idle for 200 ms, the statement under the cursor
+  is checked. The first error is shown below the line, and its text is underlined in
+  the line. An error that runs to the end of the text is not shown while you are still
+  typing it. A space after it shows it.
+- **After a syntax error from the server.** The server's error comes first. Then the
+  parser's message and a caret under the offending text. The server stays the authority,
+  so a statement the parser rejects is still sent.
+- **Completion.** Tab and the hint take the parser's candidates at the cursor, and the
+  names come from the names that completion loads. When the parser gives nothing, the
+  lexer's context is used.
+
+`--no-parser` turns all three off. Highlighting and completion then use the lexer alone.
+The lexer follows `ANSI_QUOTES` and `NO_BACKSLASH_ESCAPES` in both cases.
+
+A MariaDB server is parsed as the nearest MySQL version: 8.0 from MariaDB 10.2, and 5.7
+before. MariaDB-only syntax is reported as an error, so use `--no-parser` when it matters.
+
 ## reconnect
 
 When the server drops the connection, the interactive client prints the error
