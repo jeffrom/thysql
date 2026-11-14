@@ -84,6 +84,39 @@ pub const ReplConfig = struct {
     /// Optional command history used by navigation and search. Like GNU
     /// Readline, adding accepted lines remains the caller's responsibility.
     history: ?*History = null,
+    /// Optional tab completion. Without it, Tab does nothing.
+    completer: ?Completer = null,
+};
+
+/// The candidates a `Completer` offers for the word being completed. Each candidate
+/// must stay valid until the completer returns, since replete only reads it during
+/// that Tab press.
+pub const Candidates = struct {
+    gpa: std.mem.Allocator,
+    list: std.ArrayList([]const u8) = .empty,
+
+    /// Offers `text`. Candidates are shown in the order they are added.
+    pub fn add(self: *Candidates, text: []const u8) std.mem.Allocator.Error!void {
+        try self.list.append(self.gpa, text);
+    }
+
+    pub fn deinit(self: *Candidates) void {
+        self.list.deinit(self.gpa);
+    }
+};
+
+/// Supplies tab completions. `complete` is called with the whole line and the cursor
+/// offset. It adds the candidates for the word that ends at the cursor, and returns
+/// the offset where that word starts. The word is what gets replaced.
+pub const Completer = struct {
+    /// Passed to `complete` as its first argument.
+    context: ?*anyopaque = null,
+    complete: *const fn (
+        context: ?*anyopaque,
+        line: []const u8,
+        cursor: usize,
+        candidates: *Candidates,
+    ) std.mem.Allocator.Error!usize,
 };
 
 /// The line and cursor as they were before an undoable change.
@@ -123,6 +156,8 @@ pub const Repl = struct {
     /// States to restore on undo, oldest first. Cleared for each new line.
     undo: std.ArrayList(UndoEntry),
     lastCommand: LastCommand = .other,
+    /// Whether the previous key was Tab, so a second Tab lists the candidates.
+    tab_pending: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
         return .{
@@ -146,6 +181,7 @@ pub const Repl = struct {
             .saved_line_valid = false,
             .last_search = .empty,
             .undo = .empty,
+            .tab_pending = false,
         };
     }
 
@@ -319,6 +355,8 @@ pub const Repl = struct {
         const c = try self.cfg.in.takeByte();
         var command: LastCommand = .other;
         defer self.lastCommand = command;
+        const after_tab = self.tab_pending;
+        self.tab_pending = false;
 
         if (self.quoted_next) {
             self.quoted_next = false;
@@ -413,6 +451,11 @@ pub const Repl = struct {
             },
             @intFromEnum(KeyCode.CTRL_T) => {
                 try self.editTransposeChars();
+                return ReadEditState.More;
+            },
+            @intFromEnum(KeyCode.TAB) => {
+                try self.editComplete(after_tab);
+                self.tab_pending = true;
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.CTRL_W) => {
@@ -759,6 +802,71 @@ pub const Repl = struct {
     }
 
     /// Clears the whole screen and redraws the prompt and line at the top.
+    /// Tab completion as in GNU Readline. The word before the cursor is replaced by the
+    /// longest common prefix of the candidates, if that is longer than the word. When it
+    /// is not, a Tab that follows another Tab lists the candidates below the line.
+    fn editComplete(self: *Repl, list_on_miss: bool) !void {
+        const completer = self.cfg.completer orelse return;
+        var candidates: Candidates = .{ .gpa = self.gpa };
+        defer candidates.deinit();
+
+        const start = try completer.complete(completer.context, self.buf.items, self.pos, &candidates);
+        if (start > self.pos or candidates.list.items.len == 0) return;
+
+        const words = candidates.list.items;
+        var common = words[0];
+        for (words[1..]) |word| {
+            common = common[0..commonPrefixLen(common, word)];
+        }
+        if (common.len > self.pos - start) {
+            try self.recordUndo(false);
+            try self.replaceBeforeCursor(start, common);
+        } else if (list_on_miss) {
+            try self.listCandidates(words);
+        }
+    }
+
+    /// Replaces the text from `start` to the cursor with `text`. The cursor ends after it.
+    fn replaceBeforeCursor(self: *Repl, start: usize, text: []const u8) !void {
+        const tail_len = self.buf.items.len - self.pos;
+        const new_len = start + text.len + tail_len;
+        if (new_len > MaxLine) return error.LineTooLong;
+
+        const old_len = self.buf.items.len;
+        if (new_len > old_len) try self.buf.resize(self.gpa, new_len);
+        @memmove(self.buf.items[start + text.len ..][0..tail_len], self.buf.items[self.pos..][0..tail_len]);
+        @memcpy(self.buf.items[start..][0..text.len], text);
+        if (new_len < old_len) self.buf.items.len = new_len;
+        self.pos = start + text.len;
+        try self.refreshLine();
+    }
+
+    /// Prints `words` in columns below the line, then draws the line again under them.
+    fn listCandidates(self: *Repl, words: []const []const u8) !void {
+        var width: usize = 0;
+        for (words) |word| width = @max(width, unicode.displayWidth(word));
+        const column = width + 2;
+        const per_row = @max(self.cols / column, 1);
+
+        // Leave the line from its last row, which may be below the cursor's.
+        if (self.rendered_rows > 0 and self.rendered_rows - 1 > self.rendered_cursor_row) {
+            try self.cfg.out.print("\x1b[{d}B", .{self.rendered_rows - 1 - self.rendered_cursor_row});
+        }
+        try self.cfg.out.writeAll("\r\n");
+        for (words, 0..) |word, i| {
+            try self.cfg.out.writeAll(word);
+            if ((i + 1) % per_row == 0 or i + 1 == words.len) {
+                try self.cfg.out.writeAll("\r\n");
+            } else {
+                for (0..column - unicode.displayWidth(word)) |_| try self.cfg.out.writeByte(' ');
+            }
+        }
+        // The line is drawn below the list, so the redraw must not move up.
+        self.rendered_rows = 0;
+        self.rendered_cursor_row = 0;
+        try self.refreshLine();
+    }
+
     fn editClearScreen(self: *Repl) !void {
         try self.cfg.out.writeAll("\x1b[H\x1b[2J");
         // Nothing above the cursor is rendered any more, so the redraw must not move up.
@@ -1312,6 +1420,7 @@ pub const Repl = struct {
 };
 
 const testKeys = struct {
+    const tab = "\t";
     const enter = "\r";
     const ctrl_j = "\x0a";
     const ctrl_v = "\x16";
@@ -2076,4 +2185,146 @@ test "delete escape sequence removes one UTF-8 codepoint" {
     try std.testing.expectEqual(ReadEditState.More, try repl.readEditKey());
     try std.testing.expectEqualStrings("a界", repl.buf.items);
     try std.testing.expectEqual(@as(usize, 1), repl.pos);
+}
+
+/// Returns the length of the common prefix of `a` and `b`.
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    var n: usize = 0;
+    while (n < a.len and n < b.len and a[n] == b[n]) n += 1;
+    return n;
+}
+
+/// Offers the names that start with the word before the cursor, for the tests.
+const TestCompleter = struct {
+    names: []const []const u8,
+
+    fn complete(context: ?*anyopaque, line: []const u8, cursor: usize, candidates: *Candidates) std.mem.Allocator.Error!usize {
+        const self: *const TestCompleter = @ptrCast(@alignCast(context.?));
+        var start = cursor;
+        while (start > 0 and std.ascii.isAlphanumeric(line[start - 1])) start -= 1;
+        for (self.names) |name| {
+            if (std.mem.startsWith(u8, name, line[start..cursor])) try candidates.add(name);
+        }
+        return start;
+    }
+};
+
+test "tab completes a single candidate" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("x pe" ++ testKeys.tab ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var names: TestCompleter = .{ .names = &.{ "people", "orders" } };
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .completer = .{ .context = &names, .complete = TestCompleter.complete },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("x people", try repl.readline());
+}
+
+test "tab inserts the common prefix, and a second tab lists the candidates" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("x p" ++ testKeys.tab ++ testKeys.tab ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var names: TestCompleter = .{ .names = &.{ "people", "person" } };
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .completer = .{ .context = &names, .complete = TestCompleter.complete },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("x pe", try repl.readline());
+    const written = output.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\r\npeople") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "person") != null);
+}
+
+test "a single tab with several candidates and no common prefix lists nothing" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("x p" ++ testKeys.tab ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var names: TestCompleter = .{ .names = &.{ "people", "person" } };
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .completer = .{ .context = &names, .complete = TestCompleter.complete },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("x pe", try repl.readline());
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\r\npeople") == null);
+}
+
+test "tab with no candidates, or no completer, leaves the line alone" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("x zz" ++ testKeys.tab ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var names: TestCompleter = .{ .names = &.{"people"} };
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .completer = .{ .context = &names, .complete = TestCompleter.complete },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    try std.testing.expectEqualStrings("x zz", try repl.readline());
+
+    try expectReadline("ab" ++ testKeys.tab ++ testKeys.enter, 80, "ab");
+}
+
+test "undo reverts a tab completion" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("x pe" ++ testKeys.tab ++ testKeys.ctrl_underscore ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var names: TestCompleter = .{ .names = &.{ "people", "orders" } };
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .completer = .{ .context = &names, .complete = TestCompleter.complete },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("x pe", try repl.readline());
+}
+
+test "tab completes at the cursor and keeps the text after it" {
+    const allocator = std.testing.allocator;
+    // Five lefts put the cursor after "pe", so the word being completed is "pe".
+    var input: Io.Reader = .fixed("pe rson" ++ testKeys.left ++ testKeys.left ++ testKeys.left ++ testKeys.left ++ testKeys.left ++ testKeys.tab ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var names: TestCompleter = .{ .names = &.{ "people", "orders" } };
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .completer = .{ .context = &names, .complete = TestCompleter.complete },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("people rson", try repl.readline());
 }
