@@ -34,6 +34,8 @@ pub const Session = struct {
     repl: replete.Repl = undefined,
     /// Null when there is no usable history file. The client then has no history.
     history: ?replete.FileHistory = null,
+    /// The highlight spans of the line being drawn. The highlighter returns them.
+    spans: std.ArrayList(replete.Span) = .empty,
 
     /// Sets up the line editor for the interactive client. Lines are read from stdin and
     /// written to `out`. Tab completes the SQL keywords and the words in `names`, which the
@@ -64,6 +66,8 @@ pub const Session = struct {
             .out = out,
             .history = if (self.history) |*file| &file.history else null,
             .completer = .{ .context = names, .complete = completeWord },
+            .highlighter = .{ .context = self, .highlight = highlightLine },
+            .hinter = if (self.history) |*file| replete.Hinter{ .context = &file.history, .hint = replete.historyHinter } else null,
         };
         self.repl = try replete.Repl.init(allocator, &self.config);
         return self;
@@ -72,6 +76,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         self.repl.deinit();
         if (self.history) |*file| file.deinit();
+        self.spans.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -122,6 +127,62 @@ fn openHistory(allocator: Allocator, io: std.Io, env: *const std.process.Environ
     defer allocator.free(path);
     history_file.convertIsocline(allocator, io, path) catch {};
     return replete.FileHistory.open(allocator, io, path, history_file.options) catch null;
+}
+
+/// Styles the line for the highlighter. The spans stay valid until the next call. If they
+/// cannot all be kept, the line is drawn with the ones that could be.
+fn highlightLine(context: ?*anyopaque, line: []const u8) []const replete.Span {
+    const session: *Session = @ptrCast(@alignCast(context.?));
+    session.spans.clearRetainingCapacity();
+    sqlSpans(session.gpa, line, &session.spans) catch {};
+    return session.spans.items;
+}
+
+/// Appends spans for the SQL keywords (whole words, any case) and the quoted strings in `line`.
+fn sqlSpans(gpa: Allocator, line: []const u8, spans: *std.ArrayList(replete.Span)) Allocator.Error!void {
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == '\'' or line[i] == '"') {
+            const end = quotedEnd(line, i);
+            try spans.append(gpa, .{ .start = i, .len = end - i, .style = .string });
+            i = end;
+        } else if (isSqlWordByte(line[i])) {
+            var end = i;
+            while (end < line.len and isSqlWordByte(line[end])) end += 1;
+            if (isKeyword(line[i..end])) {
+                try spans.append(gpa, .{ .start = i, .len = end - i, .style = .keyword });
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// The end of the quoted string that starts at `start`: just past its closing quote, or the end of
+/// the line when it is not closed. A doubled quote and a backslash-escaped byte stay inside it.
+fn quotedEnd(line: []const u8, start: usize) usize {
+    const quote = line[start];
+    var i = start + 1;
+    while (i < line.len) : (i += 1) {
+        if (line[i] == '\\') {
+            i += 1;
+        } else if (line[i] == quote) {
+            if (i + 1 < line.len and line[i + 1] == quote) {
+                i += 1;
+            } else {
+                return i + 1;
+            }
+        }
+    }
+    return line.len;
+}
+
+fn isKeyword(word: []const u8) bool {
+    for (SqlCompletion.keywords) |keyword| {
+        if (std.ascii.eqlIgnoreCase(keyword, word)) return true;
+    }
+    return false;
 }
 
 /// Offers the keywords and names that start with the word before the cursor. A word is
@@ -183,6 +244,42 @@ test "completion treats dots as part of the word" {
     const start = try completeWord(&names, line, line.len, &candidates);
     try std.testing.expectEqual(@as(usize, 7), start);
     try std.testing.expectEqualStrings("people.name", candidates.list.items[0].text);
+}
+
+fn expectSpans(line: []const u8, expected: []const replete.Span) !void {
+    var spans: std.ArrayList(replete.Span) = .empty;
+    defer spans.deinit(std.testing.allocator);
+    try sqlSpans(std.testing.allocator, line, &spans);
+    try std.testing.expectEqualSlices(replete.Span, expected, spans.items);
+}
+
+test "highlighting marks keywords in any case and quoted strings" {
+    try expectSpans("select 'a b' FROM t", &.{
+        .{ .start = 0, .len = 6, .style = .keyword },
+        .{ .start = 7, .len = 5, .style = .string },
+        .{ .start = 13, .len = 4, .style = .keyword },
+    });
+}
+
+test "highlighting skips keywords inside names and strings" {
+    try expectSpans("selected 'select' \"and\" x_and", &.{
+        .{ .start = 9, .len = 8, .style = .string },
+        .{ .start = 18, .len = 5, .style = .string },
+    });
+}
+
+test "a doubled quote or a backslash keeps a string going, and an open string runs to the end" {
+    try expectSpans("'select''x' select", &.{
+        .{ .start = 0, .len = 11, .style = .string },
+        .{ .start = 12, .len = 6, .style = .keyword },
+    });
+    try expectSpans("'it\\'s' and", &.{
+        .{ .start = 0, .len = 7, .style = .string },
+        .{ .start = 8, .len = 3, .style = .keyword },
+    });
+    try expectSpans("x 'abc and", &.{
+        .{ .start = 2, .len = 8, .style = .string },
+    });
 }
 
 test "completion with an empty word offers nothing" {
