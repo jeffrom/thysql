@@ -30,6 +30,8 @@ const Repl = struct {
     silent: bool,
     /// The parser and the sql_mode of the server, kept up to date after each connect.
     syntax: *Syntax,
+    /// The -C connection's name, for the \C prompt escape. Empty when there is none.
+    connection: []const u8 = "",
 };
 
 var sigint_requested = std.atomic.Value(bool).init(false);
@@ -454,6 +456,7 @@ fn mainPrompt(context: *ReplContext, delimiter: []const u8) ![:0]u8 {
     const hostname: []const u8 = std.posix.gethostname(&hostname_buffer) catch "";
 
     return Prompt.render(allocator, format, .{
+        .connection = context.repl.connection,
         .full_user = full_user,
         .host_info = db.hostInfo(),
         .hostname = hostname,
@@ -1026,6 +1029,7 @@ pub fn runREPL(
         .reconnect = options.reconnect,
         .silent = options.silent > 0,
         .syntax = &syntax,
+        .connection = options.connection orelse "",
     };
 
     const readline = try Readline.Session.setup(allocator, io, env, out, &names, &syntax);

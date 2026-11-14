@@ -48,6 +48,8 @@ pub const Info = struct {
     server_name: []const u8 = "",
     server_version: []const u8 = "",
     delimiter: []const u8 = ";",
+    /// The -C connection's name, such as "main/ro". Empty when there is none, so \C prints nothing.
+    connection: []const u8 = "",
 };
 
 /// A local date and time. `month` is 0 for January and `weekday` is 0 for Sunday.
@@ -105,6 +107,7 @@ pub fn writeFormat(out: *std.Io.Writer, format: []const u8, info: Info, counter:
                 try out.print("{d}", .{counter.*});
             },
             'v' => try out.writeAll(info.server_version),
+            'C' => try out.writeAll(info.connection),
             'd' => try out.writeAll(if (info.database.len == 0) "(none)" else info.database),
             'N' => try out.writeAll(info.server_name),
             'h' => try writeHost(out, info, false),
@@ -286,6 +289,13 @@ test "time escapes use the given clock, zero-padded where mysql.cc pads" {
     try expectFormat("\\R:\\m:\\s \\r \\P", testInfo(), "20:05:09 08 pm");
     try expectFormat("\\y \\Y \\o \\O \\w", testInfo(), "26 2026 11 Nov Thu");
     try expectFormat("\\D", testInfo(), "Thu Nov  5 20:05:09 2026");
+}
+
+test "\\C shows the -C connection's name, or nothing without one" {
+    var info = testInfo();
+    info.connection = "main/ro";
+    try expectFormat("\\C> ", info, "main/ro> ");
+    try expectFormat("[\\C]", testInfo(), "[]");
 }
 
 test "literal escapes: backslash, space, underscore, delimiter, semicolon, tab, newline" {

@@ -186,3 +186,23 @@ class ConnectionTests(E2ETestCase):
                 self.assertIn("--host=127.0.0.1", result.stdout)
                 self.assertIn(f"--port={server.port}", result.stdout)
                 self.assertIn(f"--database={TEST_DB}", result.stdout)
+
+    def test_prompt_escape_shows_the_connection_name(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.write_connection("local", self.local_text(server))
+                session = self.interactive(["-C", "local", "--prompt=\\C> "], env=password_env(ROOT_USER))
+                session.expect("Welcome to thysql.")
+                session.expect("local> ")
+                session.send("\x04")
+                self.assertEqual(session.wait_exit(), 0)
+
+                # Without -C the escape prints nothing.
+                session = self.interactive(
+                    server.connect_args(ROOT_USER) + ["--prompt=[\\C]> ", TEST_DB],
+                    env=password_env(ROOT_USER),
+                )
+                session.expect("Welcome to thysql.")
+                session.expect("[]> ")
+                session.send("\x04")
+                self.assertEqual(session.wait_exit(), 0)
