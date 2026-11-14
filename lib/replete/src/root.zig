@@ -114,6 +114,22 @@ pub const ReplConfig = struct {
     hinter: ?Hinter = null,
     /// Optional message about the line, drawn on the rows below it.
     diagnoser: ?Diagnoser = null,
+    /// Optional work done while the input is idle, such as parsing the line for a diagnostic.
+    idle: ?Idle = null,
+};
+
+/// Runs work while the user is not typing. `tick` runs once when input has been idle for `delay_ms`,
+/// and again each time a signal interrupts the wait for input, such as a window resize. It gets the
+/// line and the cursor offset, and returns true when the line must be drawn again. It runs on the
+/// thread that reads the line, so it must not block for long.
+pub const Idle = struct {
+    /// Passed to `tick` as its first argument.
+    context: ?*anyopaque = null,
+    /// How long input must be idle, in milliseconds, before `tick` first runs.
+    delay_ms: i32 = 200,
+    tick: *const fn (context: ?*anyopaque, line: []const u8, cursor: usize) bool,
+    /// How the wait for input is done. Tests replace it; the default is `terminal.waitInput`.
+    wait: *const fn (timeout_ms: i32) terminal.Wait = terminal.waitInput,
 };
 
 /// What a completion names. A listing colors each candidate by its kind.
@@ -465,7 +481,31 @@ pub const Repl = struct {
         return false;
     }
 
+    /// Waits for the next key. When input pauses, or a signal interrupts the wait, the idle
+    /// callback runs and the line is drawn again if it asks. Without an idle callback this does nothing.
+    fn awaitInput(self: *Repl) !void {
+        const idle = self.cfg.idle orelse return;
+        if (self.cfg.in.bufferedLen() > 0) return;
+        var timeout = idle.delay_ms;
+        while (true) {
+            switch (idle.wait(timeout)) {
+                .ready => return,
+                .timeout => {
+                    // Once the pause has been handled, wait without a limit until the next key or signal.
+                    timeout = -1;
+                    try self.runIdle(idle);
+                },
+                .interrupted => try self.runIdle(idle),
+            }
+        }
+    }
+
+    fn runIdle(self: *Repl, idle: Idle) !void {
+        if (idle.tick(idle.context, self.buf.items, self.pos)) try self.refreshLine();
+    }
+
     fn readEditKey(self: *Repl) !ReadEditState {
+        try self.awaitInput();
         const c = try self.cfg.in.takeByte();
         var command: LastCommand = .other;
         defer self.lastCommand = command;
@@ -2464,6 +2504,57 @@ test "callbacks wait until the input is idle" {
     try std.testing.expectEqualStrings("select", try repl.readline());
     // Only the final drawing runs after the last key has been read.
     try std.testing.expectEqual(@as(usize, 1), counter.calls);
+}
+
+/// The results of `fakeWait`, in order. Each call takes the first one.
+var fake_waits: []const terminal.Wait = &.{};
+
+fn fakeWait(timeout_ms: i32) terminal.Wait {
+    _ = timeout_ms;
+    const next = fake_waits[0];
+    fake_waits = fake_waits[1..];
+    return next;
+}
+
+/// Counts the idle ticks, and records the length and cursor of the last line.
+const CountingIdle = struct {
+    ticks: usize = 0,
+    last_len: usize = 0,
+    last_cursor: usize = 0,
+
+    fn tick(context: ?*anyopaque, line: []const u8, cursor: usize) bool {
+        const self: *CountingIdle = @ptrCast(@alignCast(context.?));
+        self.ticks += 1;
+        self.last_len = line.len;
+        self.last_cursor = cursor;
+        return true;
+    }
+};
+
+test "idle callback runs after a pause and after each interrupt, with the line" {
+    const allocator = std.testing.allocator;
+    // "a" is typed. Then the wait times out, a signal interrupts the next wait, and the one after
+    // reports input. The input is used up, so the read ends.
+    fake_waits = &.{ .timeout, .interrupted, .ready };
+    var input: Io.Reader = .fixed("a");
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var idle: CountingIdle = .{};
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .idle = .{ .context = &idle, .tick = CountingIdle.tick, .wait = fakeWait },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+    try std.testing.expectError(Io.Reader.Error.EndOfStream, repl.readline());
+
+    try std.testing.expectEqual(@as(usize, 2), idle.ticks);
+    try std.testing.expectEqual(@as(usize, 1), idle.last_len);
+    try std.testing.expectEqual(@as(usize, 1), idle.last_cursor);
+    try std.testing.expectEqual(@as(usize, 0), fake_waits.len);
 }
 
 test "cancelling with type-ahead does not repaint the line after it ends" {

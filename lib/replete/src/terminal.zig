@@ -94,6 +94,37 @@ pub fn columns() usize {
     return size().columns;
 }
 
+/// What `waitInput` saw on the process standard input.
+pub const Wait = enum {
+    /// Input can be read, or the read will fail.
+    ready,
+    /// The time ran out with no input.
+    timeout,
+    /// A signal, such as a window resize, ended the wait.
+    interrupted,
+};
+
+/// Waits up to `timeout_ms` for input on the process standard input. A negative timeout waits
+/// without a limit. Unlike `std.posix.poll`, a signal does not restart the wait: it returns
+/// `interrupted`, so that the caller can react to it. Where polling is not available, the
+/// wait reports `ready`, and the caller reads as it would without a wait.
+pub fn waitInput(timeout_ms: i32) Wait {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return .ready;
+
+    var fds = [_]posix.pollfd{.{
+        .fd = std.Io.File.stdin().handle,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const rc = posix.system.poll(&fds, 1, timeout_ms);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => if (rc == 0) .timeout else .ready,
+        .INTR => .interrupted,
+        // A failed poll reads as ready, so the read that follows reports the error.
+        else => .ready,
+    };
+}
+
 /// Wait briefly for a terminal response on the process standard input. We
 /// still read the bytes through its configured reader so existing buffering
 /// remains authoritative.
