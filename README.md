@@ -136,10 +136,9 @@ names load on connect and on `use` when the database changes. They are reloaded
 with `rehash`. The notice about loading is printed on connect and `use`, unless
 `--silent` is given.
 
-When a hint is shown at the end of the line, Tab accepts it, as Right, End, Ctrl-E,
-Ctrl-F and Meta-L do. Tab completes only when no hint is shown. Meta-W accepts the hint
-up to the end of the word, or completes the word when no hint is shown, and Meta-F
-accepts its next word. On macOS the Meta keys are Option, with the terminal set to
+A hint shown at the end of the line is accepted whole by Meta-L, Right, End, Ctrl-E or
+Ctrl-F. Meta-W accepts it up to the end of the word, or completes the word when no hint
+is shown, and Meta-F accepts its next word. Tab always completes the word. On macOS the Meta keys are Option, with the terminal set to
 use Option as Meta.
 
 `-A` (or `--no-auto-rehash`) skips loading. Then only keywords complete until

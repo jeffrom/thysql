@@ -112,9 +112,6 @@ pub const ReplConfig = struct {
     highlighter: ?Highlighter = null,
     /// Optional suggestion of text to add after the cursor, shown dim. See `historyHinter`.
     hinter: ?Hinter = null,
-    /// Whether Tab accepts a hint shown at the end of the line instead of completing. A Tab
-    /// that accepts a hint does not start a completion, so the next Tab completes.
-    tab_accepts_hint: bool = true,
     /// Optional message about the line, drawn on the rows below it.
     diagnoser: ?Diagnoser = null,
     /// Optional work done while the input is idle, such as parsing the line for a diagnostic.
@@ -614,8 +611,6 @@ pub const Repl = struct {
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.TAB) => {
-                // Only a hint on screen: keys typed in one burst never drew theirs.
-                if (self.cfg.tab_accepts_hint and try self.acceptShownHint(.whole)) return ReadEditState.More;
                 try self.editComplete(after_tab);
                 self.tab_pending = true;
                 return ReadEditState.More;
@@ -2412,62 +2407,45 @@ test "the hint is drawn dim after the cursor and removed when the read ends" {
     try std.testing.expect(std.mem.lastIndexOf(u8, written, "> hello\x1b[0K").? > last_hint);
 }
 
-test "tab accepts the hint at the end of the line" {
-    try expectTabWithHint(&.{ "hello", testKeys.tab, testKeys.enter }, true, "hello world");
+test "tab completes the word even when a hint is shown" {
+    try expectWithHint(&.{ "hello", testKeys.tab, testKeys.enter }, "hello_there ");
 }
 
-test "tab with a hinter and a completer still completes when no hint is shown" {
-    try expectTabWithHint(&.{ "or", testKeys.tab, testKeys.enter }, true, "orders ");
-}
-
-test "tab in the middle of the line completes rather than accepting the hint" {
-    try expectTabWithHint(&.{ "hello", testKeys.left, testKeys.tab, testKeys.enter }, true, "hello_there o");
-}
-
-test "tab ignores the hint when tab_accepts_hint is off" {
-    try expectTabWithHint(&.{ "hello", testKeys.tab, testKeys.enter }, false, "hello_there ");
-}
-
-test "undo reverts a tab that accepted a hint" {
-    try expectTabWithHint(&.{ "hello", testKeys.tab, testKeys.ctrl_underscore, testKeys.enter }, true, "hello");
-}
-
-test "tab does not take a hint that was never drawn" {
-    // "hello" and Tab arrive in one read, so the line is not idle and no hint is drawn.
-    try expectTabWithHint(&.{ "hello" ++ testKeys.tab, testKeys.enter }, true, "hello_there ");
+test "tab with a hinter and a completer completes when no hint is shown" {
+    try expectWithHint(&.{ "or", testKeys.tab, testKeys.enter }, "orders ");
 }
 
 test "meta-w accepts the hint to the end of the word being typed" {
-    try expectTabWithHint(&.{ "sel", testKeys.meta_w, testKeys.enter }, true, "select");
+    try expectWithHint(&.{ "sel", testKeys.meta_w, testKeys.enter }, "select");
 }
 
 test "meta-w takes the next word of a hint that starts with a blank" {
-    try expectTabWithHint(&.{ "hello", testKeys.meta_w, testKeys.enter }, true, "hello world");
+    try expectWithHint(&.{ "hello", testKeys.meta_w, testKeys.enter }, "hello world");
 }
 
 test "meta-w twice takes two words of the hint" {
-    try expectTabWithHint(&.{ "sel", testKeys.meta_w, testKeys.meta_w, testKeys.enter }, true, "select *");
+    try expectWithHint(&.{ "sel", testKeys.meta_w, testKeys.meta_w, testKeys.enter }, "select *");
 }
 
 test "meta-w completes the word when no hint is shown" {
-    try expectTabWithHint(&.{ "or", testKeys.meta_w, testKeys.enter }, true, "orders ");
+    try expectWithHint(&.{ "or", testKeys.meta_w, testKeys.enter }, "orders ");
 }
 
 test "meta-l accepts the whole hint" {
-    try expectTabWithHint(&.{ "sel", testKeys.meta_l, testKeys.enter }, true, "select * from t");
+    try expectWithHint(&.{ "sel", testKeys.meta_l, testKeys.enter }, "select * from t");
 }
 
 test "meta-l does nothing when no hint is shown" {
-    try expectTabWithHint(&.{ "or", testKeys.meta_l, testKeys.enter }, true, "or");
+    try expectWithHint(&.{ "or", testKeys.meta_l, testKeys.enter }, "or");
 }
 
 test "meta-w and meta-l take only a hint that was drawn" {
-    try expectTabWithHint(&.{ "sel" ++ testKeys.meta_l, testKeys.enter }, true, "sel");
+    try expectWithHint(&.{ "sel" ++ testKeys.meta_l, testKeys.enter }, "sel");
 }
 
 /// Reads a line with `hello_hinter` and a completer. Each element of `reads` arrives as its own
 /// read, so the line goes idle, and its hint is drawn, between them.
-fn expectTabWithHint(reads: []const []const u8, tab_accepts_hint: bool, expectedLine: []const u8) !void {
+fn expectWithHint(reads: []const []const u8, expectedLine: []const u8) !void {
     const allocator = std.testing.allocator;
     var calls: [8]std.testing.Reader.Call = undefined;
     for (reads, 0..) |bytes, i| calls[i] = .{ .buffer = bytes };
@@ -2483,7 +2461,6 @@ fn expectTabWithHint(reads: []const []const u8, tab_accepts_hint: bool, expected
         .columns = 80,
         .hinter = hello_hinter,
         .completer = .{ .context = &names, .complete = TestCompleter.complete },
-        .tab_accepts_hint = tab_accepts_hint,
     };
     var repl = try Repl.init(allocator, &cfg);
     defer repl.deinit();
