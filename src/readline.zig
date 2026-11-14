@@ -411,6 +411,10 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
 fn offerParsed(offers: *Offers, completion: *const Completion, line: []const u8, cursor: usize, expect: SqlContext.Expect) std.mem.Allocator.Error!bool {
     switch (expect) {
         .none, .variable, .client_command => return false,
+        // After `name.` the lexer has resolved the name, alias or table, to a table. The parser
+        // only sees a qualifier there and asks for `table_wild` (`t.*`) as well as a column, which
+        // would offer tables after the dot and leave out the columns the lexer can name.
+        .column_of => return false,
         else => {},
     }
     const syntax = completion.syntax orelse return false;
@@ -1012,6 +1016,65 @@ test "with the parser on, nothing is offered inside a string" {
     defer candidates.deinit();
     _ = try completeLine(&completion, "select 'pe", &candidates);
     try std.testing.expectEqual(@as(usize, 0), candidates.list.items.len);
+}
+
+/// Completes at the `|` in `marked`, with the parser on or off, over a `people` table with
+/// columns `id`, `name` and `nickname`, and an `orders` table with `id` and `total`.
+fn expectColumnsAtCursor(parser: bool, marked: []const u8, expected: []const []const u8) !void {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.addTable("app", "people");
+    try names.addColumn("app", "people", "id");
+    try names.addColumn("app", "people", "name");
+    try names.addColumn("app", "people", "nickname");
+    try names.addTable("app", "orders");
+    try names.addColumn("app", "orders", "id");
+    try names.addColumn("app", "orders", "total");
+    try names.setDatabase("app");
+    var syntax = Syntax.init(allocator, parser);
+    defer syntax.deinit();
+    var completion = testCompletion(allocator, &names);
+    completion.syntax = &syntax;
+    defer completion.scratch.deinit();
+
+    const cursor = std.mem.indexOfScalar(u8, marked, '|').?;
+    const line = try std.mem.concat(allocator, u8, &.{ marked[0..cursor], marked[cursor + 1 ..] });
+    defer allocator.free(line);
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    _ = try completeWord(&completion, line, cursor, &candidates);
+
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer texts.deinit(allocator);
+    for (candidates.list.items) |candidate| try texts.append(allocator, candidate.text);
+    std.mem.sort([]const u8, texts.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    if (texts.items.len != expected.len) {
+        std.debug.print("at {s} (parser {}): got {d} candidates:", .{ marked, parser, texts.items.len });
+        for (texts.items) |text| std.debug.print(" {s}", .{text});
+        std.debug.print("\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    for (expected, texts.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "after table. in a select list only that table's columns are offered" {
+    for ([_]bool{ false, true }) |parser| {
+        try expectColumnsAtCursor(parser, "select people.|", &.{ "id", "name", "nickname" });
+        try expectColumnsAtCursor(parser, "select people.n|", &.{ "name", "nickname" });
+    }
+}
+
+test "after alias. before the FROM that defines the alias, that table's columns are offered" {
+    for ([_]bool{ false, true }) |parser| {
+        try expectColumnsAtCursor(parser, "select p.n| from people p;", &.{ "name", "nickname" });
+        try expectColumnsAtCursor(parser, "select p.| from people p", &.{ "id", "name", "nickname" });
+        try expectColumnsAtCursor(parser, "select o.t|, p.name from people p join orders o on o.id = p.id", &.{"total"});
+    }
 }
 
 test "the hint is the rest of the one context candidate, and nothing when there are several" {
