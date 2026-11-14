@@ -7,14 +7,22 @@ const std = @import("std");
 pub const Style = enum {
     /// No styling. Text in this style has no escape sequences.
     plain,
+    /// A reserved SQL keyword.
     keyword,
+    /// A keyword that may also be an identifier, such as `ACCOUNT`.
+    keyword_nonreserved,
     identifier,
+    quoted_identifier,
     string,
     number,
     comment,
     operator,
     variable,
     function,
+    /// The statement delimiter, such as `;`.
+    delimiter,
+    /// A client command such as `\G` or `DELIMITER`.
+    client_command,
     /// A syntax error. Drawn as an underline, curly when `Theme.undercurl` is set.
     @"error",
     /// The ghost text that a `Hinter` suggests after the cursor.
@@ -34,13 +42,17 @@ pub const Span = struct {
 /// both dark and light backgrounds. Every field is an SGR sequence, or empty for none.
 pub const Theme = struct {
     keyword: []const u8 = "\x1b[1;38;5;32m",
+    keyword_nonreserved: []const u8 = "\x1b[38;5;32m",
     identifier: []const u8 = "",
+    quoted_identifier: []const u8 = "\x1b[38;5;66m",
     string: []const u8 = "\x1b[38;5;28m",
     number: []const u8 = "\x1b[38;5;166m",
     comment: []const u8 = "\x1b[2;38;5;244m",
     operator: []const u8 = "\x1b[38;5;241m",
     variable: []const u8 = "\x1b[38;5;97m",
     function: []const u8 = "\x1b[38;5;31m",
+    delimiter: []const u8 = "\x1b[1m",
+    client_command: []const u8 = "\x1b[38;5;125m",
     @"error": []const u8 = "\x1b[4:3m",
     hint: []const u8 = "\x1b[2m",
     diagnostic: []const u8 = "\x1b[38;5;160m",
@@ -53,13 +65,17 @@ pub const Theme = struct {
         return switch (style) {
             .plain => "",
             .keyword => self.keyword,
+            .keyword_nonreserved => self.keyword_nonreserved,
             .identifier => self.identifier,
+            .quoted_identifier => self.quoted_identifier,
             .string => self.string,
             .number => self.number,
             .comment => self.comment,
             .operator => self.operator,
             .variable => self.variable,
             .function => self.function,
+            .delimiter => self.delimiter,
+            .client_command => self.client_command,
             .@"error" => if (self.undercurl) self.@"error" else "\x1b[4m",
             .hint => self.hint,
             .diagnostic => self.diagnostic,
@@ -86,6 +102,18 @@ test "plain style has no escape sequence" {
     const theme: Theme = .{};
     try std.testing.expectEqualStrings("", theme.sgr(.plain));
     try std.testing.expectEqualStrings("", theme.sgr(.identifier));
+}
+
+test "SQL token styles have their own escape sequences unless the theme leaves them plain" {
+    var theme: Theme = .{};
+    try std.testing.expect(theme.sgr(.keyword_nonreserved).len > 0);
+    try std.testing.expect(!std.mem.eql(u8, theme.sgr(.keyword), theme.sgr(.keyword_nonreserved)));
+    try std.testing.expect(theme.sgr(.quoted_identifier).len > 0);
+    try std.testing.expect(theme.sgr(.delimiter).len > 0);
+    try std.testing.expect(theme.sgr(.client_command).len > 0);
+
+    theme.quoted_identifier = "";
+    try std.testing.expectEqualStrings("", theme.sgr(.quoted_identifier));
 }
 
 test "error style is a curly underline unless the theme turns it off" {
