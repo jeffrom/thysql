@@ -283,6 +283,8 @@ pub const Repl = struct {
     final_draw: bool = false,
     /// Whether the last drawing of the line showed a hint or a diagnostic.
     decorated: bool = false,
+    /// Whether the last drawing of the line showed a hint. Tab takes only a hint the user has seen.
+    hint_shown: bool = false,
     /// Whether the last drawing skipped the highlighter, because input was still buffered.
     unhighlighted: bool = false,
 
@@ -612,7 +614,8 @@ pub const Repl = struct {
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.TAB) => {
-                if (self.cfg.tab_accepts_hint and try self.acceptHint(.whole)) return ReadEditState.More;
+                // Only a hint on screen: keys typed in one burst never drew theirs.
+                if (self.cfg.tab_accepts_hint and self.hint_shown and try self.acceptHint(.whole)) return ReadEditState.More;
                 try self.editComplete(after_tab);
                 self.tab_pending = true;
                 return ReadEditState.More;
@@ -1560,6 +1563,7 @@ pub const Repl = struct {
         const hint = if (interactive) (self.currentHint() orelse "") else "";
         const diagnostic = if (interactive) (self.currentDiagnostic() orelse "") else "";
         self.decorated = hint.len > 0 or diagnostic.len > 0;
+        self.hint_shown = hint.len > 0;
         var next = try display.layoutWith(self.gpa, self.active_prompt, self.buf.items, self.pos, self.cols, .{
             .styles = styles,
             .theme = self.cfg.theme,
@@ -2387,34 +2391,44 @@ test "the hint is drawn dim after the cursor and removed when the read ends" {
 }
 
 test "tab accepts the hint at the end of the line" {
-    try expectReadlineWithHinter("hello" ++ testKeys.tab ++ testKeys.enter, "hello world");
+    try expectTabWithHint(&.{ "hello", testKeys.tab, testKeys.enter }, true, "hello world");
 }
 
 test "tab with a hinter and a completer still completes when no hint is shown" {
-    try expectReadlineWithHintAndCompleter("or" ++ testKeys.tab ++ testKeys.enter, true, "orders ");
+    try expectTabWithHint(&.{ "or", testKeys.tab, testKeys.enter }, true, "orders ");
 }
 
 test "tab in the middle of the line completes rather than accepting the hint" {
-    try expectReadlineWithHintAndCompleter("hello" ++ testKeys.left ++ testKeys.tab ++ testKeys.enter, true, "hello_there o");
+    try expectTabWithHint(&.{ "hello", testKeys.left, testKeys.tab, testKeys.enter }, true, "hello_there o");
 }
 
 test "tab ignores the hint when tab_accepts_hint is off" {
-    try expectReadlineWithHintAndCompleter("hello" ++ testKeys.tab ++ testKeys.enter, false, "hello_there ");
+    try expectTabWithHint(&.{ "hello", testKeys.tab, testKeys.enter }, false, "hello_there ");
 }
 
 test "undo reverts a tab that accepted a hint" {
-    try expectReadlineWithHintAndCompleter("hello" ++ testKeys.tab ++ testKeys.ctrl_underscore ++ testKeys.enter, true, "hello");
+    try expectTabWithHint(&.{ "hello", testKeys.tab, testKeys.ctrl_underscore, testKeys.enter }, true, "hello");
 }
 
-fn expectReadlineWithHintAndCompleter(inputBytes: []const u8, tab_accepts_hint: bool, expectedLine: []const u8) !void {
+test "tab does not take a hint that was never drawn" {
+    // "hello" and Tab arrive in one read, so the line is not idle and no hint is drawn.
+    try expectTabWithHint(&.{ "hello" ++ testKeys.tab, testKeys.enter }, true, "hello_there ");
+}
+
+/// Reads a line with `hello_hinter` and a completer. Each element of `reads` arrives as its own
+/// read, so the line goes idle, and its hint is drawn, between them.
+fn expectTabWithHint(reads: []const []const u8, tab_accepts_hint: bool, expectedLine: []const u8) !void {
     const allocator = std.testing.allocator;
-    var input: Io.Reader = .fixed(inputBytes);
+    var calls: [8]std.testing.Reader.Call = undefined;
+    for (reads, 0..) |bytes, i| calls[i] = .{ .buffer = bytes };
+    var buffer: [64]u8 = undefined;
+    var input: std.testing.Reader = .init(&buffer, calls[0..reads.len]);
     var output: Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var names: TestCompleter = .{ .names = &.{ "hello_there", "orders" } };
     const cfg: ReplConfig = .{
         .prompt = "> ",
-        .in = &input,
+        .in = &input.interface,
         .out = &output.writer,
         .columns = 80,
         .hinter = hello_hinter,
