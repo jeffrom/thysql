@@ -371,6 +371,10 @@ pub const Repl = struct {
                 try self.editBackwardsKillLine();
                 return ReadEditState.More;
             },
+            @intFromEnum(KeyCode.CTRL_T) => {
+                try self.editTransposeChars();
+                return ReadEditState.More;
+            },
             @intFromEnum(KeyCode.CTRL_W) => {
                 command = .kill;
                 try self.editUnixWordRubout();
@@ -588,6 +592,36 @@ pub const Repl = struct {
 
     fn editKillWord(self: *Repl) !void {
         try self.killTo(self.forwardWordEnd());
+    }
+
+    /// Readline's transpose-chars: swaps the codepoint before the cursor with
+    /// the one at it and moves past both. At the end of the line, it swaps the
+    /// last two codepoints and leaves the cursor where it was.
+    fn editTransposeChars(self: *Repl) !void {
+        if (self.pos == 0) return;
+
+        const buf = self.buf.items;
+        var first: usize = undefined;
+        var middle: usize = undefined;
+        var end: usize = undefined;
+        var next_pos: usize = undefined;
+        if (self.pos == buf.len) {
+            middle = unicode.codepointStartBefore(buf, self.pos);
+            if (middle == 0) return;
+            first = unicode.codepointStartBefore(buf, middle);
+            end = self.pos;
+            next_pos = self.pos;
+        } else {
+            first = unicode.codepointStartBefore(buf, self.pos);
+            middle = self.pos;
+            end = middle + unicode.codepointLenAt(buf, middle);
+            next_pos = end;
+        }
+
+        // Rotating left by the first segment's length swaps the two segments in place.
+        std.mem.rotate(u8, buf[first..end], middle - first);
+        self.pos = next_pos;
+        try self.refreshLine();
     }
 
     fn editDelete(self: *Repl) !void {
@@ -1131,6 +1165,7 @@ const testKeys = struct {
     const ctrl_p = "\x10";
     const ctrl_r = "\x12";
     const ctrl_s = "\x13";
+    const ctrl_t = "\x14";
     const ctrl_w = "\x17";
     const ctrl_y = "\x19";
     const left = "\x1b[D";
@@ -1493,6 +1528,26 @@ test "meta-d kills the Readline word after the cursor" {
         80,
         "!one two",
     );
+}
+
+test "ctrl-t at the end of the line swaps the last two characters" {
+    try expectReadline("ab" ++ testKeys.ctrl_t ++ testKeys.enter, 80, "ba");
+}
+
+test "ctrl-t in the middle swaps around the cursor and advances past both" {
+    try expectReadline(
+        "abc" ++ testKeys.home ++ testKeys.ctrl_f ++ testKeys.ctrl_t ++ "!" ++ testKeys.enter,
+        80,
+        "ba!c",
+    );
+}
+
+test "ctrl-t at the start of the line does nothing" {
+    try expectReadline("ab" ++ testKeys.home ++ testKeys.ctrl_t ++ testKeys.enter, 80, "ab");
+}
+
+test "ctrl-t swaps whole UTF-8 codepoints" {
+    try expectReadline("aé界" ++ testKeys.ctrl_t ++ testKeys.enter, 80, "a界é");
 }
 
 test "ctrl-w at the start of the line does nothing" {
