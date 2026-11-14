@@ -1194,6 +1194,7 @@ test {
         @import("client.zig"),
         @import("client_command.zig"),
         @import("completion.zig"),
+        @import("connections.zig"),
         @import("history_file.zig"),
         @import("mysql.zig"),
         @import("option_file.zig"),
