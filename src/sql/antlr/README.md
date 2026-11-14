@@ -42,11 +42,12 @@ Each modified file says so at the top. In short:
   `src/sql/keywords.zig` (732 entries, 263 reserved, the MySQL 8.4 list), in
   the same format. Regenerate it from that file, do not edit it.
 
-Open issue, not changed here: `MySQLBaseLexer::isIdentifier()` passes the
-vocabulary's symbolic name (`SELECT_SYMBOL`) to `isReservedKeyword()`, but the
-tables hold plain words (`SELECT`), so that check never matches. Parser
-rules still reject reserved words, because `identifierKeyword` leaves them out
-of the grammar. `MySQLBaseLexer::keywordFromText()` is kept verbatim. Its symbol
+`MySQLBaseLexer::isIdentifier()` drops the `_SYMBOL` suffix from the vocabulary's
+symbolic name (`SELECT_SYMBOL` becomes `SELECT`) before `isReservedKeyword()`
+looks it up. Before this, the lookup never matched, so every keyword counted as
+an identifier. The smoke test checks it. Parser rules still reject reserved
+words, because `identifierKeyword` leaves them out of the grammar.
+`MySQLBaseLexer::keywordFromText()` is kept verbatim. Its symbol
 map is keyed by upper-case token names but looked up with lower-case text, so it
 does not match anything. Nothing in the grammar calls it.
 

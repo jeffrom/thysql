@@ -72,6 +72,28 @@ int main() {
       ++failures;
   }
 
+  // The lexer's isIdentifier(): reserved keywords are not identifiers, other keywords are.
+  struct IdentifierCase {
+    size_t type;
+    const char *name;
+    bool identifier;
+  };
+  const IdentifierCase identifiers[] = {
+    {parsers::MySQLLexer::IDENTIFIER, "IDENTIFIER", true},
+    {parsers::MySQLLexer::SELECT_SYMBOL, "SELECT", false},
+    {parsers::MySQLLexer::STATUS_SYMBOL, "STATUS", true},
+  };
+  for (const IdentifierCase &c : identifiers) {
+    antlr4::ANTLRInputStream input("");
+    parsers::MySQLLexer lexer(&input);
+    lexer.serverVersion = kServerVersion;
+    bool identifier = lexer.isIdentifier(c.type);
+    bool ok = identifier == c.identifier;
+    std::printf("%s isIdentifier %s (%d)\n", ok ? "ok  " : "FAIL", c.name, identifier);
+    if (!ok)
+      ++failures;
+  }
+
   for (const Case &c : cases) {
     size_t errors = countSyntaxErrors(c.sql);
     bool ok = c.valid ? errors == 0 : errors > 0;

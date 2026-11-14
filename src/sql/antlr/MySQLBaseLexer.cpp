@@ -65,7 +65,12 @@ bool MySQLBaseLexer::isIdentifier(size_t type) const {
   if (((sqlMode & AnsiQuotes) != 0) && (type == MySQLLexer::DOUBLE_QUOTED_TEXT))
     return true;
 
+  // The vocabulary names a keyword by its token, such as SELECT_SYMBOL. The keyword tables hold the
+  // plain word, so the suffix is dropped before the lookup.
   std::string symbol = getVocabulary().getSymbolicName(type).data();
+  const std::string suffix = "_SYMBOL";
+  if (symbol.size() > suffix.size() && symbol.compare(symbol.size() - suffix.size(), suffix.size(), suffix) == 0)
+    symbol.erase(symbol.size() - suffix.size());
   if (!symbol.empty() && !MySQLSymbolInfo::isReservedKeyword(symbol, MySQLSymbolInfo::numberToVersion(serverVersion)))
     return true;
 
