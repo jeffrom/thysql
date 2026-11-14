@@ -182,12 +182,16 @@ An example for AWS RDS IAM tokens:
 host = prod.cluster-abc123.us-east-1.rds.amazonaws.com
 port = 3306
 user = app_iam
+ssl-ca = ~/certs/rds-global-bundle.pem
 auth-command = aws rds generate-db-auth-token --hostname "$THYSQL_HOST" --port "$THYSQL_PORT" --username "$THYSQL_USER"
 ```
 
-Then run `thysql -C rds/prod`. RDS IAM tokens are sent with MySQL's `mysql_clear_password`
-plugin, which thysql does not enable yet. This example has not been tested against RDS,
-and it may fail with an authentication error until that plugin is enabled.
+Then run `thysql -C rds/prod`. The token is a fresh one on every connect and reconnect, so
+an expired token is never reused. RDS sends it with the `mysql_clear_password` plugin.
+thysql has that plugin built in and always allows it, as the MariaDB client does, so no
+`--enable-cleartext-plugin` is needed. Because the token goes over the wire as plain text,
+set `ssl-ca` to the RDS CA bundle: with a CA, thysql verifies the server certificate. This
+example has not been tested against RDS.
 
 ### keychain (macOS)
 
