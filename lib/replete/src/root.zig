@@ -512,7 +512,7 @@ pub const Repl = struct {
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.CTRL_E) => {
-                try self.editEndOfLine();
+                try self.editEndKey();
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.CTRL_F) => {
@@ -1635,6 +1635,7 @@ const testKeys = struct {
     const backspace = "\x7f";
     const ctrl_c = "\x03";
     const ctrl_d = "\x04";
+    const ctrl_e = "\x05";
     const ctrl_f = "\x06";
     const ctrl_l = "\x0c";
     const ctrl_n = "\x0e";
@@ -2302,6 +2303,14 @@ test "right arrow in the middle of the line does not accept the hint" {
 
 test "a hint is not part of the line unless it is accepted" {
     try expectReadlineWithHinter("hello" ++ testKeys.enter, "hello");
+}
+
+test "ctrl-e accepts the hint at the end of the line" {
+    try expectReadlineWithHinter("hello" ++ testKeys.ctrl_e ++ testKeys.enter, "hello world");
+}
+
+test "ctrl-e in the middle of the line moves to the end without accepting the hint" {
+    try expectReadlineWithHinter("hello" ++ testKeys.left ++ testKeys.ctrl_e ++ testKeys.enter, "hello");
 }
 
 test "meta-f accepts the first word of the hint" {
