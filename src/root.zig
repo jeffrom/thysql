@@ -7,6 +7,7 @@ const Mysql = @import("mysql.zig");
 const Batch = @import("batch.zig");
 const ClientCommand = @import("client_command.zig");
 const Client = @import("client.zig");
+const KeychainCommand = @import("keychain_command.zig");
 const Completion = @import("completion.zig");
 const Connections = @import("connections.zig");
 const Options = @import("options.zig");
@@ -901,6 +902,9 @@ pub fn runREPL(
     if (args.items.len > 1 and std.mem.eql(u8, args.items[1], "complete")) {
         return try Completion.run(allocator, io, stdout, stderr, args.items, env);
     }
+    if (args.items.len > 1 and std.mem.eql(u8, args.items[1], "keychain")) {
+        return try KeychainCommand.run(allocator, io, stdout, stderr, args.items, env);
+    }
 
     // Option files come before the command line, as in mysql.cc's load_defaults.
     var loaded = OptionFile.load(allocator, io, env, args.items, stderr) catch |err| switch (err) {
@@ -1060,6 +1064,7 @@ pub fn add(a: i32, b: i32) i32 {
 
 test {
     _ = @import("keychain.zig");
+    _ = @import("keychain_command.zig");
 }
 
 test "basic add functionality" {
