@@ -36,7 +36,7 @@ pub const PasswordSource = union(enum) {
     literal: []const u8,
     /// -p, or a bare `password` in an option file.
     prompt,
-    /// `--auth-command`: the command prints the password.
+    /// `--auth-command`: the command prints the password, on every connect.
     command: []const u8,
     /// The keychain item for this account.
     keychain: []const u8,
@@ -52,6 +52,7 @@ pub const Id = enum {
     protocol,
     connect_timeout,
     connection,
+    auth_command,
     ssl,
     skip_ssl,
     ssl_ca,
@@ -112,6 +113,7 @@ pub const specs = [_]Spec{
     .{ .id = .protocol, .long = "protocol", .arg = .required, .arg_name = "name", .group = .connection, .help = "Connection protocol: tcp or socket. Socket applies only to host localhost." },
     .{ .id = .connect_timeout, .long = "connect-timeout", .arg = .required, .arg_name = "#", .group = .connection, .help = "Seconds to wait for the connection to open. Defaults to the library's timeout." },
     .{ .id = .connection, .long = "connection", .short = 'C', .arg = .required, .arg_name = "name", .group = .connection, .help = "Connect with a saved connection from ~/.config/thysql/connections." },
+    .{ .id = .auth_command, .long = "auth-command", .arg = .required, .arg_name = "command", .group = .connection, .help = "Run this shell command to get the password, on every connect and reconnect." },
     .{ .id = .ssl, .long = "ssl", .arg = .optional, .group = .connection, .help = "Use TLS when the server offers it. This is the default." },
     .{ .id = .skip_ssl, .long = "skip-ssl", .group = .connection, .help = "Do not use TLS." },
     .{ .id = .ssl_ca, .long = "ssl-ca", .arg = .required, .arg_name = "file", .group = .connection, .help = "CA certificate file in PEM format. Implies --ssl." },
@@ -544,6 +546,7 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         .connect_timeout => options.connect_timeout = try connectTimeoutValue(value),
         // -C is found by connectionArg before parsing, and the resolved name is set by the caller.
         .connection => {},
+        .auth_command => options.password_source = .{ .command = try requiredValue(value) },
         .ssl => options.tls.enabled = try boolValue(value),
         .skip_ssl => options.tls.enabled = false,
         .ssl_ca => try setTlsPath(options, &options.tls.ca, value),
@@ -1148,6 +1151,33 @@ test "a password in an option file beats MYSQL_PWD; a bare one prompts; an empty
     var cli_prompt = try parseWithSettings(std.testing.allocator, &prompt_flag, 1, &env, &from_file);
     defer cli_prompt.deinit(std.testing.allocator);
     try std.testing.expect(cli_prompt.password_source == .prompt);
+}
+
+test "auth-command sets the password source from a flag and from an option file, and the last one wins" {
+    var env = testEnv();
+    defer env.deinit();
+    try env.put("MYSQL_PWD", "env-secret");
+
+    const flag = [_][]const u8{ "thysql", "--auth-command=print-token" };
+    var by_flag = try parse(std.testing.allocator, &flag, &env);
+    defer by_flag.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("print-token", by_flag.password_source.command);
+
+    const from_file = [_]OptionFile.Setting{.{ .name = "auth_command", .value = "file-token" }};
+    const args = [_][]const u8{"thysql"};
+    var by_file = try parseWithSettings(std.testing.allocator, &args, 1, &env, &from_file);
+    defer by_file.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("file-token", by_file.password_source.command);
+
+    // A -p after the file's auth-command prompts instead.
+    const prompt_flag = [_][]const u8{ "thysql", "-p" };
+    var prompting = try parseWithSettings(std.testing.allocator, &prompt_flag, 1, &env, &from_file);
+    defer prompting.deinit(std.testing.allocator);
+    try std.testing.expect(prompting.password_source == .prompt);
+
+    // The option needs a value.
+    const bare = [_][]const u8{ "thysql", "--auth-command" };
+    try std.testing.expectError(Error.MissingOptionValue, parse(std.testing.allocator, &bare, &env));
 }
 
 test "option-file names treat dashes and underscores alike, accept loose-, and ignore unknown names" {

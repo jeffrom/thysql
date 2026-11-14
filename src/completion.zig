@@ -110,7 +110,8 @@ pub fn run(
         .allocator = allocator,
         .io = io,
         .source = options.password_source,
-        .context = .{ .interactive = false, .stderr = stderr },
+        .context = .{ .interactive = false, .stderr = stderr, .env = env },
+        .connection = options.connection orelse "",
     };
     defer password_supplier.deinit();
 

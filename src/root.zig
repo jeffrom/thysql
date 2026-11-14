@@ -157,6 +157,11 @@ fn reconnectSession(db: *Mysql.DB, out: *std.Io.Writer, repl: *Repl) !bool {
             try out.print("ERROR: Can't connect to the server\n", .{});
             return false;
         },
+        // The password source (the auth command) has printed its error to stderr.
+        Mysql.DBError.PasswordFailed => {
+            try out.print("ERROR: Can't connect to the server\n", .{});
+            return false;
+        },
         else => return err,
     };
     try repl.syntax.refresh(db);
@@ -244,6 +249,11 @@ fn connectCommand(db: *Mysql.DB, out: *std.Io.Writer, err_out: *std.Io.Writer, l
     db.connectTo(database, host) catch |err| switch (err) {
         Mysql.DBError.ConnectError => {
             try db.renderConnectFailure(err_out, line);
+            return false;
+        },
+        // The password source (the auth command) has printed its error to stderr.
+        Mysql.DBError.PasswordFailed => {
+            try err_out.print("ERROR: Can't connect to the server\n", .{});
             return false;
         },
         else => return err,
@@ -937,7 +947,8 @@ pub fn runREPL(
         .allocator = allocator,
         .io = io,
         .source = options.password_source,
-        .context = .{ .interactive = stdin_is_tty, .stderr = stderr },
+        .context = .{ .interactive = stdin_is_tty, .stderr = stderr, .env = env },
+        .connection = options.connection orelse "",
     };
     defer password_supplier.deinit();
     password_supplier.prime() catch |err| switch (err) {
@@ -961,6 +972,8 @@ pub fn runREPL(
     }) catch |err| switch (err) {
         // connect() has already printed the server's error message.
         error.ConnectError => return 1,
+        // The password source has printed its error message.
+        error.PasswordFailed => return 1,
         else => return err,
     };
     defer db.close();

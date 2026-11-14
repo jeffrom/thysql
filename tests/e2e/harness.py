@@ -41,6 +41,8 @@ TEST_DB = "thysql_test"
 PW_USER = "thysql_pw"
 PW_PASSWORD = "e2e-user-pw"
 NOPW_USER = "thysql_nopw"
+AUTH_USER = "thysql_auth"
+AUTH_PASSWORD = "e2e-auth-pw"
 
 LABEL = "thysql-e2e"
 READY_TIMEOUT = 240
@@ -70,10 +72,11 @@ INSERT INTO people VALUES
   (3, 'bob', CONCAT('tab', CHAR(9), 'here'), CONCAT('line1', CHAR(10), 'line2'));
 CREATE TABLE blobs (id INT PRIMARY KEY, data VARBINARY(16));
 INSERT INTO blobs VALUES (1, X'00FF10');
-DROP USER IF EXISTS '{PW_USER}'@'%', '{NOPW_USER}'@'%';
+DROP USER IF EXISTS '{PW_USER}'@'%', '{NOPW_USER}'@'%', '{AUTH_USER}'@'%';
 CREATE USER '{PW_USER}'@'%' IDENTIFIED BY '{PW_PASSWORD}';
 CREATE USER '{NOPW_USER}'@'%';
-GRANT SELECT ON {TEST_DB}.* TO '{PW_USER}'@'%', '{NOPW_USER}'@'%';
+CREATE USER '{AUTH_USER}'@'%' IDENTIFIED BY '{AUTH_PASSWORD}';
+GRANT SELECT ON {TEST_DB}.* TO '{PW_USER}'@'%', '{NOPW_USER}'@'%', '{AUTH_USER}'@'%';
 """
 
 

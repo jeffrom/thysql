@@ -39,7 +39,7 @@ pub const ConnectFailure = struct {
 /// keeps no password when a provider is set.
 pub const PasswordProvider = struct {
     ctx: *anyopaque,
-    fetchFn: *const fn (ctx: *anyopaque) anyerror!Password.Secret,
+    fetchFn: *const fn (ctx: *anyopaque, target: Password.Target, reason: Password.Reason) anyerror!Password.Secret,
 };
 
 pub const DBInfo = struct {
@@ -144,7 +144,7 @@ pub const DB = struct {
             .connect_timeout = info.connect_timeout,
         };
         var failure: ConnectFailure = .{};
-        const db = connectWith(connect_params, info.password_provider, &failure) catch |err| {
+        const db = connectWith(connect_params, info.password_provider, .connect, &failure) catch |err| {
             if (err == error.ConnectError) {
                 std.debug.print("Connect to database failed: {s}\n", .{failure.message()});
             }
@@ -405,13 +405,18 @@ pub const DB = struct {
 
     /// Opens a new connection with the same settings, as mysql.cc's reconnect does.
     pub fn reconnect(self: *DB) DBError!void {
-        return self.connectTo(null, null);
+        return self.connectAs(null, null, .reconnect);
     }
 
     /// Opens a new connection to `host` and selects `database`. Null keeps the current
     /// value. The old connection stays open when this fails, and the failure is kept
     /// for `renderConnectFailure`.
     pub fn connectTo(self: *DB, database: ?[]const u8, host: ?[]const u8) DBError!void {
+        return self.connectAs(database, host, .connect);
+    }
+
+    /// `connectTo`, for a connect made for `reason`, which the password provider sees.
+    fn connectAs(self: *DB, database: ?[]const u8, host: ?[]const u8, reason: Password.Reason) DBError!void {
         const new_database: ?[:0]u8 = if (database) |name| try self.allocator.dupeSentinel(u8, name, 0) else null;
         errdefer if (new_database) |name| self.allocator.free(name);
         const new_host: ?[:0]u8 = if (host) |name| try self.allocator.dupeSentinel(u8, name, 0) else null;
@@ -421,7 +426,7 @@ pub const DB = struct {
         if (new_database) |name| next_params.database = name;
         if (new_host) |name| next_params.host = name;
 
-        const conn = connectWith(next_params, self.password_provider, &self.connect_failure) catch |err| switch (err) {
+        const conn = connectWith(next_params, self.password_provider, reason, &self.connect_failure) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.PasswordFailed => return error.PasswordFailed,
             else => return error.ConnectError,
@@ -553,10 +558,18 @@ fn applyConnectOptions(db: *C.struct_st_mysql, params: ConnectParams) void {
 }
 
 /// Opens a connection. With a provider, the password comes from it for this connect only.
-/// The secret is zeroed when this function returns, after the connect attempt.
-fn connectWith(params: ConnectParams, provider: ?PasswordProvider, failure: *ConnectFailure) !*C.struct_st_mysql {
+/// The secret is zeroed when this function returns, after the connect attempt. Any failure
+/// to get the password is `error.PasswordFailed`, and the provider has reported it.
+fn connectWith(params: ConnectParams, provider: ?PasswordProvider, reason: Password.Reason, failure: *ConnectFailure) !*C.struct_st_mysql {
     const source = provider orelse return connect(params, failure);
-    var secret = source.fetchFn(source.ctx) catch |err| {
+    const target: Password.Target = .{
+        .host = params.host,
+        .user = params.user,
+        .port = params.port,
+        .database = params.database,
+        .socket = params.socket,
+    };
+    var secret = source.fetchFn(source.ctx, target, reason) catch |err| {
         if (err == error.OutOfMemory) {
             return error.OutOfMemory;
         }
