@@ -43,6 +43,8 @@ pub const Session = struct {
     scanner: ?*Batch.Scanner = null,
     /// Scratch space where the highlighter joins the statement so far and the line.
     joined: std.ArrayList(u8) = .empty,
+    /// What tab completion reads. It is in the session, which does not move, so replete can keep its pointer.
+    completion: Completion = undefined,
 
     /// Sets up the line editor for the interactive client. Lines are read from stdin and
     /// written to `out`. Tab completes the SQL keywords and the words in `names`, which the
@@ -67,12 +69,14 @@ pub const Session = struct {
         self.history = openHistory(allocator, io, env);
         errdefer if (self.history) |*file| file.deinit();
 
+        self.completion = .{ .names = names, .scratch = .init(allocator) };
+        errdefer self.completion.scratch.deinit();
         self.config = .{
             .prompt = "",
             .in = &self.input.interface,
             .out = out,
             .history = if (self.history) |*file| &file.history else null,
-            .completer = .{ .context = names, .complete = completeWord },
+            .completer = .{ .context = &self.completion, .complete = completeWord },
             .highlighter = .{ .context = self, .highlight = highlightLine },
             .hinter = if (self.history) |*file| replete.Hinter{ .context = &file.history, .hint = replete.historyHinter } else null,
         };
@@ -82,6 +86,7 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         self.repl.deinit();
+        self.completion.scratch.deinit();
         if (self.history) |*file| file.deinit();
         self.spans.deinit(self.gpa);
         self.joined.deinit(self.gpa);
@@ -201,10 +206,20 @@ fn styleOf(kind: SqlLexer.Kind) ?replete.Style {
     };
 }
 
+/// What tab completion reads. `scratch` holds the strings that candidates point to, such as
+/// `table.column`. It is reset at each Tab press, and the candidates last until the next one.
+const Completion = struct {
+    names: *const SqlCompletion.Names,
+    scratch: std.heap.ArenaAllocator,
+};
+
 /// Offers the keywords and names that start with the word before the cursor. A word is
 /// letters, digits, `_`, `$`, `.`, and bytes from 0x80 up, so `people.na` completes as one word.
 fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidates: *replete.Candidates) std.mem.Allocator.Error!usize {
-    const names: *const SqlCompletion.Names = @ptrCast(@alignCast(context.?));
+    const completion: *Completion = @ptrCast(@alignCast(context.?));
+    _ = completion.scratch.reset(.retain_capacity);
+    const scratch = completion.scratch.allocator();
+    const names = completion.names;
     var start = cursor;
     while (start > 0 and isSqlWordByte(line[start - 1])) {
         start -= 1;
@@ -224,30 +239,66 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
             try candidates.add(name);
         }
     }
-    for (names.words.items) |name| {
-        if (SqlCompletion.matches(name, prefix)) {
-            try candidates.add(name);
+    // Each name once. A column is offered by its name and as table.column, as in mysql.cc.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (names.databases.items) |name| {
+        try offerName(scratch, &seen, candidates, name, prefix);
+    }
+    for (names.tables.items) |table| {
+        try offerName(scratch, &seen, candidates, table.name, prefix);
+    }
+    for (names.routines.items) |routine| {
+        try offerName(scratch, &seen, candidates, routine.name, prefix);
+    }
+    for (names.tables.items) |table| {
+        for (table.columns.items) |column| {
+            try offerName(scratch, &seen, candidates, column, prefix);
+            const qualified = try std.fmt.allocPrint(scratch, "{s}.{s}", .{ table.name, column });
+            try offerName(scratch, &seen, candidates, qualified, prefix);
         }
     }
     return start;
+}
+
+/// Offers `text` when it starts with `prefix` and has not been offered yet. `seen` holds the
+/// names offered by this Tab press, and is allocated from `scratch`.
+fn offerName(
+    scratch: std.mem.Allocator,
+    seen: *std.StringHashMapUnmanaged(void),
+    candidates: *replete.Candidates,
+    text: []const u8,
+    prefix: []const u8,
+) std.mem.Allocator.Error!void {
+    if (!SqlCompletion.matches(text, prefix)) return;
+    const found = try seen.getOrPut(scratch, text);
+    if (!found.found_existing) {
+        try candidates.add(text);
+    }
 }
 
 fn isSqlWordByte(byte: u8) bool {
     return byte >= 0x80 or std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '$' or byte == '.';
 }
 
+/// A completion context over `names` for the tests. The caller frees its scratch arena.
+fn testCompletion(allocator: std.mem.Allocator, names: *const SqlCompletion.Names) Completion {
+    return .{ .names = names, .scratch = .init(allocator) };
+}
+
 test "completion offers keywords and names for the word before the cursor" {
     const allocator = std.testing.allocator;
     var names = SqlCompletion.Names.init(allocator);
     defer names.deinit();
-    try names.add("people");
-    try names.add("orders");
-    try names.add("people.name");
+    var completion = testCompletion(allocator, &names);
+    defer completion.scratch.deinit();
+    try names.addTable("app", "people");
+    try names.addTable("app", "orders");
+    try names.addColumn("app", "people", "name");
 
     var candidates: replete.Candidates = .{ .gpa = allocator };
     defer candidates.deinit();
     const line = "select peo";
-    const start = try completeWord(&names, line, line.len, &candidates);
+    const start = try completeWord(&completion, line, line.len, &candidates);
     try std.testing.expectEqual(@as(usize, 7), start);
     try std.testing.expectEqual(@as(usize, 2), candidates.list.items.len);
     try std.testing.expectEqualStrings("people", candidates.list.items[0].text);
@@ -258,11 +309,13 @@ test "completion offers SQL keywords and functions once each" {
     const allocator = std.testing.allocator;
     var names = SqlCompletion.Names.init(allocator);
     defer names.deinit();
+    var completion = testCompletion(allocator, &names);
+    defer completion.scratch.deinit();
 
     var candidates: replete.Candidates = .{ .gpa = allocator };
     defer candidates.deinit();
     const line = "if";
-    _ = try completeWord(&names, line, line.len, &candidates);
+    _ = try completeWord(&completion, line, line.len, &candidates);
     var ifs: usize = 0;
     var ifnull = false;
     for (candidates.list.items) |candidate| {
@@ -277,12 +330,15 @@ test "completion treats dots as part of the word" {
     const allocator = std.testing.allocator;
     var names = SqlCompletion.Names.init(allocator);
     defer names.deinit();
-    try names.add("people.name");
+    var completion = testCompletion(allocator, &names);
+    defer completion.scratch.deinit();
+    try names.addTable("app", "people");
+    try names.addColumn("app", "people", "name");
 
     var candidates: replete.Candidates = .{ .gpa = allocator };
     defer candidates.deinit();
     const line = "select people.na";
-    const start = try completeWord(&names, line, line.len, &candidates);
+    const start = try completeWord(&completion, line, line.len, &candidates);
     try std.testing.expectEqual(@as(usize, 7), start);
     try std.testing.expectEqualStrings("people.name", candidates.list.items[0].text);
 }
@@ -378,12 +434,14 @@ test "completion with an empty word offers nothing" {
     const allocator = std.testing.allocator;
     var names = SqlCompletion.Names.init(allocator);
     defer names.deinit();
-    try names.add("people");
+    var completion = testCompletion(allocator, &names);
+    defer completion.scratch.deinit();
+    try names.addTable("app", "people");
 
     var candidates: replete.Candidates = .{ .gpa = allocator };
     defer candidates.deinit();
     const line = "select ";
-    const start = try completeWord(&names, line, line.len, &candidates);
+    const start = try completeWord(&completion, line, line.len, &candidates);
     try std.testing.expectEqual(line.len, start);
     try std.testing.expectEqual(@as(usize, 0), candidates.list.items.len);
 }
