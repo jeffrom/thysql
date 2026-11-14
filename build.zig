@@ -25,6 +25,29 @@ pub fn build(b: *std.Build) void {
         .macos => @as(?[]const u8, "/opt/homebrew/lib"),
         else => @as(?[]const u8, null),
     };
+    // The OpenSSL root holds lib/ and include/. Headers default to the root of
+    // -Dopenssl-lib-dir, so cmake compiles MariaDB against the OpenSSL that thysql links.
+    const openssl_root: ?[]const u8 = if (openssl_lib_dir) |lib_dir|
+        std.fs.path.dirname(lib_dir) orelse "."
+    else
+        null;
+    const openssl_include_dir = b.option(
+        []const u8,
+        "openssl-include-dir",
+        "Directory containing OpenSSL headers (default: include/ next to -Dopenssl-lib-dir)",
+    ) orelse @as(?[]const u8, if (openssl_root) |root| b.pathJoin(&.{ root, "include" }) else null);
+    const zstd_lib_dir = b.option(
+        []const u8,
+        "zstd-lib-dir",
+        "Directory containing zstd libraries (default: the library search path)",
+    );
+    // Links ssl, crypto and zstd statically, so the binary needs no Homebrew libraries.
+    // Kerberos is still the system library.
+    const static_deps = b.option(
+        bool,
+        "static-deps",
+        "Link OpenSSL and zstd statically (default: false)",
+    ) orelse false;
     // The version comes from build.zig.zon unless -Dversion overrides it. The commit is
     // optional and empty by default. Both reach the code as the build_options module.
     const zon_version: []const u8 = @import("build.zig.zon").version;
@@ -39,7 +62,12 @@ pub fn build(b: *std.Build) void {
         "commit",
         "Commit to report with --version, such as a short SHA (default: none)",
     ) orelse "");
-    const mariadb = addMariaDbConnectorC(b);
+    const mariadb = addMariaDbConnectorC(b, .{
+        .openssl_root = openssl_root,
+        .openssl_include_dir = openssl_include_dir,
+        .zstd_lib_dir = zstd_lib_dir,
+        .static_deps = static_deps,
+    });
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -102,7 +130,11 @@ pub fn build(b: *std.Build) void {
     mod.link_libcpp = true;
     mod.linkLibrary(parser_lib);
     mod.addObjectFile(mariadb.static_library);
-    linkMariaDbSystemLibraries(mod, target, openssl_lib_dir);
+    linkMariaDbSystemLibraries(mod, target, .{
+        .openssl_lib_dir = openssl_lib_dir,
+        .zstd_lib_dir = zstd_lib_dir,
+        .static_deps = static_deps,
+    });
 
     // The macOS keychain: a C shim over Security.framework, behind src/keychain.zig. Only
     // macOS targets compile it and link the frameworks.
@@ -280,11 +312,27 @@ const MariaDbConnectorC = struct {
     static_library: std.Build.LazyPath,
 };
 
-fn addMariaDbConnectorC(b: *std.Build) MariaDbConnectorC {
+const MariaDbOptions = struct {
+    openssl_root: ?[]const u8,
+    openssl_include_dir: ?[]const u8,
+    zstd_lib_dir: ?[]const u8,
+    static_deps: bool,
+};
+
+fn addMariaDbConnectorC(b: *std.Build, opts: MariaDbOptions) MariaDbConnectorC {
     const build_cmd = b.addSystemCommand(&.{"sh"});
     build_cmd.addFileArg(b.path("tools/build_mariadb_static.sh"));
     build_cmd.addDirectoryArg(b.path("deps/mariadb-connector-c"));
     const build_dir = build_cmd.addOutputDirectoryArg("mariadb-connector-c");
+
+    // The script passes these to cmake. They are arguments, not environment, so
+    // changing an option invalidates the cache.
+    if (opts.openssl_root) |root| build_cmd.addArg(b.fmt("-DOPENSSL_ROOT_DIR={s}", .{root}));
+    if (opts.openssl_include_dir) |dir| build_cmd.addArg(b.fmt("-DOPENSSL_INCLUDE_DIR={s}", .{dir}));
+    if (opts.zstd_lib_dir) |lib_dir| {
+        build_cmd.addArg(b.fmt("-DZSTD_ROOT_DIR={s}", .{std.fs.path.dirname(lib_dir) orelse "."}));
+    }
+    if (opts.static_deps) build_cmd.addArg("-DOPENSSL_USE_STATIC_LIBS=ON");
 
     return .{
         .generated_include_dir = build_dir.path(b, "include"),
@@ -292,13 +340,25 @@ fn addMariaDbConnectorC(b: *std.Build) MariaDbConnectorC {
     };
 }
 
-fn linkMariaDbSystemLibraries(module: *std.Build.Module, target: std.Build.ResolvedTarget, openssl_lib_dir: ?[]const u8) void {
-    if (openssl_lib_dir) |lib_dir| {
+const SystemLibraryOptions = struct {
+    openssl_lib_dir: ?[]const u8,
+    zstd_lib_dir: ?[]const u8,
+    static_deps: bool,
+};
+
+fn linkMariaDbSystemLibraries(module: *std.Build.Module, target: std.Build.ResolvedTarget, opts: SystemLibraryOptions) void {
+    if (opts.openssl_lib_dir) |lib_dir| {
         module.addLibraryPath(.{ .cwd_relative = lib_dir });
     }
-    module.linkSystemLibrary("ssl", .{});
-    module.linkSystemLibrary("crypto", .{});
-    module.linkSystemLibrary("zstd", .{});
+    if (opts.zstd_lib_dir) |lib_dir| {
+        module.addLibraryPath(.{ .cwd_relative = lib_dir });
+    }
+    // Zig falls back to the dynamic library when no .a is found, so check the
+    // result with tools/check_linkage.sh.
+    const link_mode: std.builtin.LinkMode = if (opts.static_deps) .static else .dynamic;
+    module.linkSystemLibrary("ssl", .{ .preferred_link_mode = link_mode });
+    module.linkSystemLibrary("crypto", .{ .preferred_link_mode = link_mode });
+    module.linkSystemLibrary("zstd", .{ .preferred_link_mode = link_mode });
 
     switch (target.result.os.tag) {
         .macos => {
