@@ -1,10 +1,9 @@
 """Interactive sessions under a pseudo-terminal.
 
-Keys: a real Enter sends "\r", which isocline treats as submit. "\n" is
-ctrl+J (shift+Enter), which inserts a newline instead, so every submitted
-line in these tests ends with ENTER.
+Keys: a real Enter sends "\r", which the line editor treats as submit. Every
+submitted line in these tests ends with ENTER.
 
-Ctrl-D only quits once isocline is reading the next line. Each test waits for
+Ctrl-D only quits once the line editor is reading the next line. Each test waits for
 the prompt before sending it, or the tty may still be in cooked mode.
 """
 

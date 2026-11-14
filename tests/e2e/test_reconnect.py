@@ -86,7 +86,7 @@ class ReconnectTests(E2ETestCase):
                 self.kill_from_another_client(server, first)
 
                 session.send("select 9 as nine;" + ENTER)
-                # Wait for the error, not the prompt: isocline redraws the prompt while the line is typed.
+                # Wait for the error, not the prompt: the line editor redraws the prompt while the line is typed.
                 text = session.expect(re.compile(r"ERROR (2006|2013)[^\n]*\n"))
                 self.assertNotIn("No connection", text)
                 session.expect(main_prompt(server))

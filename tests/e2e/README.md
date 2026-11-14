@@ -55,10 +55,9 @@ with SIGKILL, the same filter finds any leftovers.
   the match. ANSI escapes are stripped and CRLF is normalized first.
   `wait_exit()` returns the exit code.
   Keys matter on a pty. Send `"\r"` to submit a line, as a real Enter does.
-  `"\n"` is ctrl+J in isocline, which inserts a newline instead. Send `"\x04"`
-  (Ctrl-D) only after `expect` has seen the prompt, because the tty may still
+  Send `"\x04"` (Ctrl-D) only after `expect` has seen the prompt, because the tty may still
   be in cooked mode before that.
-  The prompt is not a reliable marker on its own. isocline redraws it while a
+  The prompt is not a reliable marker on its own. The line editor redraws it while a
   line is typed, so `expect(prompt)` can match a redraw before the statement has
   run. After a statement, wait for its output, such as `"1 row in set"` or the
   error text, and then for the prompt. After a client command that prints

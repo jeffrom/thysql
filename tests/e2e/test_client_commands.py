@@ -29,9 +29,9 @@ class ClientCommandTests(E2ETestCase):
     def run_line(self, session, server, text, database=TEST_DB):
         """Runs one line and returns its output. Waits for the prompt that follows a newline.
 
-        isocline redraws the prompt (after a carriage return) while a line is typed,
-        and it drops input typed while a command runs. So the real prompt is the one
-        that comes right after the output's final newline."""
+        The line editor redraws the prompt (after a carriage return) while a line is
+        typed. So the real prompt is the one that comes right after the output's final
+        newline."""
         session.send(text + ENTER)
         return session.expect(re.compile(r"\n" + re.escape(prompt_for(server, database))))
 

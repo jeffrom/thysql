@@ -30,7 +30,6 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "deps/isocline",
         "deps/mariadb-connector-c",
         "src",
         "tools",

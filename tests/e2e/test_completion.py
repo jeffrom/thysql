@@ -83,7 +83,7 @@ class CompletionTests(E2ETestCase):
 
                 # Without names, "peo" has nothing to complete to, so the table is missing.
                 session.send("select * from peo" + TAB + " order by id;" + ENTER)
-                # Wait for the error, not the prompt: isocline redraws the prompt while the line is typed.
+                # Wait for the error, not the prompt: the line editor redraws the prompt while the line is typed.
                 output = session.expect("doesn't exist")
                 self.assertIn("ERROR 1146", output)
                 session.expect(main_prompt(server))

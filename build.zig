@@ -58,21 +58,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const isocline_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    isocline_mod.addCSourceFile(.{
-        .file = b.path("deps/isocline/src/isocline.c"),
-        .flags = &.{},
-    });
-    const isocline_artifact = b.addLibrary(.{
-        .name = "isocline",
-        .linkage = .static,
-        .root_module = isocline_mod,
-    });
-
     const mysql_c_translate = b.addTranslateC(.{
         .root_source_file = b.path("src/mysql_c.h"),
         .target = target,
@@ -82,20 +67,10 @@ pub fn build(b: *std.Build) void {
     mysql_c_translate.addIncludePath(b.path("deps/mariadb-connector-c/include"));
     const mysql_c = mysql_c_translate.createModule();
 
-    const isocline_c_translate = b.addTranslateC(.{
-        .root_source_file = b.path("src/isocline_c.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    isocline_c_translate.addIncludePath(b.path("deps/isocline/include"));
-    const isocline_c = isocline_c_translate.createModule();
-
     mod.addImport("mysql_c", mysql_c);
-    mod.addImport("isocline_c", isocline_c);
     mod.addImport("replete", replete_mod);
 
     mod.link_libc = true;
-    mod.linkLibrary(isocline_artifact);
     mod.addObjectFile(mariadb.static_library);
     linkMariaDbSystemLibraries(mod, target, openssl_lib_dir);
 
