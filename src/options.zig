@@ -67,6 +67,7 @@ pub const Id = enum {
     skip_auto_rehash,
     reconnect,
     skip_reconnect,
+    no_parser,
     help,
     version,
 };
@@ -124,6 +125,7 @@ pub const specs = [_]Spec{
     .{ .id = .skip_auto_rehash, .long = "skip-auto-rehash", .group = .output, .help = "Same as --no-auto-rehash." },
     .{ .id = .reconnect, .long = "reconnect", .group = .connection, .help = "Reconnect once if the server has gone away, in the interactive client. This is the default." },
     .{ .id = .skip_reconnect, .long = "skip-reconnect", .group = .connection, .help = "Do not reconnect when the server has gone away." },
+    .{ .id = .no_parser, .long = "no-parser", .group = .output, .help = "Do not parse statements as you type, or report parser errors. Interactive only." },
     .{ .id = .help, .long = "help", .short = '?', .group = .other, .help = "Display this help and exit." },
     .{ .id = .version, .long = "version", .short = 'V', .group = .other, .help = "Output version information and exit." },
 };
@@ -184,6 +186,8 @@ pub const Options = struct {
     auto_rehash: bool = true,
     /// Reconnect when the server has gone away. The interactive client only, as in mysql.cc.
     reconnect: bool = true,
+    /// Parse statements as they are typed, and report parser errors. The interactive client only.
+    parser: bool = true,
     show_help: bool = false,
     show_version: bool = false,
 
@@ -456,6 +460,7 @@ fn applyFileFlag(options: *Options, id: Id, enabled: bool) void {
         .no_auto_rehash, .skip_auto_rehash => options.auto_rehash = !enabled,
         .reconnect => options.reconnect = enabled,
         .skip_reconnect => options.reconnect = !enabled,
+        .no_parser => options.parser = !enabled,
         // Every other flag is caught by the spec-coverage test below.
         else => unreachable,
     }
@@ -522,6 +527,7 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         .no_auto_rehash, .skip_auto_rehash => options.auto_rehash = false,
         .reconnect => options.reconnect = true,
         .skip_reconnect => options.reconnect = false,
+        .no_parser => options.parser = false,
         .help => options.show_help = true,
         .version => options.show_version = true,
     }
@@ -948,6 +954,26 @@ test "pager, tee, and show-warnings flags" {
 
     const missing = [_][]const u8{ "thysql", "--tee" };
     try std.testing.expectError(Error.MissingOptionValue, parse(std.testing.allocator, &missing, &env));
+}
+
+test "--no-parser turns the parser off, and an option file can set it either way" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const plain = [_][]const u8{"thysql"};
+    var defaults = try parse(std.testing.allocator, &plain, &env);
+    defer defaults.deinit(std.testing.allocator);
+    try std.testing.expect(defaults.parser);
+
+    const given = [_][]const u8{ "thysql", "--no-parser" };
+    var options = try parse(std.testing.allocator, &given, &env);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expect(!options.parser);
+
+    const file_on = [_]OptionFile.Setting{.{ .name = "no-parser", .value = "0" }};
+    var from_file = try parseWithSettings(std.testing.allocator, &plain, 1, &env, &file_on);
+    defer from_file.deinit(std.testing.allocator);
+    try std.testing.expect(from_file.parser);
 }
 
 test "prompt, auto-rehash, and reconnect flags, with their negative forms" {

@@ -12,6 +12,7 @@ const SqlCompletion = @import("sql_completion.zig");
 const SqlContext = @import("sql/context.zig");
 const SqlKeywords = @import("sql/keywords.zig");
 const SqlLexer = @import("sql/lexer.zig");
+const Syntax = @import("syntax.zig").Syntax;
 
 /// What `Session.one` read.
 pub const Outcome = union(enum) {
@@ -47,16 +48,20 @@ pub const Session = struct {
     joined: std.ArrayList(u8) = .empty,
     /// What tab completion reads. It is in the session, which does not move, so replete can keep its pointer.
     completion: Completion = undefined,
+    /// The lexer settings for the session's sql_mode, read by the highlighter and completion.
+    syntax: *Syntax,
 
     /// Sets up the line editor for the interactive client. Lines are read from stdin and
     /// written to `out`. Tab completes the names and keywords that fit the context of the cursor,
-    /// from `names`, which the caller keeps loaded. Free the result with `deinit`.
+    /// from `names`, which the caller keeps loaded. `syntax` holds the sql_mode, which the caller keeps
+    /// up to date. Free the result with `deinit`.
     pub fn setup(
         allocator: Allocator,
         io: std.Io,
         env: *const std.process.Environ.Map,
         out: *std.Io.Writer,
         names: *SqlCompletion.Names,
+        syntax: *Syntax,
     ) !*Session {
         const self = try allocator.create(Session);
         errdefer allocator.destroy(self);
@@ -65,13 +70,14 @@ pub const Session = struct {
             .io = io,
             .stdout = out,
             .fd = std.Io.File.stdin().handle,
+            .syntax = syntax,
         };
         // stdin is a terminal here, which cannot be read by position.
         self.input = std.Io.File.stdin().readerStreaming(io, &self.input_buffer);
         self.history = openHistory(allocator, io, env);
         errdefer if (self.history) |*file| file.deinit();
 
-        self.completion = .{ .names = names, .scratch = .init(allocator) };
+        self.completion = .{ .names = names, .syntax = syntax, .scratch = .init(allocator) };
         errdefer self.completion.scratch.deinit();
         self.config = .{
             .prompt = "",
@@ -156,7 +162,7 @@ fn openHistory(allocator: Allocator, io: std.Io, env: *const std.process.Environ
 fn highlightLine(context: ?*anyopaque, line: []const u8) []const replete.Span {
     const session: *Session = @ptrCast(@alignCast(context.?));
     session.spans.clearRetainingCapacity();
-    appendSpans(session.gpa, &session.joined, &session.spans, session.scanner, line) catch {};
+    appendSpans(session.gpa, &session.joined, &session.spans, session.scanner, session.syntax.lexer, line) catch {};
     return session.spans.items;
 }
 
@@ -168,9 +174,10 @@ fn appendSpans(
     joined: *std.ArrayList(u8),
     spans: *std.ArrayList(replete.Span),
     scanner: ?*Batch.Scanner,
+    lexer_options: SqlLexer.Options,
     line: []const u8,
 ) Allocator.Error!void {
-    var options: SqlLexer.Options = .{};
+    var options = lexer_options;
     var prefix: usize = 0;
     joined.clearRetainingCapacity();
     if (scanner) |batch| {
@@ -216,6 +223,8 @@ fn styleOf(kind: SqlLexer.Kind) ?replete.Style {
 /// quoted names. It is reset at each Tab press, and the candidates last until the next one.
 const Completion = struct {
     names: *const SqlCompletion.Names,
+    /// The lexer settings come from here. Null in the tests, which use the defaults.
+    syntax: ?*const Syntax = null,
     /// The statement being typed, while `Session.one` reads a line. It gives the context of the line.
     scanner: ?*Batch.Scanner = null,
     scratch: std.heap.ArenaAllocator,
@@ -282,7 +291,7 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
 fn contextAt(scratch: std.mem.Allocator, completion: *const Completion, line: []const u8, cursor: usize) !SqlContext.Expect {
     var text: std.ArrayList(u8) = .empty;
     var offset = cursor;
-    var options: SqlLexer.Options = .{};
+    var options: SqlLexer.Options = if (completion.syntax) |syntax| syntax.lexer else .{};
     if (completion.scanner) |batch| {
         options.delimiter = batch.delimiterText();
         const pending = batch.pendingQuery().sql;
@@ -624,7 +633,7 @@ fn expectSpans(scanner: ?*Batch.Scanner, line: []const u8, expected: []const rep
     defer joined.deinit(allocator);
     var spans: std.ArrayList(replete.Span) = .empty;
     defer spans.deinit(allocator);
-    try appendSpans(allocator, &joined, &spans, scanner, line);
+    try appendSpans(allocator, &joined, &spans, scanner, .{}, line);
     try std.testing.expectEqualSlices(replete.Span, expected, spans.items);
 }
 
@@ -652,6 +661,19 @@ test "highlighting marks keywords in any case and quoted strings" {
 
 test "a non-reserved keyword has its own style" {
     try expectSpans(null, "account", &.{.{ .start = 0, .len = 7, .style = .keyword_nonreserved }});
+}
+
+test "with ANSI_QUOTES a double-quoted name is an identifier, as the sql_mode says" {
+    const allocator = std.testing.allocator;
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(allocator);
+    var spans: std.ArrayList(replete.Span) = .empty;
+    defer spans.deinit(allocator);
+    try appendSpans(allocator, &joined, &spans, null, .{ .ansi_quotes = true }, "\"a b\" x");
+    try std.testing.expectEqualSlices(replete.Span, &.{
+        .{ .start = 0, .len = 5, .style = .quoted_identifier },
+        .{ .start = 6, .len = 1, .style = .identifier },
+    }, spans.items);
 }
 
 test "highlighting skips keywords inside names and strings" {

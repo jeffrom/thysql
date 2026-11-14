@@ -13,6 +13,7 @@ const OptionFile = @import("option_file.zig");
 const Prompt = @import("prompt.zig");
 const Readline = @import("readline.zig");
 const SqlCompletion = @import("sql_completion.zig");
+const Syntax = @import("syntax.zig").Syntax;
 pub const Unicode = @import("unicode.zig");
 
 /// Settings and state that only the interactive client has. Batch input runs without
@@ -26,6 +27,8 @@ const Repl = struct {
     reconnect: bool,
     /// --silent: the notice about loading names is not printed.
     silent: bool,
+    /// The parser and the sql_mode of the server, kept up to date after each connect.
+    syntax: *Syntax,
 };
 
 var sigint_requested = std.atomic.Value(bool).init(false);
@@ -184,6 +187,7 @@ fn reconnectSession(db: *Mysql.DB, out: *std.Io.Writer, repl: *Repl) !bool {
         },
         else => return err,
     };
+    try repl.syntax.refresh(db);
     try renderConnectionInfo(out, db);
     try loadNames(repl, db, out, false);
     return true;
@@ -273,6 +277,7 @@ fn connectCommand(db: *Mysql.DB, out: *std.Io.Writer, err_out: *std.Io.Writer, l
         else => return err,
     };
     if (repl) |session| {
+        try session.syntax.refresh(db);
         try renderConnectionInfo(out, db);
         if (database != null) {
             try loadNames(session, db, out, true);
@@ -980,6 +985,11 @@ pub fn runREPL(
         return try runBatch(io, stdin, stdin_is_tty, stderr_is_tty, stdout, stderr, &db, &options, &client);
     }
 
+    // The parser warms up on its own thread while the names load. It follows the server's version and sql_mode.
+    var syntax = Syntax.init(allocator, options.parser);
+    defer syntax.deinit();
+    try syntax.refresh(&db);
+
     // The pager and the tee file are for interactive use only, as in mysql.cc.
     try client.configurePager(options.pager, env.get("PAGER"));
     if (options.tee) |path| {
@@ -1004,9 +1014,10 @@ pub fn runREPL(
         .auto_rehash = options.auto_rehash,
         .reconnect = options.reconnect,
         .silent = options.silent > 0,
+        .syntax = &syntax,
     };
 
-    const readline = try Readline.Session.setup(allocator, io, env, out, &names);
+    const readline = try Readline.Session.setup(allocator, io, env, out, &names, &syntax);
     defer readline.deinit();
     // Names load before the banner, as mysql.cc does at connect.
     try loadNames(&repl, &db, out, true);
@@ -1192,6 +1203,7 @@ test {
         @import("sql/lexer_test.zig"),
         @import("sql/parser.zig"),
         @import("sql_completion.zig"),
+        @import("syntax.zig"),
         @import("unicode.zig"),
     };
 }
