@@ -371,11 +371,13 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
         start -= 1;
     }
     const prefix = line[start..cursor];
+    const typed = try typedText(scratch, completion, line);
     var offers: Offers = .{
         .candidates = candidates,
         .scratch = scratch,
         .prefix = prefix,
         .quoted = prefix.len > 0 and prefix[0] == '`',
+        .lower = lowerKeywords(typed.text, typed.offset + start, prefix, typed.options),
     };
     defer offers.seen.deinit(scratch);
 
@@ -424,11 +426,12 @@ fn offerParsed(offers: *Offers, completion: *const Completion, line: []const u8,
     if (list.len == 0) return false;
 
     // The parser also lists tokens that are not words, such as NOT2 for `!`. Only the words of the
-    // keyword table are offered.
+    // keyword and function tables are offered. The grammar has tokens of its own for some functions,
+    // such as COUNT and SUM, which are not keywords.
     var wanted: Wanted = .{};
     var keywords: usize = 0;
     for (list) |candidate| switch (candidate.kind) {
-        .keyword => if (SqlKeywords.find(candidate.text) != null) {
+        .keyword => if (parsedWordKind(candidate.text) != null) {
             keywords += 1;
         },
         .rule => if (candidate.rule) |rule| wanted.add(rule),
@@ -437,10 +440,11 @@ fn offerParsed(offers: *Offers, completion: *const Completion, line: []const u8,
     // does not, so the lexer's context is used for them.
     if (keywords == 0 and !wanted.any()) return false;
     for (list) |candidate| {
-        if (candidate.kind != .keyword or SqlKeywords.find(candidate.text) == null) continue;
+        if (candidate.kind != .keyword) continue;
+        const kind = parsedWordKind(candidate.text) orelse continue;
         // The parser frees its candidates when this returns, and offers keep their text until the next
         // Tab press, so a keyword is copied into the scratch arena.
-        try offers.keyword(try offers.scratch.dupe(u8, candidate.text), .keyword);
+        try offers.keyword(try offers.scratch.dupe(u8, candidate.text), kind);
     }
 
     const names = completion.names;
@@ -453,6 +457,14 @@ fn offerParsed(offers: *Offers, completion: *const Completion, line: []const u8,
     if (wanted.functions) try offerFunctions(offers);
     if (wanted.columns) try offerExpectedColumns(offers, names, expect);
     return true;
+}
+
+/// How a keyword token from the parser is offered: as a keyword, as a function when only the
+/// function table has it, or not at all when it is not a word, such as NOT2.
+fn parsedWordKind(text: []const u8) ?replete.CandidateKind {
+    if (SqlKeywords.find(text) != null) return .keyword;
+    if (SqlKeywords.isFunction(text)) return .function;
+    return null;
 }
 
 /// The kinds of name that the parser's rule candidates ask for.
@@ -557,6 +569,8 @@ const Offers = struct {
     prefix: []const u8,
     /// True when the word starts with a backtick, so names are quoted and keywords are not offered.
     quoted: bool,
+    /// True when keywords and functions are offered in lower case. See `lowerKeywords`.
+    lower: bool = false,
     /// The texts offered so far. The keys are allocated from `scratch`.
     seen: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -569,7 +583,8 @@ const Offers = struct {
     /// Offers a keyword or a function name, which is never quoted. Nothing is offered inside quotes.
     fn keyword(self: *Offers, text: []const u8, kind: replete.CandidateKind) std.mem.Allocator.Error!void {
         if (self.quoted) return;
-        try self.offer(text, kind, true);
+        const shown = if (self.lower) try std.ascii.allocLowerString(self.scratch, text) else text;
+        try self.offer(shown, kind, true);
     }
 
     fn offer(self: *Offers, text: []const u8, kind: replete.CandidateKind, space: bool) std.mem.Allocator.Error!void {
@@ -579,6 +594,33 @@ const Offers = struct {
         try self.candidates.addCandidate(.{ .text = text, .kind = kind, .space = space });
     }
 };
+
+/// Whether keywords are offered in lower case, following how the user writes them. A word being
+/// typed decides by its own letters: all upper case gives upper case, and any lower-case letter
+/// gives lower case, so `Sel` completes as `Select`. With no letters typed yet, the last reserved
+/// keyword or function call before the word decides. Non-reserved keywords such as `name` are
+/// often names, so they do not count. Upper case when nothing decides.
+fn lowerKeywords(text: []const u8, word_start: usize, prefix: []const u8, options: SqlLexer.Options) bool {
+    if (letterCase(prefix)) |case| return case == .lower;
+    var lexer = SqlLexer.Lexer.init(text[0..word_start], options);
+    var lower = false;
+    while (lexer.next()) |token| {
+        if (token.kind != .reserved_keyword and token.kind != .function) continue;
+        if (letterCase(text[token.start..token.end])) |case| lower = case == .lower;
+    }
+    return lower;
+}
+
+/// The case of the letters of `word`: lower when any is lower case, upper when all are, and null
+/// when it has none.
+fn letterCase(word: []const u8) ?enum { lower, upper } {
+    var upper = false;
+    for (word) |byte| {
+        if (std.ascii.isLower(byte)) return .lower;
+        if (std.ascii.isUpper(byte)) upper = true;
+    }
+    return if (upper) .upper else null;
+}
 
 /// The text of `name` as an identifier: in backticks when it needs them, with any backtick doubled.
 fn quoteIdentifier(scratch: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 {
@@ -778,7 +820,7 @@ test "a word that is both a keyword and a function is offered once" {
 
     var candidates: replete.Candidates = .{ .gpa = allocator };
     defer candidates.deinit();
-    _ = try completeLine(&completion, "select if", &candidates);
+    _ = try completeLine(&completion, "SELECT IF", &candidates);
     var ifs: usize = 0;
     var ifnull = false;
     for (candidates.list.items) |candidate| {
@@ -798,7 +840,7 @@ test "at the start of a statement the statement keywords are offered" {
 
     var candidates: replete.Candidates = .{ .gpa = allocator };
     defer candidates.deinit();
-    _ = try completeLine(&completion, "s", &candidates);
+    _ = try completeLine(&completion, "S", &candidates);
     try std.testing.expect(candidates.list.items.len >= 3);
     for (candidates.list.items) |candidate| {
         try std.testing.expectEqual(@as(u8, 'S'), candidate.text[0]);
@@ -939,7 +981,7 @@ test "with the parser on, columns after WHERE are the columns of the tables in s
     try std.testing.expect(!offersAs(&candidates, .column, "total"));
 }
 
-test "with the parser on, a keyword comes from the parser, in upper case" {
+test "with the parser on, a keyword comes from the parser, in the case typed" {
     const allocator = std.testing.allocator;
     var names = SqlCompletion.Names.init(allocator);
     defer names.deinit();
@@ -951,7 +993,7 @@ test "with the parser on, a keyword comes from the parser, in upper case" {
 
     var candidates: replete.Candidates = .{ .gpa = allocator };
     defer candidates.deinit();
-    _ = try completeLine(&completion, "sel", &candidates);
+    _ = try completeLine(&completion, "SEL", &candidates);
     var found = false;
     for (candidates.list.items) |candidate| {
         if (candidate.kind == .keyword and std.mem.eql(u8, candidate.text, "SELECT")) found = true;
@@ -976,9 +1018,9 @@ test "with the parser on, a token that is not a word is not offered" {
     defer candidates.deinit();
     _ = try completeLine(&completion, "select * from people where n", &candidates);
     for (candidates.list.items) |candidate| {
-        try std.testing.expect(!std.mem.eql(u8, candidate.text, "NOT2"));
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(candidate.text, "NOT2"));
     }
-    try std.testing.expect(offersAs(&candidates, .keyword, "NOT"));
+    try std.testing.expect(offersAs(&candidates, .keyword, "not"));
 }
 
 test "with the parser on, a database after USE comes from the server's names" {
@@ -1075,6 +1117,69 @@ test "after alias. before the FROM that defines the alias, that table's columns 
         try expectColumnsAtCursor(parser, "select p.| from people p", &.{ "id", "name", "nickname" });
         try expectColumnsAtCursor(parser, "select o.t|, p.name from people p join orders o on o.id = p.id", &.{"total"});
     }
+}
+
+/// Completes the end of `line`, with the parser on or off, and returns the texts offered.
+fn completeTexts(allocator: std.mem.Allocator, parser: bool, line: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.addTable("app", "People");
+    try names.addColumn("app", "People", "Name");
+    try names.setDatabase("app");
+    var syntax = Syntax.init(allocator, parser);
+    defer syntax.deinit();
+    var completion = testCompletion(allocator, &names);
+    completion.syntax = &syntax;
+    defer completion.scratch.deinit();
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    _ = try completeLine(&completion, line, &candidates);
+    for (candidates.list.items) |candidate| try out.append(allocator, try allocator.dupe(u8, candidate.text));
+}
+
+/// Expects `want` among the completions of `line`, with the parser on and off.
+fn expectOffered(line: []const u8, want: []const u8) !void {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |parser| {
+        var texts: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (texts.items) |text| allocator.free(text);
+            texts.deinit(allocator);
+        }
+        try completeTexts(allocator, parser, line, &texts);
+        for (texts.items) |text| {
+            if (std.mem.eql(u8, text, want)) break;
+        } else {
+            std.debug.print("at \"{s}\" (parser {}): {s} not offered among {d}:", .{ line, parser, want, texts.items.len });
+            for (texts.items) |text| std.debug.print(" {s}", .{text});
+            std.debug.print("\n", .{});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "keywords are completed in the case of the word being typed" {
+    try expectOffered("sel", "select");
+    try expectOffered("SEL", "SELECT");
+    try expectOffered("select * from People wh", "where");
+    try expectOffered("SELECT * FROM People WH", "WHERE");
+    try expectOffered("select * from People WH", "WHERE");
+    try expectOffered("select co", "count");
+    try expectOffered("SELECT CO", "COUNT");
+}
+
+test "with nothing typed, keywords follow the case of the last reserved keyword" {
+    try expectOffered("select * from People ", "where");
+    try expectOffered("SELECT * FROM People ", "WHERE");
+    // `name` and `status` are non-reserved keywords, here column names, so they do not count.
+    try expectOffered("SELECT name, status FROM People ", "WHERE");
+    try expectOffered("", "SELECT");
+}
+
+test "names keep their own case whatever the case typed" {
+    try expectOffered("select * from peo", "People");
+    try expectOffered("SELECT * FROM PEO", "People");
+    try expectOffered("select na", "Name");
 }
 
 test "the hint is the rest of the one context candidate, and nothing when there are several" {
