@@ -298,10 +298,11 @@ fn parseFile(ctx: Context, path: []const u8, role: FileRole) Error!?Parsed {
 }
 
 /// A connection key is any connection or output option, or an execution option, as in
-/// options.zig. Help and version are not allowed here.
+/// options.zig. Help and version are not allowed here, and neither is `connection`: a
+/// connection cannot name another one.
 fn findSpec(key: []const u8) ?options.Spec {
     for (options.specs) |spec| {
-        if (spec.group != .other and OptionFile.sameName(spec.long, key)) {
+        if (spec.group != .other and spec.id != .connection and OptionFile.sameName(spec.long, key)) {
             return spec;
         }
     }
@@ -686,6 +687,21 @@ test "help is not a connection key, and default-conn is refused in a connection 
     stderr = .fixed(&buffer);
     try std.testing.expectError(error.ConnectionFailed, resolveIn(testContext(&arena, root, null, &stderr), "dc-in-file"));
     try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "dc-in-file:1: default-conn is only allowed in a directory's config file") != null);
+}
+
+test "a connection file cannot name another connection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(&tmp, "chained", "connection = other\n");
+    const root = try tmpRoot(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(root);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [512]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&buffer);
+
+    try std.testing.expectError(error.ConnectionFailed, resolveIn(testContext(&arena, root, null, &stderr), "chained"));
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "chained:1: unknown key \"connection\"") != null);
 }
 
 test "default-conn is refused in the root config, which has no directory to apply to" {
