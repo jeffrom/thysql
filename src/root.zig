@@ -1190,6 +1190,7 @@ test {
         @import("sql/lexer.zig"),
         @import("sql/context.zig"),
         @import("sql/lexer_test.zig"),
+        @import("sql/parser.zig"),
         @import("sql_completion.zig"),
         @import("unicode.zig"),
     };
