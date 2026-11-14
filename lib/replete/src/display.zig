@@ -1,5 +1,20 @@
 const std = @import("std");
 const unicode = @import("unicode.zig");
+const highlight = @import("highlight.zig");
+
+const reset_sgr = "\x1b[0m";
+
+/// What to draw besides the plain line. Every field is optional.
+pub const Options = struct {
+    /// The style of each byte of the buffer, when the line is highlighted.
+    styles: ?[]const highlight.Style = null,
+    /// The escape sequence for each style.
+    theme: highlight.Theme = .{},
+    /// Ghost text drawn after the buffer. The caller shows it only with the cursor at the end.
+    hint: []const u8 = "",
+    /// Text drawn on its own rows below the line.
+    diagnostic: []const u8 = "",
+};
 
 pub const Row = struct {
     start: usize,
@@ -31,13 +46,39 @@ pub const prompt_insert_marker = "\x01\x03\x02";
 const Builder = struct {
     allocator: std.mem.Allocator,
     columns: usize,
+    theme: *const highlight.Theme,
     bytes: std.ArrayList(u8) = .empty,
     rows: std.ArrayList(Row) = .empty,
     row_start: usize = 0,
     row: usize = 0,
     col: usize = 0,
+    /// The escape sequence of the style that the next visible text takes.
+    style: []const u8 = "",
+    /// The escape sequence last written to the current row, empty when the row is plain.
+    /// Each row starts plain and ends plain, so that a row can be drawn on its own.
+    emitted: []const u8 = "",
+
+    fn setStyle(self: *Builder, style: highlight.Style) void {
+        self.style = self.theme.sgr(style);
+    }
+
+    /// Writes the current style before visible text, unless the row is already in it.
+    fn ensureStyle(self: *Builder) !void {
+        if (std.mem.eql(u8, self.emitted, self.style)) return;
+        if (self.emitted.len > 0) try self.bytes.appendSlice(self.allocator, reset_sgr);
+        try self.bytes.appendSlice(self.allocator, self.style);
+        self.emitted = self.style;
+    }
+
+    /// Returns the current row to plain, so that it ends without a style.
+    fn endStyle(self: *Builder) !void {
+        if (self.emitted.len == 0) return;
+        try self.bytes.appendSlice(self.allocator, reset_sgr);
+        self.emitted = "";
+    }
 
     fn finishRow(self: *Builder) !void {
+        try self.endStyle();
         try self.rows.append(self.allocator, .{
             .start = self.row_start,
             .end = self.bytes.items.len,
@@ -51,6 +92,7 @@ const Builder = struct {
         if (width > 0 and self.col > 0 and self.col + width > self.columns) {
             try self.finishRow();
         }
+        if (width > 0) try self.ensureStyle();
         try self.bytes.appendSlice(self.allocator, bytes);
         self.col += width;
         if (self.col >= self.columns) try self.finishRow();
@@ -63,6 +105,7 @@ const Builder = struct {
     fn finish(self: *Builder, cursor_row: usize, cursor_col: usize) !Layout {
         // A character in the final terminal column creates a real, empty next
         // screen row. finishRow has already added the full row in that case.
+        try self.endStyle();
         try self.rows.append(self.allocator, .{
             .start = self.row_start,
             .end = self.bytes.items.len,
@@ -146,16 +189,20 @@ const Cursor = struct {
     col: usize,
 };
 
+/// Appends `buffer`, with `styles[i]` for the byte at `i` when given, and leaves the
+/// builder plain. Point is the byte whose cursor position is returned.
 fn appendBuffer(
     builder: *Builder,
     buffer: []const u8,
     point: usize,
+    styles: ?[]const highlight.Style,
 ) !Cursor {
     var cursor_row: usize = 0;
     var cursor_col: usize = 0;
     var cursor_set = false;
     var i: usize = 0;
     while (i < buffer.len) {
+        if (styles) |byte_styles| builder.setStyle(byte_styles[i]);
         // Readline never splits a multicolumn character across the right
         // margin. Point immediately before that character belongs to the row
         // where the character will actually be drawn.
@@ -202,9 +249,17 @@ fn appendBuffer(
         cursor_row = builder.row;
         cursor_col = builder.col;
     }
+    builder.setStyle(.plain);
     return .{ .row = cursor_row, .col = cursor_col };
 }
 
+/// Appends `text` in `style`. The text takes no part in the cursor position.
+fn appendStyledText(builder: *Builder, style: highlight.Style, text: []const u8) !void {
+    builder.setStyle(style);
+    _ = try appendBuffer(builder, text, text.len, null);
+}
+
+/// Lays out the prompt and buffer in `columns`, with the cursor at `point`.
 pub fn layout(
     allocator: std.mem.Allocator,
     prompt: []const u8,
@@ -212,24 +267,46 @@ pub fn layout(
     point: usize,
     columns: usize,
 ) !Layout {
+    return layoutWith(allocator, prompt, buffer, point, columns, .{});
+}
+
+/// Like `layout`, with the styles, hint and diagnostic in `options`. The hint follows the
+/// buffer on its row, and the diagnostic goes on the rows after the whole prompt.
+pub fn layoutWith(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    buffer: []const u8,
+    point: usize,
+    columns: usize,
+    options: Options,
+) !Layout {
     std.debug.assert(point <= buffer.len);
+    if (options.styles) |styles| std.debug.assert(styles.len == buffer.len);
     var builder: Builder = .{
         .allocator = allocator,
         .columns = @max(columns, 1),
+        .theme = &options.theme,
     };
     errdefer builder.bytes.deinit(allocator);
     errdefer builder.rows.deinit(allocator);
 
     const cursor = if (std.mem.indexOf(u8, prompt, prompt_insert_marker)) |insert_at| blk: {
         try appendPrompt(&builder, prompt[0..insert_at]);
-        const result = try appendBuffer(&builder, buffer, point);
+        const result = try appendBuffer(&builder, buffer, point, options.styles);
+        if (options.hint.len > 0) try appendStyledText(&builder, .hint, options.hint);
         try appendPrompt(&builder, prompt[insert_at + prompt_insert_marker.len ..]);
         break :blk result;
     } else blk: {
         try appendPrompt(&builder, prompt);
-        break :blk try appendBuffer(&builder, buffer, point);
+        const result = try appendBuffer(&builder, buffer, point, options.styles);
+        if (options.hint.len > 0) try appendStyledText(&builder, .hint, options.hint);
+        break :blk result;
     };
 
+    if (options.diagnostic.len > 0) {
+        try builder.hardBreak();
+        try appendStyledText(&builder, .diagnostic, options.diagnostic);
+    }
     return builder.finish(cursor.row, cursor.col);
 }
 
@@ -338,4 +415,53 @@ test "kitty graphics setup is not included in repaintable rows" {
     );
     try std.testing.expectEqual(@as(usize, 1), result.cursor_row);
     try std.testing.expectEqual(@as(usize, 7), result.cursor_col);
+}
+
+test "styled text re-emits its style on each wrapped row" {
+    var result = try layoutWith(std.testing.allocator, "", "abcdef", 6, 4, .{
+        .styles = &.{ .keyword, .keyword, .keyword, .keyword, .keyword, .keyword },
+        .theme = .{ .keyword = "<k>" },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.items.len);
+    try std.testing.expectEqualStrings("<k>abcd\x1b[0m", result.row(0));
+    try std.testing.expectEqualStrings("<k>ef\x1b[0m", result.row(1));
+    try std.testing.expectEqual(@as(usize, 1), result.cursor_row);
+    try std.testing.expectEqual(@as(usize, 2), result.cursor_col);
+}
+
+test "styles and escape sequences do not change the cursor column" {
+    const styles = [_]highlight.Style{ .keyword, .keyword, .keyword, .keyword, .keyword, .keyword, .plain, .identifier };
+    var result = try layoutWith(std.testing.allocator, "> ", "select x", 6, 80, .{
+        .styles = &styles,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), result.cursor_row);
+    try std.testing.expectEqual(@as(usize, 8), result.cursor_col);
+}
+
+test "hint follows the buffer in the hint style without moving the cursor" {
+    var result = try layoutWith(std.testing.allocator, "> ", "sel", 3, 80, .{
+        .hint = "ect *",
+        .theme = .{ .hint = "<h>" },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("> sel<h>ect *\x1b[0m", result.row(0));
+    try std.testing.expectEqual(@as(usize, 5), result.cursor_col);
+}
+
+test "diagnostic gets its own row below the line" {
+    var result = try layoutWith(std.testing.allocator, "> ", "x y", 3, 80, .{
+        .diagnostic = "syntax error",
+        .theme = .{ .diagnostic = "<d>" },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.items.len);
+    try std.testing.expectEqualStrings("> x y", result.row(0));
+    try std.testing.expectEqualStrings("<d>syntax error\x1b[0m", result.row(1));
+    try std.testing.expectEqual(@as(usize, 0), result.cursor_row);
 }
