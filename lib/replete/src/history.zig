@@ -109,6 +109,14 @@ pub const History = struct {
         return true;
     }
 
+    /// Removes the newest entry. Returns false when the history is empty.
+    /// This changes memory only; `FileHistory.removeLast` also updates the file.
+    pub fn removeLast(self: *History) bool {
+        if (self.entries.items.len == 0) return false;
+        self.removeAt(self.entries.items.len - 1);
+        return true;
+    }
+
     pub fn find(
         self: *const History,
         query: []const u8,
@@ -235,6 +243,71 @@ pub const History = struct {
     }
 };
 
+/// A `History` kept in step with a file. `open` loads the file if it exists,
+/// and `add` appends each accepted line to it. The file is rewritten only when
+/// the in-memory history had to drop an entry (its limit, or deduplication),
+/// so it stays within the limit. Missing files and directories are not errors.
+pub const FileHistory = struct {
+    gpa: std.mem.Allocator,
+    dir: Io.Dir,
+    path: []u8,
+    /// The in-memory history. Its address must stay fixed while it is in use,
+    /// so pass `&file.history` to `ReplConfig.history` after `open` returns.
+    history: History,
+
+    /// Opens `path` relative to the current directory. See `openInDir`.
+    pub fn open(gpa: std.mem.Allocator, io: Io, path: []const u8, options: Options) !FileHistory {
+        return openInDir(gpa, io, .cwd(), path, options);
+    }
+
+    /// Opens `path` relative to `dir`, which must outlive the returned value.
+    /// Loads the file when it exists and creates its parent directory on a
+    /// best-effort basis. Other load errors, such as an unreadable file, are returned.
+    pub fn openInDir(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8, options: Options) !FileHistory {
+        if (std.fs.path.dirname(path)) |parent| {
+            dir.createDirPath(io, parent) catch {};
+        }
+        var self: FileHistory = .{
+            .gpa = gpa,
+            .dir = dir,
+            .path = try gpa.dupe(u8, path),
+            .history = .init(gpa, options),
+        };
+        errdefer self.deinit();
+        self.history.readFileFromDir(io, dir, path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *FileHistory) void {
+        self.history.deinit();
+        self.gpa.free(self.path);
+    }
+
+    /// Adds `line` as the newest entry and saves it. Returns false, and leaves
+    /// the file unchanged, when the history suppresses the line.
+    pub fn add(self: *FileHistory, io: Io, line: []const u8) !bool {
+        const before = self.history.len();
+        if (!try self.history.addNow(io, line)) return false;
+        if (self.history.len() == before + 1) {
+            try self.history.appendFileToDir(io, self.dir, self.path, 1);
+        } else {
+            // An older entry was dropped, so the file would keep it forever.
+            try self.history.writeFileToDir(io, self.dir, self.path);
+        }
+        return true;
+    }
+
+    /// Removes the newest entry and rewrites the file. Returns false when empty.
+    pub fn removeLast(self: *FileHistory, io: Io) !bool {
+        if (!self.history.removeLast()) return false;
+        try self.history.writeFileToDir(io, self.dir, self.path);
+        return true;
+    }
+};
+
 fn trimCr(line: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, line, "\r")) line[0 .. line.len - 1] else line;
 }
@@ -334,4 +407,104 @@ test "appendFile appends only the requested newest entries" {
     const bytes = try tmp.dir.readFileAlloc(io, "history", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("existing\ntwo\n", bytes);
+}
+
+test "removeLast drops only the newest entry" {
+    var history = History.init(std.testing.allocator, .{});
+    defer history.deinit();
+    try std.testing.expect(!history.removeLast());
+
+    _ = try history.add("one", 1);
+    _ = try history.add("two", 2);
+    try std.testing.expect(history.removeLast());
+    try std.testing.expectEqual(@as(usize, 1), history.len());
+    try std.testing.expectEqualStrings("one", history.get(0).?.line);
+}
+
+fn readTestFile(allocator: std.mem.Allocator, dir: Io.Dir, path: []const u8) ![]u8 {
+    return dir.readFileAlloc(std.testing.io, path, allocator, .limited(1024));
+}
+
+test "FileHistory treats a missing file and directory as empty" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try FileHistory.openInDir(std.testing.allocator, io, tmp.dir, "missing/history", .{
+        .write_timestamps = false,
+    });
+    defer file.deinit();
+    try std.testing.expectEqual(@as(usize, 0), file.history.len());
+
+    // The directory is created on open, so the first accepted line can be saved.
+    try std.testing.expect(try file.add(io, "first"));
+    const bytes = try readTestFile(std.testing.allocator, tmp.dir, "missing/history");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("first\n", bytes);
+}
+
+test "FileHistory appends accepted lines and reloads them" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "history", .data = "existing\n" });
+
+    {
+        var file = try FileHistory.openInDir(std.testing.allocator, io, tmp.dir, "history", .{
+            .write_timestamps = false,
+            .deduplication = .consecutive,
+        });
+        defer file.deinit();
+        try std.testing.expectEqual(@as(usize, 1), file.history.len());
+        try std.testing.expect(try file.add(io, "two"));
+        try std.testing.expect(!try file.add(io, "two"));
+    }
+
+    const bytes = try readTestFile(std.testing.allocator, tmp.dir, "history");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("existing\ntwo\n", bytes);
+
+    var reloaded = try FileHistory.openInDir(std.testing.allocator, io, tmp.dir, "history", .{});
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), reloaded.history.len());
+    try std.testing.expectEqualStrings("two", reloaded.history.get(1).?.line);
+}
+
+test "FileHistory rewrites the file when the limit drops the oldest entry" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try FileHistory.openInDir(std.testing.allocator, io, tmp.dir, "history", .{
+        .limit = 2,
+        .write_timestamps = false,
+    });
+    defer file.deinit();
+    _ = try file.add(io, "a");
+    _ = try file.add(io, "b");
+    _ = try file.add(io, "c");
+
+    try std.testing.expectEqual(@as(usize, 2), file.history.len());
+    const bytes = try readTestFile(std.testing.allocator, tmp.dir, "history");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("b\nc\n", bytes);
+}
+
+test "FileHistory removeLast rewrites the file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try FileHistory.openInDir(std.testing.allocator, io, tmp.dir, "history", .{
+        .write_timestamps = false,
+    });
+    defer file.deinit();
+    _ = try file.add(io, "keep");
+    _ = try file.add(io, "drop");
+    try std.testing.expect(try file.removeLast(io));
+    try std.testing.expectEqual(@as(usize, 1), file.history.len());
+
+    const bytes = try readTestFile(std.testing.allocator, tmp.dir, "history");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("keep\n", bytes);
 }
