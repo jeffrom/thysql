@@ -534,14 +534,14 @@ fn formatHistoryEntry(allocator: Allocator, query: Batch.Query, delimiter: []con
     return try entry.toOwnedSliceSentinel(allocator, 0);
 }
 
-fn addQueryToHistory(allocator: Allocator, query: Batch.Query, delimiter: []const u8, ignore: *const Readline.Ignore) !void {
+fn addQueryToHistory(allocator: Allocator, query: Batch.Query, delimiter: []const u8, readline: *Readline.Session, ignore: *const Readline.Ignore) !void {
     if (query.sql.len == 0) {
         return;
     }
 
     const entry = try formatHistoryEntry(allocator, query, delimiter);
     defer allocator.free(entry);
-    Readline.addHistory(ignore, entry);
+    readline.addHistory(ignore, entry);
 }
 
 fn rememberLastQuery(allocator: Allocator, last_query: *std.ArrayList(u8), query: Batch.Query) !void {
@@ -683,6 +683,7 @@ const ReplContext = struct {
     session: Batch.Session,
     client: *Client,
     repl: Repl,
+    readline: *Readline.Session,
 };
 
 /// Runs one statement typed at the prompt. Errors are printed, and the REPL keeps going.
@@ -695,7 +696,7 @@ fn executeReplQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.
         if (command == null) {
             try rememberLastQuery(allocator, context.last_query, query);
         }
-        try addQueryToHistory(allocator, query, context.scanner.delimiterText(), context.repl.history_ignore);
+        try addQueryToHistory(allocator, query, context.scanner.delimiterText(), context.readline, context.repl.history_ignore);
     }
     if (command) |client_command| {
         return try runClientCommand(context.client, context.db, stdout, stdout, null, &context.repl, context.scanner.delimiterText(), client_command);
@@ -744,17 +745,13 @@ fn readOneLine(
     const prompt = try interactivePrompt(context, scanner);
     defer db.allocator.free(prompt);
 
-    const maybeLine = try Readline.one(db.allocator, prompt);
-    if (maybeLine == null) {
-        return true;
-    }
-
-    const line = maybeLine.?;
-    defer Readline.freeLine(@ptrCast(@constCast(line.ptr)));
+    const line = switch (try context.readline.one(prompt)) {
+        .line => |text| text,
+        .cancelled => return false,
+        .eof => return true,
+    };
+    defer db.allocator.free(line);
     context.client.echoInput(prompt, line);
-    if (line.len > 1) {
-        Readline.removeLastHistory();
-    }
     if (isClearCommand(line)) {
         scanner.reset();
         return false;
@@ -1005,7 +1002,8 @@ pub fn runREPL(
         .silent = options.silent > 0,
     };
 
-    Readline.setup(allocator, io, env, &names);
+    const readline = try Readline.Session.setup(allocator, io, env, out, &names);
+    defer readline.deinit();
     // Names load before the banner, as mysql.cc does at connect.
     try loadNames(&repl, &db, out, true);
     try renderConnectionBanner(out, db.serverName(), db.connectionId(), db.serverVersion(), Mysql.clientInfo());
@@ -1027,6 +1025,7 @@ pub fn runREPL(
         .session = Batch.Session.init(allocator, io, options.force),
         .client = &client,
         .repl = repl,
+        .readline = readline,
     };
     while (true) {
         const done = try readOneLine(&context, out, stderr, env);

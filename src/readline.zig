@@ -1,87 +1,202 @@
+//! The interactive line editor: replete with the REPL's history file, its tab
+//! completion of SQL keywords and names, and the MYSQL_HISTIGNORE filter.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const replete = @import("replete");
 
-const isocline = @import("isocline.zig");
+const history_file = @import("history_file.zig");
 const SqlCompletion = @import("sql_completion.zig");
 
-pub fn freeLine(ptr: ?*anyopaque) void {
-    isocline.freeMemory(ptr);
-}
+/// What `Session.one` read.
+pub const Outcome = union(enum) {
+    /// The line without its newline. The caller owns it, and frees it with the allocator
+    /// that `setup` was given.
+    line: [:0]u8,
+    /// Ctrl-C. The line is dropped, and the caller shows a new prompt.
+    cancelled,
+    /// Ctrl-D on an empty line, or the end of input.
+    eof,
+};
 
-/// Reads one line. The prompt is shown as written, with its `[` and `\` escaped for isocline.
-pub fn one(allocator: Allocator, prompt: [:0]const u8) !?[:0]const u8 {
-    const escaped = try escapeMarkup(allocator, prompt);
-    defer allocator.free(escaped);
-    return isocline.readline(escaped);
-}
+/// The line editor for the interactive client. It is created once, by `setup`.
+pub const Session = struct {
+    gpa: Allocator,
+    io: std.Io,
+    /// Where replete writes the prompt and echoes the line. Also where a newline goes
+    /// after each line, which replete leaves to its caller.
+    stdout: *std.Io.Writer,
+    /// The terminal to read lines from.
+    fd: i32,
+    input_buffer: [4096]u8 = undefined,
+    input: std.Io.File.Reader = undefined,
+    config: replete.ReplConfig = undefined,
+    repl: replete.Repl = undefined,
+    /// Null when there is no usable history file. The client then has no history.
+    history: ?replete.FileHistory = null,
 
-/// Escapes `text` for isocline's markup, where `[tag]` styles text. A `[` becomes `\[`, and a
-/// `\` becomes `\\`, so both come out as written. Without this, a prompt such as `[\d]> `
-/// would lose its brackets.
-pub fn escapeMarkup(allocator: Allocator, text: []const u8) ![:0]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    for (text) |byte| {
-        if (byte == '[' or byte == '\\') {
-            try out.append(allocator, '\\');
+    /// Sets up the line editor for the interactive client. Lines are read from stdin and
+    /// written to `out`. Tab completes the SQL keywords and the words in `names`, which the
+    /// caller keeps loaded. Free the result with `deinit`.
+    pub fn setup(
+        allocator: Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        out: *std.Io.Writer,
+        names: *SqlCompletion.Names,
+    ) !*Session {
+        const self = try allocator.create(Session);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .gpa = allocator,
+            .io = io,
+            .stdout = out,
+            .fd = std.Io.File.stdin().handle,
+        };
+        // stdin is a terminal here, which cannot be read by position.
+        self.input = std.Io.File.stdin().readerStreaming(io, &self.input_buffer);
+        self.history = openHistory(allocator, io, env);
+        errdefer if (self.history) |*file| file.deinit();
+
+        self.config = .{
+            .prompt = "",
+            .in = &self.input.interface,
+            .out = out,
+            .history = if (self.history) |*file| &file.history else null,
+            .completer = .{ .context = names, .complete = completeWord },
+        };
+        self.repl = try replete.Repl.init(allocator, &self.config);
+        return self;
+    }
+
+    pub fn deinit(self: *Session) void {
+        self.repl.deinit();
+        if (self.history) |*file| file.deinit();
+        self.gpa.destroy(self);
+    }
+
+    /// Reads one line, shown after `prompt`. Ctrl-C and Ctrl-D come back as outcomes rather
+    /// than errors. The terminal is in raw mode only while the line is being edited, so a
+    /// query that runs afterwards gets the normal terminal settings.
+    pub fn one(self: *Session, prompt: []const u8) !Outcome {
+        self.repl.setPrompt(prompt);
+        const term = try replete.TermState.enable(self.fd);
+        defer term.disable();
+
+        const line = self.repl.readlineOwned(self.gpa) catch |err| switch (err) {
+            error.Cancelled => {
+                try self.endLine("^C\n");
+                return .cancelled;
+            },
+            error.EndOfStream => {
+                try self.endLine("\n");
+                return .eof;
+            },
+            else => return err,
+        };
+        try self.endLine("\n");
+        return .{ .line = line };
+    }
+
+    /// Adds an accepted statement to the history and appends it to the history file, unless
+    /// `ignore` matches it. A file that cannot be written is not an error: the statement is
+    /// still in this session's history.
+    pub fn addHistory(self: *Session, ignore: *const Ignore, entry: []const u8) void {
+        if (ignore.matches(entry)) return;
+        if (self.history) |*file| {
+            _ = file.add(self.io, entry) catch {};
         }
-        try out.append(allocator, byte);
     }
-    return out.toOwnedSliceSentinel(allocator, 0);
-}
 
-/// Sets up history and tab completion. Completion offers the words in `names`,
-/// which the caller owns and keeps loaded.
-pub fn setup(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, names: *SqlCompletion.Names) void {
-    isocline.setupHistory(allocator, io, env);
-    isocline.disablePromptMarker();
-    isocline.setDefaultCompleter(completeLine, names);
-}
-
-/// Completes the word before the cursor. A word is letters, digits, `_`, `$`, and `.`,
-/// so `people.na` completes as one word.
-fn completeLine(env: ?*isocline.CompletionEnv, prefix: [*c]const u8) callconv(.c) void {
-    isocline.completeWord(env orelse return, prefix, completeWord, isSqlWordChar);
-}
-
-fn isSqlWordChar(s: [*c]const u8, len: c_long) callconv(.c) bool {
-    if (s == null or len <= 0) {
-        return false;
+    /// Ends the line that was just read, then flushes, since replete has left the cursor at its end.
+    fn endLine(self: *Session, text: []const u8) !void {
+        try self.stdout.writeAll(text);
+        try self.stdout.flush();
     }
-    const byte = s[0];
-    return byte >= 0x80 or std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '$' or byte == '.';
+};
+
+/// Loads the history file, after converting it from isocline's format. Failures leave the
+/// client without history, and the client still starts.
+fn openHistory(allocator: Allocator, io: std.Io, env: *const std.process.Environ.Map) ?replete.FileHistory {
+    const path = (history_file.historyPath(allocator, env) catch return null) orelse return null;
+    defer allocator.free(path);
+    history_file.convertIsocline(allocator, io, path) catch {};
+    return replete.FileHistory.open(allocator, io, path, history_file.options) catch null;
 }
 
-fn completeWord(env: ?*isocline.CompletionEnv, word: [*c]const u8) callconv(.c) void {
-    const cenv = env orelse return;
-    const arg = isocline.completionArg(cenv) orelse return;
-    const names: *const SqlCompletion.Names = @ptrCast(@alignCast(arg));
-    const prefix = std.mem.span(word);
+/// Offers the keywords and names that start with the word before the cursor. A word is
+/// letters, digits, `_`, `$`, `.`, and bytes from 0x80 up, so `people.na` completes as one word.
+fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidates: *replete.Candidates) std.mem.Allocator.Error!usize {
+    const names: *const SqlCompletion.Names = @ptrCast(@alignCast(context.?));
+    var start = cursor;
+    while (start > 0 and isSqlWordByte(line[start - 1])) {
+        start -= 1;
+    }
+    const prefix = line[start..cursor];
     if (prefix.len == 0) {
-        return;
+        return cursor;
     }
     for (SqlCompletion.keywords) |keyword| {
         if (SqlCompletion.matches(keyword, prefix)) {
-            isocline.addCompletion(cenv, keyword);
+            try candidates.add(keyword);
         }
     }
     for (names.words.items) |name| {
         if (SqlCompletion.matches(name, prefix)) {
-            isocline.addCompletion(cenv, name);
+            try candidates.add(name);
         }
     }
+    return start;
 }
 
-pub fn removeLastHistory() void {
-    isocline.removeLastHistory();
+fn isSqlWordByte(byte: u8) bool {
+    return byte >= 0x80 or std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '$' or byte == '.';
 }
 
-/// Adds a statement to the history, unless `ignore` matches it.
-pub fn addHistory(ignore: *const Ignore, entry: [:0]const u8) void {
-    if (ignore.matches(entry)) {
-        return;
-    }
-    isocline.addHistory(entry);
+test "completion offers keywords and names for the word before the cursor" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.add("people");
+    try names.add("orders");
+    try names.add("people.name");
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    const line = "select peo";
+    const start = try completeWord(&names, line, line.len, &candidates);
+    try std.testing.expectEqual(@as(usize, 7), start);
+    try std.testing.expectEqual(@as(usize, 2), candidates.list.items.len);
+    try std.testing.expectEqualStrings("people", candidates.list.items[0]);
+    try std.testing.expectEqualStrings("people.name", candidates.list.items[1]);
+}
+
+test "completion treats dots as part of the word" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.add("people.name");
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    const line = "select people.na";
+    const start = try completeWord(&names, line, line.len, &candidates);
+    try std.testing.expectEqual(@as(usize, 7), start);
+    try std.testing.expectEqualStrings("people.name", candidates.list.items[0]);
+}
+
+test "completion with an empty word offers nothing" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.add("people");
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    const line = "select ";
+    const start = try completeWord(&names, line, line.len, &candidates);
+    try std.testing.expectEqual(line.len, start);
+    try std.testing.expectEqual(@as(usize, 0), candidates.list.items.len);
 }
 
 /// The statements that MYSQL_HISTIGNORE keeps out of the history. The value is a list of
@@ -182,16 +297,6 @@ test "history ignore splits patterns on colons and skips empty ones" {
     try std.testing.expect(ignore.matches("select 'secret'"));
     try std.testing.expect(ignore.matches("DROP table"));
     try std.testing.expect(!ignore.matches("select 1"));
-}
-
-test "prompt markup escapes brackets and backslashes and leaves other text alone" {
-    const escaped = try escapeMarkup(std.testing.allocator, "[\\d] \\_\\u> ");
-    defer std.testing.allocator.free(escaped);
-    try std.testing.expectEqualStrings("\\[\\\\d] \\\\_\\\\u> ", escaped);
-
-    const plain = try escapeMarkup(std.testing.allocator, "root@host:3306/db> ");
-    defer std.testing.allocator.free(plain);
-    try std.testing.expectEqualStrings("root@host:3306/db> ", plain);
 }
 
 test "history ignore with no variable keeps everything" {
