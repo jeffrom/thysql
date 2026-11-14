@@ -30,6 +30,7 @@ const LastCommand = enum {
     other,
     kill,
     yank,
+    insert,
 };
 
 const KeyCode = enum(u8) {
@@ -54,8 +55,10 @@ const KeyCode = enum(u8) {
     CTRL_U = 21,
     CTRL_V = 22,
     CTRL_W = 23,
+    CTRL_X = 24,
     CTRL_Y = 25,
     ESC = 27,
+    CTRL_UNDERSCORE = 31,
     BACKSPACE = 127,
 };
 
@@ -83,6 +86,17 @@ pub const ReplConfig = struct {
     history: ?*History = null,
 };
 
+/// The line and cursor as they were before an undoable change.
+const UndoEntry = struct {
+    text: std.ArrayList(u8),
+    pos: usize,
+
+    fn deinit(entry: UndoEntry, gpa: std.mem.Allocator) void {
+        var text = entry.text;
+        text.deinit(gpa);
+    }
+};
+
 pub const Repl = struct {
     gpa: std.mem.Allocator,
     cfg: *const ReplConfig,
@@ -106,6 +120,8 @@ pub const Repl = struct {
     saved_line: std.ArrayList(u8),
     saved_line_valid: bool,
     last_search: std.ArrayList(u8),
+    /// States to restore on undo, oldest first. Cleared for each new line.
+    undo: std.ArrayList(UndoEntry),
     lastCommand: LastCommand = .other,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
@@ -129,6 +145,7 @@ pub const Repl = struct {
             .saved_line = .empty,
             .saved_line_valid = false,
             .last_search = .empty,
+            .undo = .empty,
         };
     }
 
@@ -137,6 +154,8 @@ pub const Repl = struct {
         self.kills.deinit();
         self.saved_line.deinit(self.gpa);
         self.last_search.deinit(self.gpa);
+        self.clearUndo();
+        self.undo.deinit(self.gpa);
     }
 
     /// Sets the prompt used by later `readline` calls. The slice is not copied:
@@ -218,6 +237,7 @@ pub const Repl = struct {
         self.saved_line.clearRetainingCapacity();
         self.saved_line_valid = false;
         self.history_index = if (self.cfg.history) |history| history.len() else 0;
+        self.clearUndo();
 
         try self.selectPrompt();
 
@@ -302,6 +322,7 @@ pub const Repl = struct {
 
         if (self.quoted_next) {
             self.quoted_next = false;
+            try self.recordUndo(false);
             try self.editInputByte(c, true);
             return ReadEditState.More;
         }
@@ -318,12 +339,14 @@ pub const Repl = struct {
                 // TODO only if the line is empty should we exit
                 // otherwise remove the char to the right of the cursor
                 if (self.buf.items.len > 0) {
+                    try self.recordUndo(false);
                     try self.editDelete();
                     return ReadEditState.More;
                 }
                 return ReadEditState.EOF;
             },
             @intFromEnum(KeyCode.BACKSPACE), @intFromEnum(KeyCode.CTRL_H) => {
+                if (self.pos > 0) try self.recordUndo(false);
                 try self.editBackspace();
                 return ReadEditState.More;
             },
@@ -352,10 +375,23 @@ pub const Repl = struct {
                 return ReadEditState.More;
             },
             @intFromEnum(KeyCode.CTRL_R) => {
-                return try self.editIncrementalSearch(.backward);
+                return try self.undoableIncrementalSearch(.backward);
             },
             @intFromEnum(KeyCode.CTRL_S) => {
-                return try self.editIncrementalSearch(.forward);
+                return try self.undoableIncrementalSearch(.forward);
+            },
+            @intFromEnum(KeyCode.CTRL_X) => {
+                // Ctrl-X prefixes two-key commands. Ctrl-X Ctrl-U undoes; any
+                // other second key is ignored, as an unbound key would be.
+                const second = try self.cfg.in.takeByte();
+                if (second == @intFromEnum(KeyCode.CTRL_U)) {
+                    try self.editUndo();
+                }
+                return ReadEditState.More;
+            },
+            @intFromEnum(KeyCode.CTRL_UNDERSCORE) => {
+                try self.editUndo();
+                return ReadEditState.More;
             },
             @intFromEnum(KeyCode.CTRL_Q), @intFromEnum(KeyCode.CTRL_V) => {
                 self.quoted_next = true;
@@ -394,12 +430,81 @@ pub const Repl = struct {
                 return ReadEditState.More;
             },
             else => {
+                // Only printable input is a self-insert; other bytes change nothing.
+                if (c >= 0x80 or std.ascii.isPrint(c)) {
+                    command = .insert;
+                    try self.recordUndo(true);
+                }
                 try self.editInputByte(c, false);
                 return ReadEditState.More;
             },
         }
 
         return ReadEditState.Done;
+    }
+
+    /// Records the current line so that undo can restore it. With `group`, a
+    /// self-insert that follows another self-insert joins that undo unit.
+    fn recordUndo(self: *Repl, group: bool) !void {
+        if (group and self.lastCommand == .insert) return;
+        try self.pushUndo(try self.captureState());
+    }
+
+    fn captureState(self: *const Repl) !UndoEntry {
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(self.gpa);
+        try text.appendSlice(self.gpa, self.buf.items);
+        return .{ .text = text, .pos = self.pos };
+    }
+
+    /// Takes ownership of `entry`, even when the push fails.
+    fn pushUndo(self: *Repl, entry: UndoEntry) !void {
+        errdefer entry.deinit(self.gpa);
+        try self.undo.append(self.gpa, entry);
+    }
+
+    /// Forgets the undo history. Used at the start of each line and when the
+    /// line is replaced from history, as readline keeps undo per history entry.
+    fn clearUndo(self: *Repl) void {
+        for (self.undo.items) |entry| entry.deinit(self.gpa);
+        self.undo.clearRetainingCapacity();
+    }
+
+    /// Restores the state before the most recent undo unit.
+    fn editUndo(self: *Repl) !void {
+        const entry = self.undo.pop() orelse return;
+        defer entry.deinit(self.gpa);
+        try self.replaceBuffer(entry.text.items, entry.pos);
+        try self.refreshLine();
+    }
+
+    /// Runs an incremental search as one undo unit, kept only if it changed the line.
+    fn undoableIncrementalSearch(self: *Repl, direction: history_mod.Direction) !ReadEditState {
+        const before = try self.captureState();
+        const state = self.editIncrementalSearch(direction) catch |err| {
+            before.deinit(self.gpa);
+            return err;
+        };
+        try self.keepUndoIfChanged(before);
+        return state;
+    }
+
+    /// Runs a prompted non-incremental search as one undo unit, kept only if it changed the line.
+    fn undoableNonIncrementalSearch(self: *Repl, direction: history_mod.Direction) !void {
+        const before = try self.captureState();
+        self.editNonIncrementalSearch(direction) catch |err| {
+            before.deinit(self.gpa);
+            return err;
+        };
+        try self.keepUndoIfChanged(before);
+    }
+
+    fn keepUndoIfChanged(self: *Repl, before: UndoEntry) !void {
+        if (before.pos == self.pos and std.mem.eql(u8, before.text.items, self.buf.items)) {
+            before.deinit(self.gpa);
+            return;
+        }
+        try self.pushUndo(before);
     }
 
     fn editInputByte(self: *Repl, first: u8, quoted: bool) !void {
@@ -505,6 +610,7 @@ pub const Repl = struct {
     fn editPreviousHistory(self: *Repl) !void {
         const history = self.cfg.history orelse return;
         if (history.len() == 0 or self.history_index == 0) return;
+        self.clearUndo();
 
         if (self.history_index == history.len()) {
             try self.saveUnfinishedLine();
@@ -520,12 +626,35 @@ pub const Repl = struct {
         const history = self.cfg.history orelse return;
         if (self.history_index >= history.len()) return;
 
+        self.clearUndo();
         try self.saveEditedHistoryEntry();
         self.history_index += 1;
         if (self.history_index == history.len()) {
             try self.replaceBuffer(if (self.saved_line_valid) self.saved_line.items else "", null);
         } else {
             try self.replaceBuffer(history.get(self.history_index).?.line, null);
+        }
+        try self.refreshLine();
+    }
+
+    /// Moves to the first history entry (`to_start`) or back to the unfinished
+    /// line at the end of history, as readline's beginning- and end-of-history.
+    fn editHistoryEdge(self: *Repl, to_start: bool) !void {
+        const history = self.cfg.history orelse return;
+        const target: usize = if (to_start) 0 else history.len();
+        if (self.history_index == target) return;
+
+        self.clearUndo();
+        if (self.history_index == history.len()) {
+            try self.saveUnfinishedLine();
+        } else {
+            try self.saveEditedHistoryEntry();
+        }
+        self.history_index = target;
+        if (target == history.len()) {
+            try self.replaceBuffer(if (self.saved_line_valid) self.saved_line.items else "", null);
+        } else {
+            try self.replaceBuffer(history.get(target).?.line, null);
         }
         try self.refreshLine();
     }
@@ -622,6 +751,7 @@ pub const Repl = struct {
             next_pos = end;
         }
 
+        try self.recordUndo(false);
         // Rotating left by the first segment's length swaps the two segments in place.
         std.mem.rotate(u8, buf[first..end], middle - first);
         self.pos = next_pos;
@@ -673,6 +803,7 @@ pub const Repl = struct {
         const end = @max(self.pos, target);
         if (start == end) return;
 
+        try self.recordUndo(false);
         try self.kills.push(self.buf.items, self.pos, target, self.lastCommand == .kill);
         const tail = self.buf.items[end..];
         @memmove(self.buf.items[start..][0..tail.len], tail);
@@ -708,11 +839,14 @@ pub const Repl = struct {
     }
 
     fn editYank(self: *Repl) !void {
-        const k = self.kills.get();
-        if (k != null) {
-            self.yankPos = self.pos;
-            try self.editInsertSlice(k.?);
-        }
+        const k = self.kills.get() orelse return;
+        try self.recordUndo(false);
+        try self.yankText(k);
+    }
+
+    fn yankText(self: *Repl, text: []const u8) !void {
+        self.yankPos = self.pos;
+        try self.editInsertSlice(text);
     }
 
     fn editYankPop(self: *Repl) !LastCommand {
@@ -721,6 +855,7 @@ pub const Repl = struct {
         const previous = self.kills.get() orelse return .other;
         const changed = self.kills.yankPop();
         if (changed) {
+            try self.recordUndo(false);
             const tail_start = self.yankPos + previous.len;
             const tail_len = self.buf.items.len - tail_start;
             @memmove(
@@ -729,7 +864,7 @@ pub const Repl = struct {
             );
             self.buf.items.len -= previous.len;
             self.pos = self.yankPos;
-            try self.editYank();
+            try self.yankText(self.kills.get().?);
         }
         return if (changed) .yank else .other;
     }
@@ -978,11 +1113,19 @@ pub const Repl = struct {
                 return .kill;
             },
             'p', 'P' => {
-                try self.editNonIncrementalSearch(.backward);
+                try self.undoableNonIncrementalSearch(.backward);
                 return .other;
             },
             'n', 'N' => {
-                try self.editNonIncrementalSearch(.forward);
+                try self.undoableNonIncrementalSearch(.forward);
+                return .other;
+            },
+            '<' => {
+                try self.editHistoryEdge(true);
+                return .other;
+            },
+            '>' => {
+                try self.editHistoryEdge(false);
                 return .other;
             },
             'y', 'Y' => return self.editYankPop(),
@@ -1028,7 +1171,10 @@ pub const Repl = struct {
             'F' => try self.editEndOfLine(),
             '~' => switch (parameter orelse return) {
                 1, 7 => try self.editStartOfLine(),
-                3 => try self.editDelete(),
+                3 => if (self.pos < self.buf.items.len) {
+                    try self.recordUndo(false);
+                    try self.editDelete();
+                },
                 4, 8 => try self.editEndOfLine(),
                 200 => try self.editBracketedPaste(),
                 else => {},
@@ -1053,6 +1199,7 @@ pub const Repl = struct {
             }
         }
 
+        if (pasted.items.len > 0) try self.recordUndo(false);
         try self.editInsertSlice(pasted.items);
     }
 
@@ -1180,6 +1327,9 @@ const testKeys = struct {
     const ctrl_r = "\x12";
     const ctrl_s = "\x13";
     const ctrl_t = "\x14";
+    const ctrl_u = "\x15";
+    const ctrl_underscore = "\x1f";
+    const ctrl_x = "\x18";
     const ctrl_w = "\x17";
     const ctrl_y = "\x19";
     const left = "\x1b[D";
@@ -1561,6 +1711,128 @@ test "ctrl-l clears the screen and redraws the line at the top" {
 
     try std.testing.expectEqualStrings("abcd", try repl.readline());
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[H\x1b[2J> abc") != null);
+}
+
+test "undo removes a whole run of typed characters at once" {
+    try expectReadline("hello" ++ testKeys.ctrl_underscore ++ testKeys.enter, 80, "");
+}
+
+test "undo starts a new unit after cursor movement" {
+    try expectReadline(
+        "abc" ++ testKeys.left ++ "d" ++ testKeys.ctrl_underscore ++ testKeys.enter,
+        80,
+        "abc",
+    );
+}
+
+test "undo restores the text and cursor removed by a kill" {
+    try expectReadline(
+        "one two" ++ testKeys.ctrl_w ++ testKeys.ctrl_underscore ++ "!" ++ testKeys.enter,
+        80,
+        "one two!",
+    );
+}
+
+test "repeated undo walks back through earlier units" {
+    try expectReadline(
+        "one two" ++ testKeys.ctrl_w ++ testKeys.ctrl_underscore ++ testKeys.ctrl_underscore ++
+            testKeys.enter,
+        80,
+        "",
+    );
+}
+
+test "ctrl-x ctrl-u undoes like ctrl-underscore" {
+    try expectReadline("hello" ++ testKeys.ctrl_x ++ testKeys.ctrl_u ++ testKeys.enter, 80, "");
+}
+
+test "undo with nothing to undo leaves the line alone" {
+    try expectReadline(testKeys.ctrl_underscore ++ "x" ++ testKeys.enter, 80, "x");
+}
+
+test "undo reverts transpose-chars, kill-yank and delete-char" {
+    try expectReadline("ab" ++ testKeys.ctrl_t ++ testKeys.ctrl_underscore ++ testKeys.enter, 80, "ab");
+    try expectReadline(
+        "abc" ++ testKeys.ctrl_w ++ testKeys.ctrl_y ++ testKeys.ctrl_underscore ++ testKeys.enter,
+        80,
+        "",
+    );
+    try expectReadline(
+        "abc" ++ testKeys.home ++ testKeys.ctrl_d ++ testKeys.ctrl_underscore ++ testKeys.enter,
+        80,
+        "abc",
+    );
+}
+
+test "history navigation clears undo so it cannot revert the recalled line" {
+    const allocator = std.testing.allocator;
+    var history = History.init(allocator, .{});
+    defer history.deinit();
+    _ = try history.add("old", 1);
+
+    var input: Io.Reader = .fixed("typed" ++ testKeys.ctrl_p ++ testKeys.ctrl_underscore ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .history = &history,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("old", try repl.readline());
+}
+
+test "undo reverts an incremental search as one unit" {
+    const allocator = std.testing.allocator;
+    var history = History.init(allocator, .{});
+    defer history.deinit();
+    _ = try history.add("git status", 1);
+
+    // Ctrl-E accepts the match but keeps the line open, unlike Enter.
+    var input: Io.Reader = .fixed(
+        "x" ++ testKeys.ctrl_r ++ "git" ++ "\x05" ++ testKeys.ctrl_underscore ++ testKeys.enter,
+    );
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .history = &history,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("x", try repl.readline());
+}
+
+test "meta-< and meta-> move to the first history entry and back to the unfinished line" {
+    const allocator = std.testing.allocator;
+    var history = History.init(allocator, .{});
+    defer history.deinit();
+    _ = try history.add("old", 1);
+    _ = try history.add("new", 2);
+
+    var input: Io.Reader = .fixed("draft\x1b<" ++ "!" ++ "\x1b>" ++ "?" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .history = &history,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("draft?", try repl.readline());
+    try std.testing.expectEqualStrings("old!", history.get(0).?.line);
 }
 
 test "ctrl-t at the end of the line swaps the last two characters" {
