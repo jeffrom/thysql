@@ -652,7 +652,12 @@ fn renderSpec(out: *std.Io.Writer, spec: Spec) !void {
     } else if (spec.arg == .optional and spec.arg_name.len > 0) {
         try left.print("[={s}]", .{spec.arg_name});
     }
-    try out.print("  {s: <26}{s}\n", .{ left.buffered(), spec.help });
+    // A long flag takes the whole column, so its help text starts on the next line.
+    if (left.buffered().len < 26) {
+        try out.print("  {s: <26}{s}\n", .{ left.buffered(), spec.help });
+    } else {
+        try out.print("  {s}\n  {s: <26}{s}\n", .{ left.buffered(), "", spec.help });
+    }
 }
 
 pub fn renderUsage(out: *std.Io.Writer) !void {
@@ -914,6 +919,18 @@ test "usage describes the complete, keychain, and completion subcommands" {
     try std.testing.expect(std.mem.indexOf(u8, text, "       thysql completion bash\n") != null);
     // The -D form of complete is gone.
     try std.testing.expect(std.mem.indexOf(u8, text, "-D[prefix]") == null);
+}
+
+test "usage puts the help of a long flag on the line after it" {
+    var buffer: [8192]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    try renderUsage(&out);
+    const text = out.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --auth-command=command\n" ++ "                            " ++ "Run this shell command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --skip-ssl-verify-server-cert\n" ++ "                            " ++ "Do not verify") != null);
+    // A short flag fits, so its help stays on the same line.
+    try std.testing.expect(std.mem.indexOf(u8, text, "  -C, --connection=name     Connect with") != null);
 }
 
 test "-P selects tcp and -S selects the socket; the last flag wins" {
