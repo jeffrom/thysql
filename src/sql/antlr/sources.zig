@@ -164,6 +164,12 @@ pub const mysql_generated = [_][]const u8{
     "src/sql/generated/MySQLParserVisitor.cpp",
 };
 
+/// C shim over the parser and antlr4-c3 (src/sql/antlr/shim.h). Built as C++20, because
+/// it includes antlr4-c3's header.
+pub const mysql_shim = [_][]const u8{
+    "src/sql/antlr/shim.cpp",
+};
+
 /// antlr4-c3 port (deps/antlr4-c3, ports/cpp/source/antlr4-c3). Built as C++20.
 pub const antlr4_c3 = [_][]const u8{
     "deps/antlr4-c3/ports/cpp/source/antlr4-c3/CodeCompletionCore.cpp",

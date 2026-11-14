@@ -56,4 +56,39 @@ does not match anything. Nothing in the grammar calls it.
 classes and symbol tables above, the generated parser (`src/sql/generated`) and
 antlr4-c3 (`deps/antlr4-c3`, C++20) into `libmysql_parser.a`. `zig build test`
 runs `smoke_test.cpp` against it; it checks the symbol tables and that
-`SELECT 1 AS select` is rejected while `SELECT 1 AS status` is accepted. Nothing in thysql links the library yet.
+`SELECT 1 AS select` is rejected while `SELECT 1 AS status` is accepted.
+thysql links the library through `build.zig`, and `shim.h` is translated for Zig.
+
+## C shim
+
+`shim.h` / `shim.cpp` are the only interface the rest of thysql uses. No C++
+type crosses it, and every exception is caught inside. `shim.cpp` is built as
+C++20 with antlr4-c3, because antlr4-c3's header needs it.
+
+- `mysql_parser_check()`: parses one statement with the grammar's `query` rule.
+  Two stages: SLL with bail-out on the first error, which is the fast common
+  case, then LL with error reporting when the first stage fails. Lexer errors
+  are reported with either stage. Errors are sorted by position.
+- Error messages follow Workbench's form, for example
+  `"FROM" is not valid at this position, expecting an identifier`. The
+  expected list is taken from the parser state at the error. It is "an
+  identifier" or up to six keywords, and is shorter than Workbench's.
+- Offsets are byte offsets into the UTF-8 input. The input is decoded to code
+  points first, and each code point keeps its byte offset. Invalid UTF-8 bytes
+  decode to U+FFFD and keep one byte each. Columns are code points.
+- `mysql_parser_candidates()`: antlr4-c3 with the configuration of Workbench's
+  `code-completion/mysql-code-completion.cpp` (ignored tokens, preferred rules).
+  A caret inside or right after a word completes that word. Otherwise the
+  candidates are for the first token at or after the caret. The list is not
+  filtered by the typed prefix.
+- Candidates are keywords (token text in upper case, from the `*_SYMBOL` token
+  names) and rules (the rule name). The `MYSQL_RULE_*` values in `shim.h` match
+  the generated parser; `shim.cpp` checks them with `static_assert`.
+- A `mysql_parser` owns its configuration and the buffers it hands out. The
+  ANTLR lexer and parser are created per call, because they keep a pointer to
+  the input. The static ATN and DFA caches are shared, so repeated calls are
+  still fast.
+- An internal failure is reported as one error, `internal parser error`, over
+  the whole input.
+- Limit: one statement per call. A second statement after `;` is a syntax
+  error. Splitting a buffer into statements is left to the caller. Nothing in thysql links the library yet.

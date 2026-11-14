@@ -38,6 +38,10 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    // The ANTLR4 runtime, antlr4-c3, the MySQL base classes and the generated MySQL parser,
+    // with the C shim (src/sql/antlr/shim.h) that src/sql/parser.zig calls.
+    const parser_lib = addMysqlParserLibrary(b, target, optimize);
+
     const mod = b.addModule("thysql", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -68,10 +72,20 @@ pub fn build(b: *std.Build) void {
     mysql_c_translate.addIncludePath(b.path("deps/mariadb-connector-c/include"));
     const mysql_c = mysql_c_translate.createModule();
 
+    const parser_shim_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/sql/antlr/shim.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const parser_shim_c = parser_shim_translate.createModule();
+
     mod.addImport("mysql_c", mysql_c);
+    mod.addImport("mysql_parser_c", parser_shim_c);
     mod.addImport("replete", replete_mod);
 
     mod.link_libc = true;
+    mod.link_libcpp = true;
+    mod.linkLibrary(parser_lib);
     mod.addObjectFile(mariadb.static_library);
     linkMariaDbSystemLibraries(mod, target, openssl_lib_dir);
 
@@ -173,10 +187,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_replete_tests = b.addRunArtifact(replete_tests);
 
-    // The ANTLR4 runtime, antlr4-c3 and the generated MySQL parser, as one
-    // static C++ library. Nothing links it yet; it is built and installed so
-    // that it stays compiling.
-    const parser_lib = addMysqlParserLibrary(b, target, optimize);
+    // Installed so that it stays compiling on its own, as well as linked into the module.
     b.installArtifact(parser_lib);
 
     // Regenerates src/sql/generated from src/sql/grammar. Needs Java; normal
@@ -321,9 +332,10 @@ fn addMysqlParserLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimi
         .flags = parser_cxx_flags,
     });
 
-    // antlr4-c3 needs C++20, so it is compiled with its own flags.
+    // antlr4-c3 needs C++20, so it is compiled with its own flags. The shim includes
+    // its header, so it needs them too.
     module.addCSourceFiles(.{
-        .files = &parser_sources.antlr4_c3,
+        .files = &(parser_sources.antlr4_c3 ++ parser_sources.mysql_shim),
         .flags = antlr4_c3_cxx_flags,
     });
 
