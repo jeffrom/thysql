@@ -33,8 +33,35 @@ const Repl = struct {
     silent: bool,
     /// The parser and the sql_mode of the server, kept up to date after each connect.
     syntax: *Syntax,
-    /// The -C connection's name, for the \C prompt escape. Empty when there is none.
+    /// The name of the connection in use, from -C or `\C`, for the prompt escape. Empty when there is none.
     connection: []const u8 = "",
+};
+
+/// What `\C` needs to open another saved connection. runREPL makes one for the session. The
+/// connection in use is kept here, because its settings and password source point into it.
+const ConnectionSwitch = struct {
+    allocator: Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    stderr: *std.Io.Writer,
+    stdin_is_tty: bool,
+    /// The startup command line, and the index where its options start.
+    args: []const []const u8,
+    first: usize,
+    /// The option-file settings, before any connection's settings.
+    base: []const OptionFile.Setting,
+    /// The connection in use, which is -C or nothing at startup.
+    selection: Connections.Selection,
+    /// The password source of the connection in use. The DB keeps a pointer to it, so it is on the heap.
+    supplier: ?*Password.Supplier = null,
+
+    fn deinit(self: *ConnectionSwitch) void {
+        if (self.supplier) |supplier| {
+            supplier.deinit();
+            self.allocator.destroy(supplier);
+        }
+        self.selection.deinit();
+    }
 };
 
 var sigint_requested = std.atomic.Value(bool).init(false);
@@ -46,6 +73,163 @@ fn connectionPrompt(allocator: Allocator, user: []const u8, host: []const u8, po
         return try std.fmt.allocPrintSentinel(allocator, "{s}:{}/{s}> ", .{ host, port, db_name }, 0);
     }
     return try std.fmt.allocPrintSentinel(allocator, "{s}@{s}:{}/{s}> ", .{ user, host, port, db_name }, 0);
+}
+
+/// The password source for `options`, on the heap, since the DB keeps a pointer to it. The caller
+/// primes it, and `ConnectionSwitch.deinit` frees it.
+fn newSupplier(switcher: *const ConnectionSwitch, options: *const Options.Options) !*Password.Supplier {
+    const supplier = try switcher.allocator.create(Password.Supplier);
+    supplier.* = .{
+        .allocator = switcher.allocator,
+        .io = switcher.io,
+        .source = options.password_source,
+        .context = .{ .interactive = switcher.stdin_is_tty, .stderr = switcher.stderr, .env = switcher.env },
+        .connection = options.connection orelse "",
+    };
+    return supplier;
+}
+
+fn passwordProvider(supplier: *Password.Supplier) Mysql.PasswordProvider {
+    return .{ .ctx = supplier, .fetchFn = Password.Supplier.fetchOpaque };
+}
+
+/// The connect parameters for `options`, with the password from `provider`.
+fn connectInfo(options: *const Options.Options, provider: Mysql.PasswordProvider) Mysql.DBInfo {
+    return .{
+        .host = options.host,
+        .user = options.user,
+        .password_provider = provider,
+        .database = options.database,
+        .port = options.port,
+        .socket = options.socket,
+        .protocol = options.protocol,
+        .tls = options.tls,
+        .connect_timeout = options.connect_timeout,
+    };
+}
+
+/// `path` with the home directory written as `~`, for messages.
+fn homeRelative(allocator: Allocator, env: *const std.process.Environ.Map, path: []const u8) ![]const u8 {
+    const home = env.get("HOME") orelse return path;
+    if (home.len == 0 or path.len <= home.len or !std.mem.startsWith(u8, path, home) or path[home.len] != '/') {
+        return path;
+    }
+    return try std.fmt.allocPrint(allocator, "~{s}", .{path[home.len..]});
+}
+
+/// Runs `\C` with no name: one saved connection per line, directories as `dir/` and the one in use
+/// with `* `. When there are none, says where they would go.
+fn listConnections(switcher: *const ConnectionSwitch, out: *std.Io.Writer) !void {
+    var arena = std.heap.ArenaAllocator.init(switcher.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const entries = try Connections.listAll(allocator, switcher.io, switcher.env);
+    if (entries.len == 0) {
+        const root = (try Connections.rootDir(allocator, switcher.env)) orelse {
+            try out.print("No connections.\n", .{});
+            return;
+        };
+        try out.print("No connections in {s}.\n", .{try homeRelative(allocator, switcher.env, root)});
+        return;
+    }
+    const current = switcher.selection.name() orelse "";
+    for (entries) |entry| {
+        switch (entry.kind) {
+            .directory => try out.print("  {s}/\n", .{entry.name}),
+            .connection => try out.print("{s} {s}\n", .{ if (std.mem.eql(u8, entry.name, current)) "*" else " ", entry.name }),
+        }
+    }
+}
+
+/// Runs `\C name`. The new connection is opened with the startup settings that still apply, and then
+/// it replaces the one in use. On any failure the message is printed and nothing changes. In the
+/// interactive client the prompt, the names, and the parser follow the new connection. Returns false
+/// after printing a failure.
+fn switchConnection(
+    switcher: *ConnectionSwitch,
+    db: *Mysql.DB,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+    line: ?usize,
+    repl: ?*Repl,
+    name: []const u8,
+) !bool {
+    const allocator = switcher.allocator;
+    var selection = Connections.selectName(allocator, switcher.io, switcher.env, err_out, name, switcher.base) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ConnectionFailed => return false,
+    };
+    var selection_taken = false;
+    defer if (!selection_taken) selection.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const session_args = try Options.withoutConnectionArgs(arena.allocator(), switcher.args, switcher.first);
+    var next_options = Options.parseWithSettings(allocator, session_args, 1, switcher.env, selection.settings) catch |err| {
+        try Options.renderError(err_out, err);
+        return false;
+    };
+    defer next_options.deinit(allocator);
+    next_options.connection = selection.name();
+
+    const supplier = try newSupplier(switcher, &next_options);
+    var supplier_taken = false;
+    defer if (!supplier_taken) {
+        supplier.deinit();
+        allocator.destroy(supplier);
+    };
+    supplier.prime() catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.NeedsPrompt => {
+            try err_out.print("Cannot prompt for a password while reading SQL from stdin; use MYSQL_PWD.\n", .{});
+            return false;
+        },
+        else => {
+            try err_out.print("ERROR: Can't connect to the server\n", .{});
+            return false;
+        },
+    };
+
+    var failure: Mysql.ConnectFailure = .{};
+    const next_db = Mysql.DB.open(allocator, connectInfo(&next_options, passwordProvider(supplier)), &failure) catch |err| switch (err) {
+        error.ConnectError => {
+            try failure.render(err_out, line);
+            return false;
+        },
+        // The password source has printed its error to stderr.
+        error.PasswordFailed => {
+            try err_out.print("ERROR: Can't connect to the server\n", .{});
+            return false;
+        },
+        else => return err,
+    };
+
+    // The new connection is open. The old one goes, and the new one takes its place, so that
+    // reconnects use the new password source.
+    db.close();
+    db.* = next_db;
+    const old_supplier = switcher.supplier;
+    switcher.supplier = supplier;
+    supplier_taken = true;
+    if (old_supplier) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    var old_selection = switcher.selection;
+    switcher.selection = selection;
+    selection_taken = true;
+    old_selection.deinit();
+
+    const connection_name = switcher.selection.name() orelse "";
+    if (repl) |session| {
+        session.connection = connection_name;
+        try session.syntax.refresh(db);
+        try out.print("Connected to \"{s}\".\n", .{connection_name});
+        try renderConnectionInfo(out, db);
+        try loadNames(session, db, out, true);
+    }
+    return true;
 }
 
 fn envValue(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
@@ -293,6 +477,7 @@ fn runClientCommand(
     line: ?usize,
     repl: ?*Repl,
     delimiter: []const u8,
+    switcher: *ConnectionSwitch,
     command: ClientCommand.Command,
 ) !bool {
     switch (command.kind) {
@@ -307,6 +492,13 @@ fn runClientCommand(
         .status => try client.renderStatus(db, out, delimiter),
         .use => return try useDatabase(db, out, err_out, line, repl, command.arg),
         .connect => return try connectCommand(db, out, err_out, line, repl, command.arg),
+        .connection => {
+            if (command.arg.len == 0) {
+                try listConnections(switcher, out);
+                return true;
+            }
+            return try switchConnection(switcher, db, out, err_out, line, repl, command.arg);
+        },
         .prompt => try promptCommand(out, repl, command.rest),
         // `rehash` loads the names whatever auto-rehash says, and prints nothing, as in mysql.cc.
         .rehash => if (repl) |session| {
@@ -669,6 +861,7 @@ fn openEditorForQuery(
 const ReplContext = struct {
     db: *Mysql.DB,
     io: std.Io,
+    switcher: *ConnectionSwitch,
     scanner: *Batch.Scanner,
     last_query: *std.ArrayList(u8),
     /// Batch state for statements typed at the prompt. It carries the force flag and `source` depth.
@@ -691,7 +884,7 @@ fn executeReplQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.
         try addQueryToHistory(allocator, query, context.scanner.delimiterText(), context.readline, context.repl.history_ignore);
     }
     if (command) |client_command| {
-        return try runClientCommand(context.client, context.db, stdout, stdout, null, &context.repl, context.scanner.delimiterText(), client_command);
+        return try runClientCommand(context.client, context.db, stdout, stdout, null, &context.repl, context.scanner.delimiterText(), context.switcher, client_command);
     }
     return try executeQuery(context, stdout, query);
 }
@@ -767,7 +960,7 @@ fn readOneLine(
     // A client command at the start of a line runs at once, without a delimiter, as in mysql.cc.
     if (scanner.atStatementStart() and std.mem.indexOf(u8, line, scanner.delimiterText()) == null) {
         if (ClientCommand.parse(line)) |command| {
-            _ = runClientCommand(context.client, db, stdout, stdout, null, &context.repl, scanner.delimiterText(), command) catch |err| switch (err) {
+            _ = runClientCommand(context.client, db, stdout, stdout, null, &context.repl, scanner.delimiterText(), context.switcher, command) catch |err| switch (err) {
                 error.ClientQuit => return true,
                 else => return err,
             };
@@ -789,6 +982,7 @@ const BatchContext = struct {
     options: *const Options.Options,
     stdin_is_tty: bool,
     client: *Client,
+    switcher: *ConnectionSwitch,
 };
 
 /// Runs one batch statement. Results go to stdout, and errors go to stderr
@@ -800,7 +994,7 @@ fn executeBatchQuery(context: BatchContext, stdout: *std.Io.Writer, stderr: *std
     }
 
     if (ClientCommand.parse(query.sql)) |command| {
-        return try runClientCommand(context.client, db, stdout, stderr, query.line, null, context.options.delimiter, command);
+        return try runClientCommand(context.client, db, stdout, stderr, query.line, null, context.options.delimiter, context.switcher, command);
     }
 
     var exec_result = db.exec(query.sql) catch |err| {
@@ -855,6 +1049,7 @@ fn runBatch(
     db: *Mysql.DB,
     options: *const Options.Options,
     client: *Client,
+    switcher: *ConnectionSwitch,
 ) !u8 {
     var stdin_buffer: [8192]u8 = undefined;
     var stdin_reader = stdin.reader(io, &stdin_buffer);
@@ -875,6 +1070,7 @@ fn runBatch(
         .options = options,
         .stdin_is_tty = stdin_is_tty,
         .client = client,
+        .switcher = switcher,
     };
     // `quit` ends the input with success, as in mysql.cc.
     return Batch.run(db.allocator, input, stdout, stderr, run_options, context, executeBatchQuery) catch |err| switch (err) {
@@ -916,25 +1112,40 @@ pub fn runREPL(
         error.OptionFileFailed => return 1,
     };
     defer loaded.deinit();
-    // -C adds the saved connection's settings after the option files, so the connection wins.
-    var selection = Connections.select(allocator, io, env, stderr, args.items, loaded.next, loaded.settings) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        error.ConnectionFailed => return 1,
+    const stdin = std.Io.File.stdin();
+    const stdin_is_tty = try stdin.isTty(io);
+    const stderr_is_tty = try std.Io.File.stderr().isTty(io);
+
+    // -C adds the saved connection's settings after the option files, so the connection wins. The
+    // switcher keeps that connection for `\C`, which replaces it.
+    var switcher: ConnectionSwitch = .{
+        .allocator = allocator,
+        .io = io,
+        .env = env,
+        .stderr = stderr,
+        .stdin_is_tty = stdin_is_tty,
+        .args = args.items,
+        .first = loaded.next,
+        .base = loaded.settings,
+        .selection = Connections.select(allocator, io, env, stderr, args.items, loaded.next, loaded.settings) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.ConnectionFailed => return 1,
+        },
     };
-    defer selection.deinit();
+    defer switcher.deinit();
     if (loaded.print_defaults) {
-        try OptionFile.renderPrintDefaults(stdout, args.items[0], selection.settings, args.items[loaded.next..]);
+        try OptionFile.renderPrintDefaults(stdout, args.items[0], switcher.selection.settings, args.items[loaded.next..]);
         try stdout.flush();
         return 0;
     }
 
-    var options = Options.parseWithSettings(allocator, args.items, loaded.next, env, selection.settings) catch |err| {
+    var options = Options.parseWithSettings(allocator, args.items, loaded.next, env, switcher.selection.settings) catch |err| {
         try Options.renderError(stderr, err);
         try Options.renderUsage(stderr);
         return 1;
     };
     defer options.deinit(allocator);
-    options.connection = selection.name();
+    options.connection = switcher.selection.name();
 
     if (options.show_help) {
         try Options.renderUsage(stdout);
@@ -946,20 +1157,10 @@ pub fn runREPL(
         return 0;
     }
 
-    const stdin = std.Io.File.stdin();
-    const stdin_is_tty = try stdin.isTty(io);
-    const stderr_is_tty = try std.Io.File.stderr().isTty(io);
-
     // The password is fetched on every connect. A prompt is asked once, here, and kept for reconnects.
-    var password_supplier: Password.Supplier = .{
-        .allocator = allocator,
-        .io = io,
-        .source = options.password_source,
-        .context = .{ .interactive = stdin_is_tty, .stderr = stderr, .env = env },
-        .connection = options.connection orelse "",
-    };
-    defer password_supplier.deinit();
-    password_supplier.prime() catch |err| switch (err) {
+    const supplier = try newSupplier(&switcher, &options);
+    switcher.supplier = supplier;
+    supplier.prime() catch |err| switch (err) {
         error.NeedsPrompt => {
             try stderr.print("Cannot prompt for a password while reading SQL from stdin; use MYSQL_PWD.\n", .{});
             return 1;
@@ -967,17 +1168,7 @@ pub fn runREPL(
         else => return err,
     };
 
-    var db = Mysql.DB.init(allocator, .{
-        .host = options.host,
-        .user = options.user,
-        .password_provider = .{ .ctx = &password_supplier, .fetchFn = Password.Supplier.fetchOpaque },
-        .database = options.database,
-        .port = options.port,
-        .socket = options.socket,
-        .protocol = options.protocol,
-        .tls = options.tls,
-        .connect_timeout = options.connect_timeout,
-    }) catch |err| switch (err) {
+    var db = Mysql.DB.init(allocator, connectInfo(&options, passwordProvider(supplier))) catch |err| switch (err) {
         // connect() has already printed the server's error message.
         error.ConnectError => return 1,
         // The password source has printed its error message.
@@ -991,7 +1182,7 @@ pub fn runREPL(
     client.show_warnings = options.show_warnings;
 
     if (options.isBatch(stdin_is_tty)) {
-        return try runBatch(io, stdin, stdin_is_tty, stderr_is_tty, stdout, stderr, &db, &options, &client);
+        return try runBatch(io, stdin, stdin_is_tty, stderr_is_tty, stdout, stderr, &db, &options, &client, &switcher);
     }
 
     // The parser warms up on its own thread while the names load. It follows the server's version and sql_mode.
@@ -1045,6 +1236,7 @@ pub fn runREPL(
     var context = ReplContext{
         .db = &db,
         .io = io,
+        .switcher = &switcher,
         .scanner = &interactive_scanner,
         .last_query = &last_query,
         .session = Batch.Session.init(allocator, io, options.force),

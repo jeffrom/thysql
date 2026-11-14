@@ -27,6 +27,16 @@ pub const ConnectFailure = struct {
         return self.message_buffer[0..self.message_len];
     }
 
+    /// Prints the failure as mysql.cc's put_error does. `line` adds the "at line N" suffix that
+    /// batch input uses.
+    pub fn render(self: *const ConnectFailure, out: *std.Io.Writer, line: ?usize) !void {
+        try out.print("ERROR {d} (HY000)", .{self.errno});
+        if (line) |number| {
+            try out.print(" at line {d}", .{number});
+        }
+        try out.print(": {s}\n", .{self.message()});
+    }
+
     fn record(self: *ConnectFailure, db: *C.struct_st_mysql) void {
         self.errno = C.mysql_errno(db);
         const text = std.mem.sliceTo(C.mysql_error(db), 0);
@@ -118,7 +128,20 @@ pub const DB = struct {
     connect_failure: ConnectFailure = .{},
     password_provider: ?PasswordProvider,
 
+    /// Connects as `info` says, and prints a failed connect to stderr unless `info.quiet_connect_error`.
     pub fn init(allocator: Allocator, info: DBInfo) !DB {
+        var failure: ConnectFailure = .{};
+        return open(allocator, info, &failure) catch |err| {
+            if (err == error.ConnectError and !info.quiet_connect_error) {
+                std.debug.print("Connect to database failed: {s}\n", .{failure.message()});
+            }
+            return err;
+        };
+    }
+
+    /// Connects as `info` says, and prints nothing. A failed connect leaves its error in
+    /// `failure`, for `ConnectFailure.render`. The caller closes the DB that it returns.
+    pub fn open(allocator: Allocator, info: DBInfo, failure: *ConnectFailure) !DB {
         const host = try allocator.dupeSentinel(u8, info.host, 0);
         errdefer allocator.free(host);
         const user = try allocator.dupeSentinel(u8, info.user, 0);
@@ -145,13 +168,7 @@ pub const DB = struct {
             .tls = tls,
             .connect_timeout = info.connect_timeout,
         };
-        var failure: ConnectFailure = .{};
-        const db = connectWith(connect_params, info.password_provider, .connect, &failure) catch |err| {
-            if (err == error.ConnectError and !info.quiet_connect_error) {
-                std.debug.print("Connect to database failed: {s}\n", .{failure.message()});
-            }
-            return err;
-        };
+        const db = try connectWith(connect_params, info.password_provider, .connect, failure);
 
         return .{
             .conn = db,
@@ -448,11 +465,7 @@ pub const DB = struct {
     /// Prints the last failed connect attempt as mysql.cc's put_error does. `line` adds
     /// the "at line N" suffix that batch input uses.
     pub fn renderConnectFailure(self: *DB, out: *std.Io.Writer, line: ?usize) !void {
-        try out.print("ERROR {d} (HY000)", .{self.connect_failure.errno});
-        if (line) |number| {
-            try out.print(" at line {d}", .{number});
-        }
-        try out.print(": {s}\n", .{self.connect_failure.message()});
+        try self.connect_failure.render(out, line);
     }
 
     /// Runs `sql` and copies all of its rows. NULL cells are null. Returns null when the

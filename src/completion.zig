@@ -287,19 +287,8 @@ fn addLiterals(out: *Candidates, literals: []const []const u8, wrapper: []const 
 /// is offered as `dir/` with no space after it. A directory that has `default-conn` is also
 /// offered by its bare name.
 fn addConnections(out: *Candidates, io: std.Io, env: *const std.process.Environ.Map, wrapper: []const u8, typed: []const u8) Allocator.Error!void {
-    const dir = if (std.mem.lastIndexOfScalar(u8, typed, '/')) |slash| typed[0..slash] else "";
-    const entries = try Connections.list(out.allocator, io, env, dir);
-    for (entries) |entry| {
-        if (!std.mem.startsWith(u8, entry.name, typed)) continue;
-        switch (entry.kind) {
-            .connection => try out.add(try std.fmt.allocPrint(out.allocator, "{s}{s}", .{ wrapper, entry.name }), false),
-            .directory => {
-                try out.add(try std.fmt.allocPrint(out.allocator, "{s}{s}/", .{ wrapper, entry.name }), true);
-                if (try Connections.defaultConn(out.allocator, io, env, entry.name)) |_| {
-                    try out.add(try std.fmt.allocPrint(out.allocator, "{s}{s}", .{ wrapper, entry.name }), false);
-                }
-            },
-        }
+    for (try Connections.completions(out.allocator, io, env, typed)) |candidate| {
+        try out.add(try std.fmt.allocPrint(out.allocator, "{s}{s}", .{ wrapper, candidate.text }), !candidate.space);
     }
 }
 

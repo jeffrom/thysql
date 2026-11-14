@@ -488,6 +488,69 @@ pub fn connectionArg(args: []const []const u8, first: usize) ?[]const u8 {
     return found;
 }
 
+/// The command line for `\C`: args[0], then the flags in args[first..] that do not choose the
+/// connection. Every flag in the connection group is dropped, with its value, and so is a database
+/// given as a plain word. --connect-timeout and --reconnect or --skip-reconnect are kept, because
+/// they are not about the connection. Each short flag in a cluster is kept or dropped on its own.
+/// The words are allocated in `allocator`. The values are borrowed from `args`.
+pub fn withoutConnectionArgs(allocator: Allocator, args: []const []const u8, first: usize) Allocator.Error![]const []const u8 {
+    var kept: std.ArrayList([]const u8) = .empty;
+    errdefer kept.deinit(allocator);
+    try kept.append(allocator, args[0]);
+
+    var positional_only = false;
+    var i: usize = first;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (positional_only or arg.len < 2 or arg[0] != '-') {
+            continue;
+        } else if (std.mem.eql(u8, arg, "--")) {
+            positional_only = true;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            const body = arg[2..];
+            const eq_index = std.mem.indexOfScalar(u8, body, '=');
+            const spec = findLong(if (eq_index) |idx| body[0..idx] else body) orelse continue;
+            const start = i;
+            const inline_value = if (eq_index) |idx| body[idx + 1 ..] else null;
+            _ = argumentValue(spec, args, &i, inline_value) catch continue;
+            if (keptForSession(spec)) try kept.appendSlice(allocator, args[start .. i + 1]);
+        } else {
+            try keepShortFlags(allocator, &kept, args, &i, arg);
+        }
+    }
+    return kept.toOwnedSlice(allocator);
+}
+
+/// Appends the kept flags of the short cluster `arg` (args[i.*]), as separate words. Advances `i`
+/// past a value that the cluster takes from the next word.
+fn keepShortFlags(allocator: Allocator, kept: *std.ArrayList([]const u8), args: []const []const u8, i: *usize, arg: []const u8) Allocator.Error!void {
+    for (arg[1..], 0..) |flag, pos| {
+        const spec = findShort(flag) orelse return;
+        if (spec.arg == .none) {
+            if (keptForSession(spec)) try kept.append(allocator, try std.fmt.allocPrint(allocator, "-{c}", .{flag}));
+            continue;
+        }
+        // A flag that takes a value ends the cluster, as in parseShortCluster.
+        const rest = arg[pos + 2 ..];
+        const inline_value: ?[]const u8 = if (rest.len > 0) rest else null;
+        const value_index = i.*;
+        const value = argumentValue(spec, args, i, inline_value) catch return;
+        if (!keptForSession(spec)) return;
+        if (inline_value) |text| {
+            try kept.append(allocator, try std.fmt.allocPrint(allocator, "-{c}{s}", .{ flag, text }));
+        } else {
+            try kept.append(allocator, try std.fmt.allocPrint(allocator, "-{c}", .{flag}));
+            if (value != null) try kept.append(allocator, args[value_index + 1]);
+        }
+        return;
+    }
+}
+
+/// Whether a flag stays in the command line that `\C` rebuilds from. See `withoutConnectionArgs`.
+fn keptForSession(spec: Spec) bool {
+    return spec.group != .connection or spec.id == .connect_timeout or spec.id == .reconnect or spec.id == .skip_reconnect;
+}
+
 /// Applies one option-file setting. Unknown names are ignored, and so are
 /// help and version, which only make sense on the command line.
 /// Passwords are allowed here, unlike on the command line.
@@ -1464,4 +1527,48 @@ test "-C is accepted by parse and does not set the name itself" {
     defer options.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?[]const u8, null), options.connection);
     try std.testing.expectEqualStrings("select 1", options.executeText().?);
+}
+
+test "withoutConnectionArgs drops the connection flags and keeps the session ones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const args = [_][]const u8{ "thysql", "-hx", "-s", "--port", "3307", "--connect-timeout=5", "--reconnect", "db1" };
+    const kept = try withoutConnectionArgs(allocator, &args, 1);
+    try std.testing.expectEqual(@as(usize, 4), kept.len);
+    try std.testing.expectEqualStrings("thysql", kept[0]);
+    try std.testing.expectEqualStrings("-s", kept[1]);
+    try std.testing.expectEqualStrings("--connect-timeout=5", kept[2]);
+    try std.testing.expectEqualStrings("--reconnect", kept[3]);
+}
+
+test "withoutConnectionArgs splits a short cluster and drops a value taken from the next word" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // -Ns keeps both flags. -sh x drops h and its value x, and keeps s.
+    const args = [_][]const u8{ "thysql", "-Ns", "-sh", "x", "-C", "local", "-p", "-N" };
+    const kept = try withoutConnectionArgs(allocator, &args, 1);
+    try std.testing.expectEqual(@as(usize, 5), kept.len);
+    try std.testing.expectEqualStrings("-N", kept[1]);
+    try std.testing.expectEqualStrings("-s", kept[2]);
+    try std.testing.expectEqualStrings("-s", kept[3]);
+    try std.testing.expectEqualStrings("-N", kept[4]);
+}
+
+test "a rebuilt command line parses without the connection flags" {
+    var env = testEnv();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const args = [_][]const u8{ "thysql", "-h", "other.example", "-P", "9", "--table" };
+    const kept = try withoutConnectionArgs(arena.allocator(), &args, 1);
+    var options = try parseWithSettings(std.testing.allocator, kept, 1, &env, &.{});
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("localhost", options.host);
+    try std.testing.expectEqual(@as(u32, 3306), options.port);
+    try std.testing.expect(options.table);
 }

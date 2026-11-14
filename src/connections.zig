@@ -73,7 +73,9 @@ pub fn resolve(
         .home = nonEmpty(env.get("HOME")),
         .stderr = stderr,
     }, name);
-    return .{ .arena = arena, .name = found.name, .settings = found.settings };
+    // The name can point into `name`, which the caller may free, as the line of `\C` is. Copy it into the arena.
+    const owned_name = try allocator.dupe(u8, found.name);
+    return .{ .arena = arena, .name = owned_name, .settings = found.settings };
 }
 
 /// The connection named by -C, if any, and the settings to parse with: the option-file settings
@@ -111,7 +113,20 @@ pub fn select(
     base: []const OptionFile.Setting,
 ) Error!Selection {
     const requested = options.connectionArg(args, first) orelse return .{ .gpa = gpa, .settings = base };
-    var resolved = try resolve(gpa, io, env, stderr, requested);
+    return selectName(gpa, io, env, stderr, requested, base);
+}
+
+/// Resolves the connection called `name`, as `-C name` does, with `base` before its settings. Errors
+/// are printed to `stderr` as in `select`.
+pub fn selectName(
+    gpa: Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    stderr: *std.Io.Writer,
+    name: []const u8,
+    base: []const OptionFile.Setting,
+) Error!Selection {
+    var resolved = try resolve(gpa, io, env, stderr, name);
     errdefer resolved.deinit();
 
     const settings = try gpa.alloc(OptionFile.Setting, base.len + resolved.settings.len);
@@ -136,6 +151,51 @@ pub fn list(
     const wanted = trimSlash(dir);
     if (wanted.len > 0 and !validName(wanted)) return allocator.alloc(Entry, 0);
     return listIn(allocator, io, root, wanted);
+}
+
+/// One connection name offered by `completions`: the text that replaces the typed word, and whether
+/// a space follows it.
+pub const Completion = struct {
+    text: []const u8,
+    space: bool,
+};
+
+/// The names that start with `typed`, for tab completion. A connection is offered by its name. A
+/// directory is offered as `dir/`, with no space after it, and a directory with a `default-conn` is
+/// also offered by its bare name. Allocated in `allocator`.
+pub fn completions(
+    allocator: Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    typed: []const u8,
+) Allocator.Error![]Completion {
+    var out: std.ArrayList(Completion) = .empty;
+    const dir = if (std.mem.lastIndexOfScalar(u8, typed, '/')) |slash| typed[0..slash] else "";
+    const entries = try list(allocator, io, env, dir);
+    for (entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, typed)) continue;
+        switch (entry.kind) {
+            .connection => try out.append(allocator, .{ .text = entry.name, .space = true }),
+            .directory => {
+                try out.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "{s}/", .{entry.name}), .space = false });
+                if (try defaultConn(allocator, io, env, entry.name)) |_| {
+                    try out.append(allocator, .{ .text = entry.name, .space = false });
+                }
+            },
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Every entry below the root, depth first: each directory is followed by what is in it. Names are
+/// relative to the root. Used by `\C` to list the connections. Allocated in `allocator`.
+pub fn listAll(allocator: Allocator, io: std.Io, env: *const std.process.Environ.Map) Allocator.Error![]Entry {
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const root = (try rootDir(scratch.allocator(), env)) orelse return allocator.alloc(Entry, 0);
+    var out: std.ArrayList(Entry) = .empty;
+    try allEntries(allocator, io, root, "", 0, &out);
+    return out.toOwnedSlice(allocator);
 }
 
 /// The connections root: `$XDG_CONFIG_HOME/thysql/connections` when XDG_CONFIG_HOME is set
@@ -494,6 +554,24 @@ fn listIn(allocator: Allocator, io: std.Io, root: []const u8, dir: []const u8) A
     }
     std.mem.sort(Entry, entries.items, {}, lessThanEntry);
     return entries.toOwnedSlice(allocator);
+}
+
+/// Every entry at or below `dir`, depth first, down to `max_depth` levels of directories.
+fn allEntries(
+    allocator: Allocator,
+    io: std.Io,
+    root: []const u8,
+    dir: []const u8,
+    depth: usize,
+    out: *std.ArrayList(Entry),
+) Allocator.Error!void {
+    const entries = try listIn(allocator, io, root, dir);
+    for (entries) |entry| {
+        try out.append(allocator, entry);
+        if (entry.kind == .directory and depth < max_depth) {
+            try allEntries(allocator, io, root, entry.name, depth + 1, out);
+        }
+    }
 }
 
 /// Every connection at or below `dir`, down to `max_depth` levels of directories.

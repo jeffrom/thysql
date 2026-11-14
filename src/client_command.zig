@@ -17,6 +17,7 @@ pub const Kind = enum {
     warnings,
     nowarnings,
     connect,
+    connection,
     prompt,
     rehash,
 };
@@ -37,6 +38,7 @@ const Short = struct { char: u8, kind: Kind, takes_arg: bool };
 const named = [_]Named{
     .{ .name = "?", .kind = .help, .takes_arg = true },
     .{ .name = "connect", .kind = .connect, .takes_arg = true },
+    .{ .name = "connection", .kind = .connection, .takes_arg = true },
     .{ .name = "exit", .kind = .quit, .takes_arg = false },
     .{ .name = "help", .kind = .help, .takes_arg = true },
     .{ .name = "nopager", .kind = .nopager, .takes_arg = false },
@@ -68,6 +70,7 @@ const short = [_]Short{
     .{ .char = 'W', .kind = .warnings, .takes_arg = false },
     .{ .char = 'w', .kind = .nowarnings, .takes_arg = false },
     .{ .char = 'r', .kind = .connect, .takes_arg = true },
+    .{ .char = 'C', .kind = .connection, .takes_arg = true },
     .{ .char = 'R', .kind = .prompt, .takes_arg = true },
     .{ .char = '#', .kind = .rehash, .takes_arg = false },
 };
@@ -136,11 +139,36 @@ fn parseShort(text: []const u8, body: []const u8) ?Command {
     return null;
 }
 
+/// Where the connection name starts when `line` is `\C name` or `connection name`, with any case for
+/// the word, and the cursor is in the name. Null otherwise. The name is the text from there to `cursor`,
+/// and it has no whitespace in it. Only a line that starts with the command counts.
+pub fn connectionNameStart(line: []const u8, cursor: usize) ?usize {
+    const first = std.mem.indexOfNone(u8, line, whitespace) orelse return null;
+    if (cursor <= first) return null;
+    const head = line[first..cursor];
+
+    const command_len: usize = if (std.mem.startsWith(u8, head, "\\C"))
+        2
+    else if (head.len > 10 and std.ascii.eqlIgnoreCase(head[0..10], "connection"))
+        10
+    else
+        return null;
+    if (command_len >= head.len or !std.ascii.isWhitespace(head[command_len])) return null;
+
+    var name = command_len;
+    while (name < head.len and std.ascii.isWhitespace(head[name])) name += 1;
+    for (head[name..]) |byte| {
+        if (std.ascii.isWhitespace(byte)) return null;
+    }
+    return first + name;
+}
+
 /// Lines for `help`, in mysql.cc's order. Only commands that thysql runs are listed.
 pub const help_items = [_]struct { name: []const u8, char: u8, doc: []const u8 }{
     .{ .name = "?", .char = '?', .doc = "Synonym for `help'." },
     .{ .name = "clear", .char = 'c', .doc = "Clear the current input statement." },
     .{ .name = "connect", .char = 'r', .doc = "Reconnect to the server. Optional arguments are db and host." },
+    .{ .name = "connection", .char = 'C', .doc = "Switch to a saved connection. With no name, list them." },
     .{ .name = "delimiter", .char = 'd', .doc = "Set statement delimiter." },
     .{ .name = "edit", .char = 'e', .doc = "Edit command with $EDITOR." },
     .{ .name = "exit", .char = 'q', .doc = "Exit thysql. Same as quit." },
@@ -164,7 +192,7 @@ pub const help_items = [_]struct { name: []const u8, char: u8, doc: []const u8 }
 pub fn renderHelp(out: *std.Io.Writer) !void {
     try out.print("List of all client commands:\n", .{});
     for (help_items) |item| {
-        try out.print("{s: <10}(\\{c}) {s}\n", .{ item.name, item.char, item.doc });
+        try out.print("{s: <11}(\\{c}) {s}\n", .{ item.name, item.char, item.doc });
     }
 }
 
@@ -238,6 +266,33 @@ test "prompt keeps the raw text, including trailing spaces" {
     try std.testing.expectEqualStrings("", bare.rest);
 }
 
+test "connection takes a name in both forms, and \\C is a short command" {
+    try std.testing.expect(isShortChar('C'));
+    const short_form = parse("\\C maria").?;
+    try std.testing.expectEqual(Kind.connection, short_form.kind);
+    try std.testing.expectEqualStrings("maria", short_form.arg);
+
+    const word_form = parse("CONNECTION main/ro;").?;
+    try std.testing.expectEqual(Kind.connection, word_form.kind);
+    try std.testing.expectEqualStrings("main/ro", word_form.arg);
+
+    const listing = parse("\\C").?;
+    try std.testing.expectEqual(Kind.connection, listing.kind);
+    try std.testing.expectEqualStrings("", listing.arg);
+    try std.testing.expectEqual(Kind.connect, parse("connect app").?.kind);
+}
+
+test "the connection name is where completion of \\C starts" {
+    try std.testing.expectEqual(@as(?usize, 3), connectionNameStart("\\C ma", 5));
+    try std.testing.expectEqual(@as(?usize, 3), connectionNameStart("\\C ", 3));
+    try std.testing.expectEqual(@as(?usize, 13), connectionNameStart("  connection main/", 18));
+    try std.testing.expectEqual(@as(?usize, null), connectionNameStart("\\C", 2));
+    try std.testing.expectEqual(@as(?usize, null), connectionNameStart("\\Cx ma", 6));
+    try std.testing.expectEqual(@as(?usize, null), connectionNameStart("select \\C", 9));
+    try std.testing.expectEqual(@as(?usize, null), connectionNameStart("\\C ma x", 6));
+    try std.testing.expectEqual(@as(?usize, null), connectionNameStart("connections ma", 14));
+}
+
 test "help lists each command with its backslash form" {
     var buffer: [2048]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buffer);
@@ -245,7 +300,8 @@ test "help lists each command with its backslash form" {
     const text = out.buffered();
 
     try std.testing.expect(std.mem.startsWith(u8, text, "List of all client commands:\n"));
-    try std.testing.expect(std.mem.indexOf(u8, text, "help      (\\h) Display this help.\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "tee       (\\T) Set outfile [to_outfile].") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "warnings  (\\W) Show warnings after every statement.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "help       (\\h) Display this help.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "connection (\\C) Switch to a saved connection. With no name, list them.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "tee        (\\T) Set outfile [to_outfile].") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "warnings   (\\W) Show warnings after every statement.\n") != null);
 }
