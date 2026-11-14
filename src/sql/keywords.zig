@@ -1,7 +1,7 @@
-//! MySQL 8.4 keywords and built-in function names, for the SQL lexer. Generated from the
-//! "Keywords and Reserved Words" page and the function reference of the MySQL 8.4 Reference
-//! Manual. Both tables are sorted by byte, so lookups are binary searches. Regenerate by
-//! editing the tables by hand; a name is listed once.
+//! MySQL 8.4 keywords and built-in function names, for the SQL lexer. The tables were taken
+//! from the "Keywords and Reserved Words" page and the function reference of the MySQL 8.4
+//! Reference Manual, and they are maintained by hand from there. Both are sorted by byte, so
+//! lookups are binary searches, and a name is listed once.
 
 const std = @import("std");
 
