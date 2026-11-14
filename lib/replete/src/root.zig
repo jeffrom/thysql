@@ -320,7 +320,9 @@ pub const Repl = struct {
     /// `readlineOwned`.
     pub fn readline(self: *Repl) ![]u8 {
         errdefer {
-            self.redrawFinal() catch {};
+            // Only a hint or diagnostic left on screen needs removing. A line that was
+            // already redrawn for its last time is past that point.
+            if (self.decorated) self.redrawFinal() catch {};
             self.disableBracketedPaste() catch {};
             self.cfg.out.flush() catch {};
         }
@@ -2453,6 +2455,28 @@ test "callbacks wait until the input is idle" {
     try std.testing.expectEqualStrings("select", try repl.readline());
     // Only the final drawing runs after the last key has been read.
     try std.testing.expectEqual(@as(usize, 1), counter.calls);
+}
+
+test "cancelling with type-ahead does not repaint the line after it ends" {
+    const allocator = std.testing.allocator;
+    // The "x" after Ctrl-C is still buffered when the line is cancelled, so the line was drawn plain.
+    var input: Io.Reader = .fixed("abc" ++ testKeys.ctrl_c ++ "x");
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var counter: CountingHighlighter = .{};
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .highlighter = .{ .context = &counter, .highlight = CountingHighlighter.highlight },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectError(ReplError.Cancelled, repl.readline());
+    // The last thing written is the end of the line, with the cursor on its row.
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "\r\x1b[?2004l"));
 }
 
 test "a 100 KB bracketed paste is inserted and drawn once" {
