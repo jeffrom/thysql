@@ -1187,6 +1187,8 @@ test {
         @import("prompt.zig"),
         @import("readline.zig"),
         @import("sql/keywords.zig"),
+        @import("sql/lexer.zig"),
+        @import("sql/lexer_test.zig"),
         @import("sql_completion.zig"),
         @import("unicode.zig"),
     };
