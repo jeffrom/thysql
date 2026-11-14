@@ -158,6 +158,35 @@ pub const Syntax = struct {
         return &self.parser_handle.?;
     }
 
+    /// The first error in the statement of `text` that holds `cursor`, for the line being typed. Only
+    /// that statement is checked. An error that reaches the end of the text is not returned, because
+    /// the user is still typing it: an unfinished statement, or a string that is not closed yet. A
+/// space after the text means the user has finished it.
+    /// Statements end at `delimiter` or at a backslash command, and client commands are not checked.
+    /// Returns null when there is nothing to report, or when the parser is off. Free the result with
+    /// `allocator`.
+    pub fn firstError(self: *Syntax, allocator: Allocator, text: []const u8, cursor: usize, delimiter: []const u8) !?Problem {
+        const handle = self.parser() orelse return null;
+        var options = self.lexer;
+        options.delimiter = delimiter;
+        const statement = statementAt(text, cursor, options) orelse return null;
+        const sql = text[statement.start..statement.end];
+        if (std.mem.trimEnd(u8, sql, " \t\r\n").len == 0) return null;
+
+        const errors = try handle.check(sql);
+        defer handle.freeErrors(errors);
+        if (errors.len == 0) return null;
+        // The parser sorts its errors by position, so the first one is the one to show. An error
+        // that runs to the end of the text is still being typed, unless a space follows it.
+        const first = errors[0];
+        if (first.end >= sql.len) return null;
+        return .{
+            .start = statement.start + first.start,
+            .end = statement.start + first.end,
+            .message = try allocator.dupe(u8, first.message),
+        };
+    }
+
     fn joinWarmUp(self: *Syntax) void {
         if (self.warm_up) |thread| {
             thread.join();
@@ -165,6 +194,46 @@ pub const Syntax = struct {
         }
     }
 };
+
+/// An error in the statement being typed. The offsets are into the text that was checked.
+pub const Problem = struct {
+    /// Byte offsets of the offending text, end exclusive.
+    start: usize,
+    end: usize,
+    /// Owned by the caller. The parser's message, such as `"FROM" is not valid at this position`.
+    message: []u8,
+};
+
+/// A statement of a text, as byte offsets, end exclusive.
+const Span = struct { start: usize, end: usize };
+
+/// The statement of `text` that holds `cursor`. A statement ends at the delimiter, or at a backslash
+/// command that follows other words, such as `\G`. Null when the statement is a client command,
+/// such as `DELIMITER $$`, which is not SQL.
+fn statementAt(text: []const u8, cursor: usize, options: SqlLexer.Options) ?Span {
+    var start: usize = 0;
+    // True until the statement has a token other than whitespace or a comment.
+    var first = true;
+    var lexer = SqlLexer.Lexer.init(text, options);
+    while (lexer.next()) |tok| {
+        switch (tok.kind) {
+            .whitespace, .comment => continue,
+            .delimiter => {
+                if (tok.start >= cursor) return .{ .start = start, .end = tok.start };
+                start = tok.end;
+                first = true;
+            },
+            .client_command => {
+                if (first) return null;
+                if (tok.start >= cursor) return .{ .start = start, .end = tok.start };
+                start = tok.end;
+                first = true;
+            },
+            else => first = false,
+        }
+    }
+    return .{ .start = start, .end = text.len };
+}
 
 /// Runs on the warm-up thread. It has its own parser, and the allocator is thread-safe.
 fn warmUp() void {
@@ -234,4 +303,70 @@ test "the parser follows the version and sql_mode it is given" {
     const errors = try handle.check("WITH c AS (SELECT 1) SELECT * FROM c");
     defer handle.freeErrors(errors);
     try std.testing.expect(errors.len > 0);
+}
+
+fn expectProblem(text: []const u8, cursor: usize, expected_start: ?usize, expected_text: ?[]const u8) !void {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    const found = try syntax.firstError(allocator, text, cursor, ";");
+    if (found) |problem| {
+        defer allocator.free(problem.message);
+        const want_start = expected_start orelse {
+            std.debug.print("expected no error for: {s}\n  got: {s}\n", .{ text, problem.message });
+            return error.UnexpectedProblem;
+        };
+        try std.testing.expectEqual(want_start, problem.start);
+        try std.testing.expectEqualStrings(expected_text.?, text[problem.start..problem.end]);
+    } else if (expected_start != null) {
+        std.debug.print("expected an error for: {s}\n", .{text});
+        return error.ExpectedProblem;
+    }
+}
+
+test "an error that reaches the end of the typed text is not reported" {
+    // The statement is unfinished, and so is the string, so the user is still typing.
+    try expectProblem("SELECT a FROM t WHERE", 22, null, null);
+    try expectProblem("SELECT a FROM t WHERE   ", 25, null, null);
+    try expectProblem("SELECT 'abc", 11, null, null);
+    try expectProblem("SELECT a FROM t FROM", 21, null, null);
+}
+
+test "a space after an error finishes it, so the error is reported" {
+    try expectProblem("SELECT a FROM t FROM ", 22, 16, "FROM");
+}
+
+test "an error before the end of the typed text is reported where it is" {
+    // The second FROM is not expected, and more text follows it.
+    try expectProblem("SELECT a FROM t FROM x", 22, 16, "FROM");
+}
+
+test "only the statement that holds the cursor is checked" {
+    const text = "SELECT 1; SELECT a FROM t FROM x; SELECT 2";
+    try expectProblem(text, 3, null, null);
+    try expectProblem(text, 25, 26, "FROM");
+    try expectProblem(text, 40, null, null);
+}
+
+test "client commands and backslash commands at the end of a statement are not SQL" {
+    try expectProblem("DELIMITER $$", 13, null, null);
+    try expectProblem("SELECT * FROM t \\G", 19, null, null);
+    try expectProblem("SELECT a FROM t FROM \\G", 24, null, null);
+}
+
+test "a statement of only whitespace or comments has nothing to report" {
+    try expectProblem("   ", 3, null, null);
+    try expectProblem("-- just a note", 14, null, null);
+}
+
+test "an error from a line that continues the statement is reported in the whole text" {
+    const text = "SELECT a\nFROM t FROM x";
+    try expectProblem(text, text.len, 16, "FROM");
+}
+
+test "a disabled syntax reports nothing" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, false);
+    defer syntax.deinit();
+    try std.testing.expect((try syntax.firstError(allocator, "SELECT a FROM t FROM x", 22, ";")) == null);
 }

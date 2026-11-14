@@ -50,6 +50,10 @@ pub const Session = struct {
     completion: Completion = undefined,
     /// The lexer settings for the session's sql_mode, read by the highlighter and completion.
     syntax: *Syntax,
+    /// The result of the last idle check of the line. The highlighter and the diagnostic read it.
+    analysis: Analysis = .{},
+    /// The SIGWINCH action that was installed before `setup`, restored by `deinit`.
+    old_winch: std.posix.Sigaction = undefined,
 
     /// Sets up the line editor for the interactive client. Lines are read from stdin and
     /// written to `out`. Tab completes the names and keywords that fit the context of the cursor,
@@ -87,17 +91,28 @@ pub const Session = struct {
             .completer = .{ .context = &self.completion, .complete = completeWord },
             .highlighter = .{ .context = self, .highlight = highlightLine },
             .hinter = .{ .context = self, .hint = hintLine },
+            .diagnoser = .{ .context = self, .diagnose = diagnoseLine },
+            .idle = .{ .context = self, .tick = idleTick, .delay_ms = idle_delay_ms },
         };
         self.repl = try replete.Repl.init(allocator, &self.config);
+        // A resize interrupts the wait for input, and the next idle check redraws the line at its new width.
+        const winch: std.posix.Sigaction = .{
+            .handler = .{ .handler = handleSigwinch },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.WINCH, &winch, &self.old_winch);
         return self;
     }
 
     pub fn deinit(self: *Session) void {
+        std.posix.sigaction(.WINCH, &self.old_winch, null);
         self.repl.deinit();
         self.completion.scratch.deinit();
         if (self.history) |*file| file.deinit();
         self.spans.deinit(self.gpa);
         self.joined.deinit(self.gpa);
+        self.analysis.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -109,6 +124,8 @@ pub const Session = struct {
         self.repl.setPrompt(prompt);
         self.scanner = pending;
         self.completion.scanner = pending;
+        // The last check was for the statement before this one, so it is not kept.
+        self.analysis.clear(self.gpa);
         defer {
             self.scanner = null;
             self.completion.scanner = null;
@@ -141,6 +158,41 @@ pub const Session = struct {
         }
     }
 
+    /// Checks `line` with the statement it continues, and keeps the first error for `diagnoseLine`
+    /// and the highlighter. The statement that holds the cursor is the one checked.
+    fn analyze(self: *Session, line: []const u8, cursor: usize) !void {
+        self.analysis.clear(self.gpa);
+        self.analysis.valid = true;
+        try self.analysis.line.appendSlice(self.gpa, line);
+        self.analysis.cursor = cursor;
+
+        const pending: []const u8 = if (self.scanner) |batch| batch.pendingQuery().sql else "";
+        const delimiter: []const u8 = if (self.scanner) |batch| batch.delimiterText() else ";";
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(self.gpa);
+        if (pending.len > 0) {
+            try text.appendSlice(self.gpa, pending);
+            try text.append(self.gpa, '\n');
+        }
+        const prefix = text.items.len;
+        try text.appendSlice(self.gpa, line);
+
+        const problem = (try self.syntax.firstError(self.gpa, text.items, prefix + cursor, delimiter)) orelse return;
+        defer self.gpa.free(problem.message);
+        self.analysis.message = try std.fmt.allocPrint(self.gpa, "syntax error: {s}", .{problem.message});
+        if (problem.end > prefix) {
+            self.analysis.start = problem.start -| prefix;
+            self.analysis.end = problem.end - prefix;
+        }
+    }
+
+    /// The bytes of `line` that the error covers, or null when the check was for another line, or
+    /// the error is not in this line.
+    fn errorSpan(self: *const Session, line: []const u8) ?struct { start: usize, end: usize } {
+        if (!self.analysis.lineIs(line) or self.analysis.end <= self.analysis.start) return null;
+        return .{ .start = self.analysis.start, .end = self.analysis.end };
+    }
+
     /// Ends the line that was just read, then flushes, since replete has left the cursor at its end.
     fn endLine(self: *Session, text: []const u8) !void {
         try self.stdout.writeAll(text);
@@ -163,7 +215,73 @@ fn highlightLine(context: ?*anyopaque, line: []const u8) []const replete.Span {
     const session: *Session = @ptrCast(@alignCast(context.?));
     session.spans.clearRetainingCapacity();
     appendSpans(session.gpa, &session.joined, &session.spans, session.scanner, session.syntax.lexer, line) catch {};
+    // The error goes last, so that it is drawn over the style of its token.
+    if (session.errorSpan(line)) |span| {
+        session.spans.append(session.gpa, .{ .start = span.start, .len = span.end - span.start, .style = .@"error" }) catch {};
+    }
     return session.spans.items;
+}
+
+/// How long the line must be idle before it is checked for a syntax error, in milliseconds.
+const idle_delay_ms = 200;
+
+/// Set by the SIGWINCH handler when the terminal is resized.
+var winch_requested = std.atomic.Value(bool).init(false);
+
+fn handleSigwinch(_: std.posix.SIG) callconv(.c) void {
+    winch_requested.store(true, .release);
+}
+
+/// The result of the last idle check of the line, and the error that it found, if any.
+const Analysis = struct {
+    /// Whether a check has run. The result is for `line` and `cursor` only.
+    valid: bool = false,
+    line: std.ArrayList(u8) = .empty,
+    cursor: usize = 0,
+    /// Owned. The message the line shows, such as `syntax error: "FROM" is not valid`, or null for none.
+    message: ?[]u8 = null,
+    /// The bytes of the line that the error covers, end exclusive. Both are 0 when the error is not in the line.
+    start: usize = 0,
+    end: usize = 0,
+
+    /// True when the check was for `line`.
+    fn lineIs(self: *const Analysis, line: []const u8) bool {
+        return self.valid and std.mem.eql(u8, self.line.items, line);
+    }
+
+    fn clear(self: *Analysis, gpa: Allocator) void {
+        self.valid = false;
+        self.line.clearRetainingCapacity();
+        self.cursor = 0;
+        if (self.message) |text| gpa.free(text);
+        self.message = null;
+        self.start = 0;
+        self.end = 0;
+    }
+
+    fn deinit(self: *Analysis, gpa: Allocator) void {
+        self.clear(gpa);
+        self.line.deinit(gpa);
+    }
+};
+
+/// Runs when the input is idle, and when a signal interrupts the wait for input. It checks the line
+/// unless the last check was for the same line and cursor. It asks for a redraw after a check, and
+/// when the terminal was resized.
+fn idleTick(context: ?*anyopaque, line: []const u8, cursor: usize) bool {
+    const session: *Session = @ptrCast(@alignCast(context.?));
+    const resized = winch_requested.swap(false, .acq_rel);
+    if (!session.syntax.enabled) return resized;
+    if (session.analysis.valid and session.analysis.cursor == cursor and session.analysis.lineIs(line)) return resized;
+    session.analyze(line, cursor) catch return resized;
+    return true;
+}
+
+/// The message for the line, from the last idle check. Nothing is shown while the line is changing.
+fn diagnoseLine(context: ?*anyopaque, line: []const u8) ?[]const u8 {
+    const session: *Session = @ptrCast(@alignCast(context.?));
+    if (!session.analysis.lineIs(line)) return null;
+    return session.analysis.message;
 }
 
 /// Appends spans for the SQL in `line`. The statement so far, which `scanner` holds, is lexed
@@ -725,6 +843,100 @@ test "the statement delimiter from the scanner and client commands are styled" {
     });
     try expectSpans(null, "DELIMITER $$", &.{.{ .start = 0, .len = 12, .style = .client_command }});
     try expectSpans(null, "\\G", &.{.{ .start = 0, .len = 2, .style = .client_command }});
+}
+
+/// A session with only the fields that the idle check reads. The caller frees the lists in it.
+fn testSession(allocator: Allocator, syntax: *Syntax) Session {
+    return .{ .gpa = allocator, .io = undefined, .stdout = undefined, .fd = -1, .syntax = syntax };
+}
+
+test "an idle check keeps the first error of the line, for the diagnostic and the highlighter" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var session = testSession(allocator, &syntax);
+    defer session.analysis.deinit(allocator);
+    defer session.spans.deinit(allocator);
+    defer session.joined.deinit(allocator);
+
+    const line = "SELECT a FROM t FROM x";
+    try session.analyze(line, line.len);
+    const message = diagnoseLine(&session, line) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, message, "syntax error: \"FROM\" is not valid"));
+    // The line is styled, with the error last so that it is drawn over the token's own style.
+    const spans = highlightLine(&session, line);
+    try std.testing.expectEqual(replete.Style.@"error", spans[spans.len - 1].style);
+    try std.testing.expectEqual(@as(usize, 16), spans[spans.len - 1].start);
+    try std.testing.expectEqual(@as(usize, 4), spans[spans.len - 1].len);
+    // Another line gets no diagnostic, because the check was for this one.
+    try std.testing.expect(diagnoseLine(&session, "SELECT a FROM t") == null);
+}
+
+test "an idle check of a line that follows a statement in progress reports offsets in the line" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var scanner: Batch.Scanner = .{};
+    defer scanner.deinit(allocator);
+    try scanner.replacePending(allocator, "SELECT a");
+    var session = testSession(allocator, &syntax);
+    session.scanner = &scanner;
+    defer session.analysis.deinit(allocator);
+    defer session.spans.deinit(allocator);
+    defer session.joined.deinit(allocator);
+
+    const line = "FROM t FROM x";
+    try session.analyze(line, line.len);
+    try std.testing.expectEqual(@as(usize, 7), session.analysis.start);
+    try std.testing.expectEqual(@as(usize, 11), session.analysis.end);
+}
+
+test "a line with no error has no diagnostic and no error style" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var session = testSession(allocator, &syntax);
+    defer session.analysis.deinit(allocator);
+    defer session.spans.deinit(allocator);
+    defer session.joined.deinit(allocator);
+
+    try session.analyze("SELECT a FROM t", 15);
+    try std.testing.expect(session.analysis.valid);
+    try std.testing.expect(diagnoseLine(&session, "SELECT a FROM t") == null);
+    for (highlightLine(&session, "SELECT a FROM t")) |span| {
+        try std.testing.expect(span.style != .@"error");
+    }
+}
+
+test "the idle tick checks each line once, and asks for a redraw after a resize" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var session = testSession(allocator, &syntax);
+    defer session.analysis.deinit(allocator);
+    defer session.spans.deinit(allocator);
+    defer session.joined.deinit(allocator);
+
+    const line = "SELECT a FROM t FROM x";
+    try std.testing.expect(idleTick(&session, line, line.len));
+    try std.testing.expect(!idleTick(&session, line, line.len));
+
+    winch_requested.store(true, .release);
+    try std.testing.expect(idleTick(&session, line, line.len));
+    try std.testing.expect(!idleTick(&session, line, line.len));
+}
+
+test "a disabled syntax never checks the line, and only redraws after a resize" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, false);
+    defer syntax.deinit();
+    var session = testSession(allocator, &syntax);
+    defer session.analysis.deinit(allocator);
+    defer session.spans.deinit(allocator);
+    defer session.joined.deinit(allocator);
+
+    try std.testing.expect(!idleTick(&session, "SELECT a FROM t FROM x", 22));
+    try std.testing.expect(!session.analysis.valid);
 }
 
 /// The statements that MYSQL_HISTIGNORE keeps out of the history. The value is a list of
