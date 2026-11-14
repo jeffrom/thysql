@@ -172,6 +172,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_replete_tests = b.addRunArtifact(replete_tests);
 
+    // Regenerates src/sql/generated from src/sql/grammar. Needs Java; normal
+    // builds use the committed sources and do not run this step.
+    const gen_parser = b.addSystemCommand(&.{ "sh", "tools/gen_parser.sh" });
+    const gen_parser_step = b.step("gen-parser", "Regenerate the MySQL parser sources (needs Java)");
+    gen_parser_step.dependOn(&gen_parser.step);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
