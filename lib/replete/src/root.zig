@@ -817,13 +817,19 @@ pub const Repl = struct {
         if (start > self.pos or candidates.list.items.len == 0) return;
 
         const words = candidates.list.items;
-        var common = words[0];
+        var common_len = words[0].len;
         for (words[1..]) |word| {
-            common = common[0..commonPrefixLen(common, word)];
+            common_len = caseInsensitivePrefixLen(words[0][0..common_len], word);
         }
-        if (common.len > self.pos - start) {
+        const typed_len = self.pos - start;
+        if (common_len > typed_len) {
+            // The typed part keeps the case the user typed; the rest takes the first candidate's case.
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(self.gpa);
+            try text.appendSlice(self.gpa, self.buf.items[start..self.pos]);
+            try text.appendSlice(self.gpa, words[0][typed_len..common_len]);
             try self.recordUndo(false);
-            try self.replaceBeforeCursor(start, common);
+            try self.replaceBeforeCursor(start, text.items);
         } else if (list_on_miss) {
             try self.listCandidates(words);
         }
@@ -2194,10 +2200,10 @@ test "delete escape sequence removes one UTF-8 codepoint" {
     try std.testing.expectEqual(@as(usize, 1), repl.pos);
 }
 
-/// Returns the length of the common prefix of `a` and `b`.
-fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+/// Returns the length of the common prefix of `a` and `b`, ignoring ASCII case.
+fn caseInsensitivePrefixLen(a: []const u8, b: []const u8) usize {
     var n: usize = 0;
-    while (n < a.len and n < b.len and a[n] == b[n]) n += 1;
+    while (n < a.len and n < b.len and std.ascii.toLower(a[n]) == std.ascii.toLower(b[n])) n += 1;
     return n;
 }
 
@@ -2210,7 +2216,7 @@ const TestCompleter = struct {
         var start = cursor;
         while (start > 0 and std.ascii.isAlphanumeric(line[start - 1])) start -= 1;
         for (self.names) |name| {
-            if (std.mem.startsWith(u8, name, line[start..cursor])) try candidates.add(name);
+            if (std.ascii.startsWithIgnoreCase(name, line[start..cursor])) try candidates.add(name);
         }
         return start;
     }
@@ -2314,6 +2320,25 @@ test "undo reverts a tab completion" {
     defer repl.deinit();
 
     try std.testing.expectEqualStrings("x pe", try repl.readline());
+}
+
+test "tab extends the common prefix ignoring case, keeping the typed case" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("x ORD" ++ testKeys.tab ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var names: TestCompleter = .{ .names = &.{ "orders", "ordering" } };
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .completer = .{ .context = &names, .complete = TestCompleter.complete },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("x ORDer", try repl.readline());
 }
 
 test "tab completes at the cursor and keeps the text after it" {
