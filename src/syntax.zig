@@ -190,6 +190,21 @@ pub const Syntax = struct {
         };
     }
 
+    /// The completion candidates that the parser gives at `cursor` in `text`, for the statement that
+    /// holds the cursor. The statement is checked only up to the cursor. Null when the parser is off,
+    /// or the cursor is in a client command. Free the result with `freeCandidates`.
+    pub fn candidates(self: *Syntax, text: []const u8, cursor: usize, delimiter: []const u8) Allocator.Error!?[]parser_api.Candidate {
+        const handle = self.parser() orelse return null;
+        var options = self.lexer;
+        options.delimiter = delimiter;
+        const span = statementAt(text, cursor, options) orelse return null;
+        return try handle.candidates(text[span.start..cursor], cursor - span.start);
+    }
+
+    pub fn freeCandidates(self: *Syntax, list: []parser_api.Candidate) void {
+        if (self.parser_handle) |*handle| handle.freeCandidates(list);
+    }
+
     /// Prints the parser's first error for `sql`, which the server has rejected with a syntax error: the
     /// message, the line of the statement that it is on, and a caret under the offending text. Nothing is
     /// printed when the parser is off or finds no error, because the server is authoritative.

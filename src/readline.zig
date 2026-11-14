@@ -13,6 +13,7 @@ const SqlContext = @import("sql/context.zig");
 const SqlKeywords = @import("sql/keywords.zig");
 const SqlLexer = @import("sql/lexer.zig");
 const Syntax = @import("syntax.zig").Syntax;
+const SqlParser = @import("sql/parser.zig");
 
 /// What `Session.one` read.
 pub const Outcome = union(enum) {
@@ -341,8 +342,9 @@ fn styleOf(kind: SqlLexer.Kind) ?replete.Style {
 /// quoted names. It is reset at each Tab press, and the candidates last until the next one.
 const Completion = struct {
     names: *const SqlCompletion.Names,
-    /// The lexer settings come from here. Null in the tests, which use the defaults.
-    syntax: ?*const Syntax = null,
+    /// The parser gives the candidates, and the lexer settings come from here. Null in the tests,
+    /// which then use the lexer alone.
+    syntax: ?*Syntax = null,
     /// The statement being typed, while `Session.one` reads a line. It gives the context of the line.
     scanner: ?*Batch.Scanner = null,
     scratch: std.heap.ArenaAllocator,
@@ -378,6 +380,7 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
     defer offers.seen.deinit(scratch);
 
     const names = completion.names;
+    if (try offerParsed(&offers, completion, line, cursor, expect)) return start;
     switch (expect) {
         .none, .variable => {},
         .client_command => try offerClientCommands(&offers),
@@ -394,21 +397,130 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
                 try offerColumns(&offers, names, scope.slice());
             }
         },
-        .column_of => |ref| {
-            if (names.findTable(ref.schema, ref.table)) |table| {
-                for (table.columns.items) |column| try offers.name(column, .column, false);
-            }
-        },
+        .column_of => |ref| try offerColumnsOf(&offers, names, &.{ref}, false),
         .routine => for (names.routines.items) |routine| try offers.name(routine.name, .function, true),
     }
     return start;
 }
 
+/// Offers what the parser expects at the cursor, from its candidates, and returns true. Keywords are
+/// offered as they are. Names are offered for the kinds of rule that ask for them, and the lexer's
+/// context says which ones: the table qualifier after `db.`, the table after a dot, and the tables in
+/// scope. Returns false, so that the lexer's context is used alone, when the parser is off, gives no
+/// candidates, or the cursor is in a string, a variable or a client command.
+fn offerParsed(offers: *Offers, completion: *const Completion, line: []const u8, cursor: usize, expect: SqlContext.Expect) std.mem.Allocator.Error!bool {
+    switch (expect) {
+        .none, .variable, .client_command => return false,
+        else => {},
+    }
+    const syntax = completion.syntax orelse return false;
+    const typed = try typedText(offers.scratch, completion, line);
+    const list = (try syntax.candidates(typed.text, typed.offset + cursor, typed.options.delimiter)) orelse return false;
+    defer syntax.freeCandidates(list);
+    if (list.len == 0) return false;
+
+    // The parser also lists tokens that are not words, such as NOT2 for `!`. Only the words of the
+    // keyword table are offered.
+    var wanted: Wanted = .{};
+    var keywords: usize = 0;
+    for (list) |candidate| switch (candidate.kind) {
+        .keyword => if (SqlKeywords.find(candidate.text) != null) {
+            keywords += 1;
+        },
+        .rule => if (candidate.rule) |rule| wanted.add(rule),
+    };
+    // Rules that name no kind of name, such as a generic identifier, tell nothing that the lexer
+    // does not, so the lexer's context is used for them.
+    if (keywords == 0 and !wanted.any()) return false;
+    for (list) |candidate| {
+        if (candidate.kind != .keyword or SqlKeywords.find(candidate.text) == null) continue;
+        // The parser frees its candidates when this returns, and offers keep their text until the next
+        // Tab press, so a keyword is copied into the scratch arena.
+        try offers.keyword(try offers.scratch.dupe(u8, candidate.text), .keyword);
+    }
+
+    const names = completion.names;
+    if (wanted.databases) for (names.databases.items) |name| try offers.name(name, .database, true);
+    if (wanted.tables) try offerTables(offers, names, switch (expect) {
+        .table => |schema| schema,
+        else => null,
+    });
+    if (wanted.routines) for (names.routines.items) |routine| try offers.name(routine.name, .function, true);
+    if (wanted.functions) try offerFunctions(offers);
+    if (wanted.columns) try offerExpectedColumns(offers, names, expect);
+    return true;
+}
+
+/// The kinds of name that the parser's rule candidates ask for.
+const Wanted = struct {
+    tables: bool = false,
+    columns: bool = false,
+    databases: bool = false,
+    /// Stored procedures and functions, for CALL and friends.
+    routines: bool = false,
+    /// The built-in functions, for an expression.
+    functions: bool = false,
+
+    fn any(self: Wanted) bool {
+        return self.tables or self.columns or self.databases or self.routines or self.functions;
+    }
+
+    fn add(self: *Wanted, rule: SqlParser.Rule) void {
+        switch (rule) {
+            .table_ref, .table_ref_with_wildcard, .filter_table_ref, .table_wild => self.tables = true,
+            .column_ref, .column_internal_ref => self.columns = true,
+            .schema_ref => self.databases = true,
+            .function_ref => {
+                self.functions = true;
+                self.routines = true;
+            },
+            .procedure_ref => self.routines = true,
+            else => {},
+        }
+    }
+};
+
+/// Offers the columns that the lexer's context names: those of the table after a dot, those of the
+/// tables in scope, or else those of every table when no table is named yet.
+fn offerExpectedColumns(offers: *Offers, names: *const SqlCompletion.Names, expect: SqlContext.Expect) std.mem.Allocator.Error!void {
+    switch (expect) {
+        .column_of => |ref| try offerColumnsOf(offers, names, &.{ref}, false),
+        .column => |scope| {
+            if (scope.len > 0) {
+                try offerColumnsOf(offers, names, scope.slice(), true);
+            } else {
+                try offerAllColumns(offers, names);
+            }
+        },
+        else => try offerAllColumns(offers, names),
+    }
+}
+
+/// Offers the columns of every table that the names hold.
+fn offerAllColumns(offers: *Offers, names: *const SqlCompletion.Names) std.mem.Allocator.Error!void {
+    for (names.tables.items) |table| {
+        for (table.columns.items) |column| try offers.name(column, .column, true);
+    }
+}
+
 /// The context of the cursor. The statement so far comes before the line, so that a clause on an
 /// earlier line still counts, and the cursor moves with it.
 fn contextAt(scratch: std.mem.Allocator, completion: *const Completion, line: []const u8, cursor: usize) !SqlContext.Expect {
+    const typed = try typedText(scratch, completion, line);
+    return SqlContext.expectAt(typed.text, typed.offset + cursor, typed.options);
+}
+
+/// The statement typed so far, with the line after it, and the lexer settings for them.
+const Typed = struct {
+    text: []const u8,
+    /// Where the line starts in `text`.
+    offset: usize,
+    options: SqlLexer.Options,
+};
+
+/// The statement typed so far, then a newline, then the line. `scratch` holds the text.
+fn typedText(scratch: std.mem.Allocator, completion: *const Completion, line: []const u8) !Typed {
     var text: std.ArrayList(u8) = .empty;
-    var offset = cursor;
     var options: SqlLexer.Options = if (completion.syntax) |syntax| syntax.lexer else .{};
     if (completion.scanner) |batch| {
         options.delimiter = batch.delimiterText();
@@ -416,11 +528,11 @@ fn contextAt(scratch: std.mem.Allocator, completion: *const Completion, line: []
         if (pending.len > 0) {
             try text.appendSlice(scratch, pending);
             try text.append(scratch, '\n');
-            offset += text.items.len;
         }
     }
+    const offset = text.items.len;
     try text.appendSlice(scratch, line);
-    return SqlContext.expectAt(text.items, offset, options);
+    return .{ .text = text.items, .offset = offset, .options = options };
 }
 
 /// True when the word completed is a name after a dot, which replaces only the part after the dot.
@@ -487,13 +599,19 @@ fn offerTables(offers: *Offers, names: *const SqlCompletion.Names, schema: ?[]co
 
 /// Offers the columns of the tables in `refs`, the functions, and the keywords that go in expressions.
 fn offerColumns(offers: *Offers, names: *const SqlCompletion.Names, refs: []const SqlContext.TableRef) std.mem.Allocator.Error!void {
-    for (refs) |ref| {
-        if (names.findTable(ref.schema, ref.table)) |table| {
-            for (table.columns.items) |column| try offers.name(column, .column, true);
-        }
-    }
+    try offerColumnsOf(offers, names, refs, true);
     try offerFunctions(offers);
     for (SqlContext.expression_keywords) |word| try offers.keyword(word, .keyword);
+}
+
+/// Offers the columns of the tables in `refs`. `space` says whether a space follows each column,
+/// which is not so after a dot.
+fn offerColumnsOf(offers: *Offers, names: *const SqlCompletion.Names, refs: []const SqlContext.TableRef, space: bool) std.mem.Allocator.Error!void {
+    for (refs) |ref| {
+        if (names.findTable(ref.schema, ref.table)) |table| {
+            for (table.columns.items) |column| try offers.name(column, .column, space);
+        }
+    }
 }
 
 fn offerFunctions(offers: *Offers) std.mem.Allocator.Error!void {
@@ -724,6 +842,171 @@ test "inside a string nothing is offered" {
     defer completion.scratch.deinit();
     try names.addTable("app", "people");
     try names.setDatabase("app");
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    _ = try completeLine(&completion, "select 'pe", &candidates);
+    try std.testing.expectEqual(@as(usize, 0), candidates.list.items.len);
+}
+
+/// Counts the candidates of `kind` in `candidates`.
+fn countKind(candidates: *const replete.Candidates, kind: replete.CandidateKind) usize {
+    var count: usize = 0;
+    for (candidates.list.items) |candidate| {
+        if (candidate.kind == kind) count += 1;
+    }
+    return count;
+}
+
+/// True when `candidates` offers `text` as a candidate of `kind`.
+fn offersAs(candidates: *const replete.Candidates, kind: replete.CandidateKind, text: []const u8) bool {
+    for (candidates.list.items) |candidate| {
+        if (candidate.kind == kind and std.mem.eql(u8, candidate.text, text)) return true;
+    }
+    return false;
+}
+
+test "with the parser on, a table after FROM is offered from the current database" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.addTable("app", "people");
+    try names.addTable("app", "orders");
+    try names.addTable("other", "ledger");
+    try names.setDatabase("app");
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var completion = testCompletion(allocator, &names);
+    completion.syntax = &syntax;
+    defer completion.scratch.deinit();
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    _ = try completeLine(&completion, "select * from ", &candidates);
+    try std.testing.expectEqual(@as(usize, 2), countKind(&candidates, .table));
+    try std.testing.expect(offersAs(&candidates, .table, "people"));
+    try std.testing.expect(offersAs(&candidates, .table, "orders"));
+    try std.testing.expect(!offersAs(&candidates, .table, "ledger"));
+}
+
+test "with the parser on, a table after a schema name comes from that schema" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.addTable("app", "people");
+    try names.addTable("other", "ledger");
+    try names.setDatabase("app");
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var completion = testCompletion(allocator, &names);
+    completion.syntax = &syntax;
+    defer completion.scratch.deinit();
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    const start = try completeLine(&completion, "select * from other.", &candidates);
+    try std.testing.expectEqual(@as(usize, 20), start);
+    try std.testing.expectEqual(@as(usize, 1), countKind(&candidates, .table));
+    try std.testing.expectEqualStrings("ledger", candidates.list.items[0].text);
+}
+
+test "with the parser on, columns after WHERE are the columns of the tables in scope" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.addTable("app", "people");
+    try names.addColumn("app", "people", "name");
+    try names.addColumn("app", "people", "nickname");
+    try names.addTable("app", "orders");
+    try names.addColumn("app", "orders", "total");
+    try names.setDatabase("app");
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var completion = testCompletion(allocator, &names);
+    completion.syntax = &syntax;
+    defer completion.scratch.deinit();
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    _ = try completeLine(&completion, "select * from people where n", &candidates);
+    try std.testing.expectEqual(@as(usize, 2), countKind(&candidates, .column));
+    try std.testing.expect(offersAs(&candidates, .column, "name"));
+    try std.testing.expect(offersAs(&candidates, .column, "nickname"));
+    try std.testing.expect(!offersAs(&candidates, .column, "total"));
+}
+
+test "with the parser on, a keyword comes from the parser, in upper case" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var completion = testCompletion(allocator, &names);
+    completion.syntax = &syntax;
+    defer completion.scratch.deinit();
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    _ = try completeLine(&completion, "sel", &candidates);
+    var found = false;
+    for (candidates.list.items) |candidate| {
+        if (candidate.kind == .keyword and std.mem.eql(u8, candidate.text, "SELECT")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "with the parser on, a token that is not a word is not offered" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.addTable("app", "people");
+    try names.addColumn("app", "people", "name");
+    try names.setDatabase("app");
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var completion = testCompletion(allocator, &names);
+    completion.syntax = &syntax;
+    defer completion.scratch.deinit();
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    _ = try completeLine(&completion, "select * from people where n", &candidates);
+    for (candidates.list.items) |candidate| {
+        try std.testing.expect(!std.mem.eql(u8, candidate.text, "NOT2"));
+    }
+    try std.testing.expect(offersAs(&candidates, .keyword, "NOT"));
+}
+
+test "with the parser on, a database after USE comes from the server's names" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.addDatabase("app");
+    try names.addDatabase("archive");
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var completion = testCompletion(allocator, &names);
+    completion.syntax = &syntax;
+    defer completion.scratch.deinit();
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    _ = try completeLine(&completion, "use a", &candidates);
+    try std.testing.expectEqual(@as(usize, 2), countKind(&candidates, .database));
+    try std.testing.expectEqual(@as(usize, 0), countKind(&candidates, .table));
+}
+
+test "with the parser on, nothing is offered inside a string" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    try names.addTable("app", "people");
+    try names.setDatabase("app");
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var completion = testCompletion(allocator, &names);
+    completion.syntax = &syntax;
+    defer completion.scratch.deinit();
 
     var candidates: replete.Candidates = .{ .gpa = allocator };
     defer candidates.deinit();
