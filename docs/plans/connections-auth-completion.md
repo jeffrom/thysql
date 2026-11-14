@@ -578,3 +578,83 @@ Commit: `readme: connections, auth command, keychain, shell completion`.
 - `connect -C name` inside the REPL, and completing connection names there.
 - A Linux secret-service backend.
 - A `thysql connections` subcommand to list and edit connections.
+
+---
+
+## Step 10: `\C` switches connections in the REPL, with tab completion
+
+Added after steps 1-9 landed. The user asked for `\C` to change connections and to
+tab-complete connection names. mysql uses `\C` for `charset`; thysql does not have
+`charset`, so `\C` is free. The `\C` prompt escape from step 3 is unrelated and stays.
+
+### Command
+
+- Add `Kind.connection` in `src/client_command.zig`: the backslash form `\C` and the
+  word form `connection`, both taking an argument. Add a help line:
+  `connection (\C) Switch to a saved connection. With no name, list them.` Check that the
+  lexer now styles `\C` as a client command (`isShortChar`).
+- `\C name`:
+  1. Resolve `name` with `connections.zig`, as `-C` does, including `default-conn`.
+  2. Build fresh options: the my.cnf settings that were loaded at startup, then the new
+     connection's settings, then the startup command line **minus every connection-group
+     flag** (host, port, user, password, socket, protocol, database, ssl/tls flags,
+     auth-command, keychain flags, and -C itself). Keep `--connect-timeout` and
+     `--reconnect`/`--skip-reconnect` from the command line. Otherwise a startup `-h` would
+     override every connection you switch to. Keep what `runREPL` needs for this (the
+     loaded option-file settings and the args) alive for the whole session.
+  3. Build a new `Password.Supplier` from the new options. A `.prompt` source prompts now,
+     as at startup. In batch input that needs a prompt: the usual error, no switch.
+  4. Open the new connection. On any failure (resolve, password, connect), print the error
+     and keep the old connection, the old supplier, and the old connection name. Nothing
+     changes.
+  5. On success, close the old connection and switch everything over: `DB`, the supplier
+     (later reconnects after a lost connection use the new one), `Repl.connection` (the
+     `\C` prompt escape), and the prompt's user, host, port, and database. Print
+     `Connected to "main/ro".` and then the same connection info that `connect` prints.
+     Reload the names when auto-rehash is on, and refresh the parser (`syntax.refresh`),
+     since the server version may differ.
+- `\C` with no name lists the connections, one per line, in `connections.list` order,
+  with `* ` before the current one and two spaces before the others. Directories are shown
+  as `main/` (recurse into them, so every connection is listed by its full name). If there
+  are no connections, print where they would go:
+  `No connections in ~/.config/thysql/connections.`
+- It works in batch input too, as `connect` does.
+
+### Tab completion
+
+- In `src/readline.zig`, when the line is `\C ` or `connection ` (any case for the word
+  form) followed by a partial name, and the cursor is in that argument, offer connection
+  names instead of SQL candidates. Share the code that `src/completion.zig` uses for `-C`
+  (move it into `connections.zig` if that is the natural home): connections, directories
+  as `main/` with no space after, and a directory with `default-conn` also as `main`.
+- The word here is everything after the whitespace that follows the command, so `/`, `-`
+  and `.` are part of it. `\C main/r<TAB>` gives `main/ro`.
+- Pending multi-line SQL input is not a `\C` context; only a line that starts with the
+  command is.
+
+### Tests
+
+- Unit tests: `client_command.parse` for `\C`, `\C name`, `connection name`; the readline
+  context detection for `\C ma|`, `connection main/|`, and `select \C|` (not a context);
+  the option rebuild (startup `-h x` is dropped, startup `--connect-timeout` is kept).
+- e2e, in a new `tests/e2e/test_switch_connection.py`. Write two connection files, one per
+  server (`servers()` gives both), each with `auth-command` pointing at a script that prints
+  the root password, so no `MYSQL_PWD` is needed. Cases:
+  - start with `-C my` (MySQL), `\C maria`, then `select version()` shows MariaDB, and the
+    prompt `--prompt='\C> '` shows `maria> `.
+  - names reload: after the switch, tab-completing a table that exists only on the new
+    server works (create it in the test on that server with root, and drop it in cleanup).
+  - the startup `-h`/`-P` flags do not leak: start with `-C my -h 127.0.0.1 -P <mysql port>`,
+    `\C maria` still reaches MariaDB.
+  - `\C nope` prints `no connection named "nope"` and the session stays on the old server.
+  - `\C` with a connection whose auth command fails keeps the old session.
+  - `\C` alone lists the connections with `*` on the current one.
+  - after a switch, kill the connection from another client; the reconnect goes to the
+    new server and runs its auth command (log `THYSQL_REASON` and `THYSQL_CONNECTION`).
+  - tab completion: `\C ma<TAB>` completes `maria`, and with a `main/` directory present,
+    `\C main/<TAB>` lists or completes its connections.
+  - word form: `connection maria` works.
+- README: document `\C` / `connection` next to the other client commands and in the
+  connections section.
+
+Commits: `client: \C switches to a saved connection`, `readline: complete connection names after \C`, `readme: \C`.
