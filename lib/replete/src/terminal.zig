@@ -38,7 +38,9 @@ pub const TermState = struct {
         raw.cc[@intFromEnum(posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(posix.V.TIME)] = 0;
 
-        try posix.tcsetattr(fd, posix.TCSA.FLUSH, raw);
+        // TCSA.NOW rather than TCSA.FLUSH: FLUSH discards input that is already
+        // waiting, so keys typed while a query ran would be lost at the prompt.
+        try posix.tcsetattr(fd, posix.TCSA.NOW, raw);
 
         return .{
             .orig = termios,
@@ -46,8 +48,10 @@ pub const TermState = struct {
         };
     }
 
+    /// Restores the settings from `enable`. Uses TCSA.NOW, not TCSA.FLUSH, so keys
+    /// typed while the caller ran a query stay in the input queue for the next line.
     pub fn disable(self: TermState) void {
-        posix.tcsetattr(self.fd, posix.TCSA.FLUSH, self.orig) catch {};
+        posix.tcsetattr(self.fd, posix.TCSA.NOW, self.orig) catch {};
     }
 };
 
