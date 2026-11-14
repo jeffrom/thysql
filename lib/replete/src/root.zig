@@ -264,6 +264,8 @@ pub const Repl = struct {
     final_draw: bool = false,
     /// Whether the last drawing of the line showed a hint or a diagnostic.
     decorated: bool = false,
+    /// Whether the last drawing skipped the highlighter, because input was still buffered.
+    unhighlighted: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const ReplConfig) !Repl {
         return .{
@@ -318,6 +320,7 @@ pub const Repl = struct {
     /// `readlineOwned`.
     pub fn readline(self: *Repl) ![]u8 {
         errdefer {
+            self.redrawFinal() catch {};
             self.disableBracketedPaste() catch {};
             self.cfg.out.flush() catch {};
         }
@@ -327,13 +330,13 @@ pub const Repl = struct {
             const state: ReadEditState = try self.readEditKey();
             switch (state) {
                 ReadEditState.EOF => {
-                    try self.redrawUndecorated();
+                    try self.redrawFinal();
                     try self.finishAtBottom();
                     return Io.Reader.Error.EndOfStream;
                 },
 
                 ReadEditState.Cancel => {
-                    try self.redrawUndecorated();
+                    try self.redrawFinal();
                     try self.finishAtBottom();
                     return ReplError.Cancelled;
                     // try self.editStart();
@@ -341,7 +344,7 @@ pub const Repl = struct {
                 },
                 ReadEditState.Done => {
                     try self.saveEditedHistoryEntry();
-                    try self.redrawUndecorated();
+                    try self.redrawFinal();
                     try self.finishAtBottom();
                     return self.buf.items;
                 },
@@ -775,10 +778,10 @@ pub const Repl = struct {
         return if (message.len == 0) null else message;
     }
 
-    /// Redraws the line without its hint and diagnostic, when either is on screen. This is
-    /// done before the caller takes over the terminal, so they do not stay there.
-    fn redrawUndecorated(self: *Repl) !void {
-        if (!self.decorated) return;
+    /// Redraws the line before the caller takes over the terminal. This removes a hint or
+    /// diagnostic that is on screen, and adds the highlighting that a paste skipped.
+    fn redrawFinal(self: *Repl) !void {
+        if (!self.decorated and !self.unhighlighted) return;
         self.final_draw = true;
         defer self.final_draw = false;
         try self.refreshLine();
@@ -1501,10 +1504,15 @@ pub const Repl = struct {
             if (self.cfg.columns == null) self.cols = current_size.columns;
             if (self.cfg.rows == null) self.rows = current_size.rows;
         }
-        const styles = try self.lineStyles();
+        // The callbacks run only once the input is idle, so that a paste is not
+        // highlighted byte by byte. Until then the line is drawn plain.
+        const idle = self.cfg.in.bufferedLen() == 0;
+        self.unhighlighted = !idle and self.cfg.highlighter != null;
+        const styles = if (idle) try self.lineStyles() else null;
         defer if (styles) |byte_styles| self.gpa.free(byte_styles);
-        const hint = if (self.final_draw) "" else self.currentHint() orelse "";
-        const diagnostic = if (self.final_draw) "" else self.currentDiagnostic() orelse "";
+        const interactive = idle and !self.final_draw;
+        const hint = if (interactive) (self.currentHint() orelse "") else "";
+        const diagnostic = if (interactive) (self.currentDiagnostic() orelse "") else "";
         self.decorated = hint.len > 0 or diagnostic.len > 0;
         var next = try display.layoutWith(self.gpa, self.active_prompt, self.buf.items, self.pos, self.cols, .{
             .styles = styles,
@@ -2298,9 +2306,11 @@ test "meta-f accepts the first word of the hint" {
     try expectReadlineWithHinter("hello" ++ testKeys.meta_f ++ testKeys.enter, "hello world");
 }
 
-test "the hint is drawn dim after the cursor and gone once the line is accepted" {
+test "the hint is drawn dim after the cursor and removed when the read ends" {
     const allocator = std.testing.allocator;
-    var input: Io.Reader = .fixed("hello" ++ testKeys.enter);
+    // The input ends after "hello", so the line is idle and drawn with its hint. The read
+    // then fails, and the hint must not stay on screen.
+    var input: Io.Reader = .fixed("hello");
     var output: Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     const cfg: ReplConfig = .{
@@ -2312,13 +2322,13 @@ test "the hint is drawn dim after the cursor and gone once the line is accepted"
     };
     var repl = try Repl.init(allocator, &cfg);
     defer repl.deinit();
-    try std.testing.expectEqualStrings("hello", try repl.readline());
+    try std.testing.expectError(Io.Reader.Error.EndOfStream, repl.readline());
 
     const written = output.written();
     try std.testing.expect(std.mem.indexOf(u8, written, "> hello\x1b[2m world\x1b[0m") != null);
     // The last drawing of the line leaves the hint off.
     const last_hint = std.mem.lastIndexOf(u8, written, "world").?;
-    try std.testing.expect(std.mem.lastIndexOf(u8, written, "> hello\x1b[0K") .? > last_hint);
+    try std.testing.expect(std.mem.lastIndexOf(u8, written, "> hello\x1b[0K").? > last_hint);
 }
 
 fn expectReadlineWithHinter(inputBytes: []const u8, expectedLine: []const u8) !void {
@@ -2363,9 +2373,9 @@ const TestDiagnoser = struct {
     }
 };
 
-test "diagnostic is drawn below the line and removed when the line is accepted" {
+test "diagnostic is drawn below the line and removed when the read ends" {
     const allocator = std.testing.allocator;
-    var input: Io.Reader = .fixed("bad" ++ testKeys.enter);
+    var input: Io.Reader = .fixed("bad");
     var output: Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     const cfg: ReplConfig = .{
@@ -2377,12 +2387,12 @@ test "diagnostic is drawn below the line and removed when the line is accepted" 
     };
     var repl = try Repl.init(allocator, &cfg);
     defer repl.deinit();
-    try std.testing.expectEqualStrings("bad", try repl.readline());
+    try std.testing.expectError(Io.Reader.Error.EndOfStream, repl.readline());
 
     const written = output.written();
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[38;5;160msyntax error\x1b[0m") != null);
     const last_message = std.mem.lastIndexOf(u8, written, "syntax error").?;
-    try std.testing.expect(std.mem.lastIndexOf(u8, written, "> bad\x1b[0K") .? > last_message);
+    try std.testing.expect(std.mem.lastIndexOf(u8, written, "> bad\x1b[0K").? > last_message);
 }
 
 test "diagnostic rows are counted, so that a redraw without them clears them" {
@@ -2410,6 +2420,67 @@ test "diagnostic rows are counted, so that a redraw without them clears them" {
     try repl.editBackspace();
     try std.testing.expectEqual(@as(usize, 1), repl.rendered_rows);
     try std.testing.expectEqual(@as(usize, 0), repl.rendered_cursor_row);
+}
+
+/// Counts how often the highlighter runs.
+const CountingHighlighter = struct {
+    calls: usize = 0,
+
+    fn highlight(context: ?*anyopaque, line: []const u8) []const Span {
+        _ = line;
+        const self: *CountingHighlighter = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        return &.{};
+    }
+};
+
+test "callbacks wait until the input is idle" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("select" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var counter: CountingHighlighter = .{};
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .highlighter = .{ .context = &counter, .highlight = CountingHighlighter.highlight },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("select", try repl.readline());
+    // Only the final drawing runs after the last key has been read.
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+}
+
+test "a 100 KB bracketed paste is inserted and drawn once" {
+    const allocator = std.testing.allocator;
+    const size = 100 * 1024;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, testKeys.paste_begin);
+    try bytes.appendNTimes(allocator, 'a', size);
+    try bytes.appendSlice(allocator, testKeys.paste_end ++ testKeys.enter);
+
+    var input: Io.Reader = .fixed(bytes.items);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var counter: CountingHighlighter = .{};
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .highlighter = .{ .context = &counter, .highlight = CountingHighlighter.highlight },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    const line = try repl.readline();
+    try std.testing.expectEqual(@as(usize, size), line.len);
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
 }
 
 test "readline ctrl-c cancels the current line" {
