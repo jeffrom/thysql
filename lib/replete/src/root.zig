@@ -44,6 +44,7 @@ const KeyCode = enum(u8) {
     CTRL_F = 6,
     CTRL_H = 8,
     TAB = 9,
+    CTRL_J = 10,
     CTRL_K = 11,
     CTRL_L = 12,
     ENTER = 13,
@@ -368,7 +369,8 @@ pub const Repl = struct {
         // std.debug.print("readEditKey c: {c}\n", .{c});
 
         switch (c) {
-            @intFromEnum(KeyCode.ENTER) => {
+            // Ctrl-J is a line feed, and readline binds it to accept-line like Enter.
+            @intFromEnum(KeyCode.ENTER), @intFromEnum(KeyCode.CTRL_J) => {
                 return ReadEditState.Done;
             },
             @intFromEnum(KeyCode.CTRL_C) => {
@@ -1619,6 +1621,10 @@ test "quoted ctrl-j inserts a literal newline" {
         80,
         "first\nsecond",
     );
+}
+
+test "ctrl-j accepts the line like enter" {
+    try expectReadline("first" ++ testKeys.ctrl_j, 80, "first");
 }
 
 test "bracketed paste inserts newlines and controls without executing them" {
