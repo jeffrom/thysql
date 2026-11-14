@@ -17,6 +17,7 @@ pub const Error = error{
     UnexpectedOptionValue,
     PasswordOnCommandLine,
     InvalidProtocol,
+    InvalidConnectTimeout,
     InvalidBoolValue,
     DefaultsOptionMisplaced,
     OutOfMemory,
@@ -36,6 +37,7 @@ pub const Id = enum {
     password,
     socket,
     protocol,
+    connect_timeout,
     ssl,
     skip_ssl,
     ssl_ca,
@@ -94,6 +96,7 @@ pub const specs = [_]Spec{
     .{ .id = .password, .long = "password", .short = 'p', .arg = .optional, .group = .connection, .help = "Prompt for password without echoing input." },
     .{ .id = .socket, .long = "socket", .short = 'S', .arg = .required, .arg_name = "path", .group = .connection, .help = "Unix socket file to use. Selects the socket protocol." },
     .{ .id = .protocol, .long = "protocol", .arg = .required, .arg_name = "name", .group = .connection, .help = "Connection protocol: tcp or socket. Socket applies only to host localhost." },
+    .{ .id = .connect_timeout, .long = "connect-timeout", .arg = .required, .arg_name = "#", .group = .connection, .help = "Seconds to wait for the connection to open. Defaults to the library's timeout." },
     .{ .id = .ssl, .long = "ssl", .arg = .optional, .group = .connection, .help = "Use TLS when the server offers it. This is the default." },
     .{ .id = .skip_ssl, .long = "skip-ssl", .group = .connection, .help = "Do not use TLS." },
     .{ .id = .ssl_ca, .long = "ssl-ca", .arg = .required, .arg_name = "file", .group = .connection, .help = "CA certificate file in PEM format. Implies --ssl." },
@@ -164,6 +167,8 @@ pub const Options = struct {
     socket: []const u8 = "",
     protocol: Protocol = .default,
     tls: Tls = .{},
+    /// Seconds to wait for the connection to open. 0 keeps the library default.
+    connect_timeout: u32 = 0,
     execute: ?std.ArrayList(u8) = null,
     force: bool = false,
     /// Delimiter for batch and REPL input. Checked when it is set.
@@ -396,6 +401,11 @@ fn protocolValue(value: ?[]const u8) Error!Protocol {
     return Error.InvalidProtocol;
 }
 
+/// As in mysql.cc, the value is a count of seconds. 0 means the library default.
+fn connectTimeoutValue(value: ?[]const u8) Error!u32 {
+    return std.fmt.parseUnsigned(u32, try requiredValue(value), 10) catch Error.InvalidConnectTimeout;
+}
+
 /// Boolean values for --ssl and --ssl-verify-server-cert. A bare flag means true.
 fn boolValue(value: ?[]const u8) Error!bool {
     const text = value orelse return true;
@@ -480,6 +490,7 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
             options.protocol = .socket;
         },
         .protocol => options.protocol = try protocolValue(value),
+        .connect_timeout => options.connect_timeout = try connectTimeoutValue(value),
         .ssl => options.tls.enabled = try boolValue(value),
         .skip_ssl => options.tls.enabled = false,
         .ssl_ca => try setTlsPath(options, &options.tls.ca, value),
@@ -543,6 +554,7 @@ pub fn renderError(out: *std.Io.Writer, err: Error) !void {
         Error.UnexpectedOptionValue => "This option does not take a value.",
         Error.PasswordOnCommandLine => "Password values are not accepted on the command line; use -p or MYSQL_PWD.",
         Error.InvalidProtocol => "Invalid protocol. Expected tcp or socket.",
+        Error.InvalidConnectTimeout => "Invalid connect timeout. Expected a base-10 unsigned integer of seconds.",
         Error.InvalidBoolValue => "Invalid value for a boolean option. Use 1, 0, on, or off.",
         Error.DefaultsOptionMisplaced => "--no-defaults, --defaults-file, --defaults-extra-file, and --print-defaults must be the first arguments, each at most once.",
         Error.OutOfMemory => "Out of memory.",
@@ -1195,6 +1207,42 @@ test "option-file values are checked like command-line values" {
 
     const bad_bool = [_]OptionFile.Setting{.{ .name = "batch", .value = "maybe" }};
     try std.testing.expectError(Error.InvalidBoolValue, parseWithSettings(std.testing.allocator, &args, 1, &env, &bad_bool));
+}
+
+test "--connect-timeout takes seconds, from the command line and from option files" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const plain = [_][]const u8{"thysql"};
+    var none = try parse(std.testing.allocator, &plain, &env);
+    defer none.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 0), none.connect_timeout);
+
+    const flag = [_][]const u8{ "thysql", "--connect-timeout=5" };
+    var by_flag = try parse(std.testing.allocator, &flag, &env);
+    defer by_flag.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 5), by_flag.connect_timeout);
+
+    const file = [_]OptionFile.Setting{.{ .name = "connect_timeout", .value = "7" }};
+    var from_file = try parseWithSettings(std.testing.allocator, &plain, 1, &env, &file);
+    defer from_file.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 7), from_file.connect_timeout);
+
+    var flag_over_file = try parseWithSettings(std.testing.allocator, &flag, 1, &env, &file);
+    defer flag_over_file.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 5), flag_over_file.connect_timeout);
+}
+
+test "a bad --connect-timeout value is rejected, from the command line or an option file" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const words = [_][]const u8{ "thysql", "--connect-timeout=soon" };
+    try std.testing.expectError(Error.InvalidConnectTimeout, parse(std.testing.allocator, &words, &env));
+
+    const negative = [_]OptionFile.Setting{.{ .name = "connect-timeout", .value = "-1" }};
+    const plain = [_][]const u8{"thysql"};
+    try std.testing.expectError(Error.InvalidConnectTimeout, parseWithSettings(std.testing.allocator, &plain, 1, &env, &negative));
 }
 
 test "help and version are not read from option files" {

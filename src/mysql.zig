@@ -43,6 +43,8 @@ pub const DBInfo = struct {
     socket: []const u8 = "",
     protocol: Options.Protocol = .default,
     tls: Options.Tls = .{},
+    /// Seconds to wait for the connection to open. 0 keeps the library default.
+    connect_timeout: u32 = 0,
 };
 
 /// TLS settings as NUL-terminated strings for the C library. An empty string means unset.
@@ -69,6 +71,7 @@ const ConnectParams = struct {
     socket: [:0]const u8,
     protocol: Options.Protocol,
     tls: Tls,
+    connect_timeout: u32,
 };
 
 pub const DBError = error{ ExecError, StoreResultError, ConnectError, OutOfMemory };
@@ -97,6 +100,7 @@ pub const DB = struct {
     socket: [:0]const u8,
     protocol: Options.Protocol,
     tls: Tls,
+    connect_timeout: u32,
     connect_failure: ConnectFailure = .{},
 
     pub fn init(allocator: Allocator, info: DBInfo) !DB {
@@ -123,6 +127,7 @@ pub const DB = struct {
             .socket = socket,
             .protocol = info.protocol,
             .tls = tls,
+            .connect_timeout = info.connect_timeout,
         };
         var failure: ConnectFailure = .{};
         const db = connect(connect_params, &failure) catch |err| {
@@ -144,6 +149,7 @@ pub const DB = struct {
             .socket = socket,
             .protocol = info.protocol,
             .tls = tls,
+            .connect_timeout = info.connect_timeout,
         };
     }
 
@@ -166,6 +172,7 @@ pub const DB = struct {
             .socket = self.socket,
             .protocol = self.protocol,
             .tls = self.tls,
+            .connect_timeout = self.connect_timeout,
         };
     }
 
@@ -535,6 +542,10 @@ fn connect(params: ConnectParams, failure: *ConnectFailure) !*C.struct_st_mysql 
     }
 
     applyConnectOptions(db, params);
+    if (params.connect_timeout != 0) {
+        var timeout: c_uint = params.connect_timeout;
+        _ = C.mysql_options(db, C.MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+    }
 
     // A socket path only matters for host "localhost" (or no host). The library
     // ignores it for other hosts and for protocol tcp, as it does for mysql.cc.

@@ -972,6 +972,7 @@ pub fn runREPL(
         .socket = options.socket,
         .protocol = options.protocol,
         .tls = options.tls,
+        .connect_timeout = options.connect_timeout,
     }) catch |err| switch (err) {
         // connect() has already printed the server's error message.
         error.ConnectError => return 1,

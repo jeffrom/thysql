@@ -107,6 +107,7 @@ pub fn run(
         .socket = options.socket,
         .protocol = options.protocol,
         .tls = options.tls,
+        .connect_timeout = options.connect_timeout,
     });
     defer db.close();
 

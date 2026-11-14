@@ -1,5 +1,7 @@
 """Connection options, credentials, and password handling."""
 
+import time
+
 import harness
 from harness import (
     NOPW_USER,
@@ -81,3 +83,14 @@ class ConnectTests(E2ETestCase):
                 )
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("Cannot prompt for a password", result.stderr)
+
+    def test_connect_timeout_gives_up_on_an_unreachable_host(self):
+        start = time.monotonic()
+        result = harness.run_thysql(
+            ["--connect-timeout=1", "-h", "10.255.255.1", "-u", ROOT_USER, "-e", "select 1"],
+            timeout=30,
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Connect to database failed", result.stdout + result.stderr)
+        self.assertLess(elapsed, 10, f"connect took {elapsed:.1f}s")
