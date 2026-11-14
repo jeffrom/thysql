@@ -1244,7 +1244,8 @@ test "meta-p performs a prompted non-incremental history search" {
 test "yank pop replaces differently sized kills without removing following text" {
     const allocator = std.testing.allocator;
     var input: Io.Reader = .fixed(
-        "leftright" ++ testKeys.home ++ testKeys.ctrl_f ** 4 ++ testKeys.ctrl_y ++
+        "leftright" ++ testKeys.home ++ testKeys.ctrl_f ++ testKeys.ctrl_f ++
+            testKeys.ctrl_f ++ testKeys.ctrl_f ++ testKeys.ctrl_y ++
             testKeys.meta_y ++ testKeys.meta_y ++ testKeys.enter,
     );
     var output: Io.Writer.Allocating = .init(allocator);
