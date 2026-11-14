@@ -1,41 +1,11 @@
-//! Words for tab completion in the REPL: SQL keywords, and the database, table,
-//! and column names of the current database. The names are loaded on connect and
+//! Names for tab completion in the REPL: the database, table, and column names of the
+//! current database. The SQL keywords and functions come from `sql/keywords.zig`. The names are loaded on connect and
 //! on `use`, and by `rehash`, as mysql.cc's build_completion_hash does. A column
 //! is offered by its own name and as `table.column`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Mysql = @import("mysql.zig");
-
-/// Reserved words and common statement words, offered as they are typed in upper case.
-pub const keywords = [_][:0]const u8{
-    "ACCESSIBLE", "ADD",       "ALL",         "ALTER",     "ANALYZE",  "AND",        "AS",         "ASC",
-    "BEFORE",     "BETWEEN",   "BIGINT",      "BINARY",    "BLOB",     "BOTH",       "BY",         "CALL",
-    "CASCADE",    "CASE",      "CHANGE",      "CHAR",      "CHARACTER", "CHECK",     "COLLATE",    "COLUMN",
-    "COMMIT",     "CONSTRAINT", "CONTINUE",   "CREATE",    "CROSS",    "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP",
-    "CURRENT_USER", "CURSOR",  "DATABASE",    "DATABASES", "DAY_HOUR", "DECIMAL",    "DECLARE",    "DEFAULT",
-    "DELETE",     "DESC",      "DESCRIBE",    "DETERMINISTIC", "DISTINCT", "DISTINCTROW", "DIV",    "DOUBLE",
-    "DROP",       "DUAL",      "EACH",        "ELSE",      "ELSEIF",   "END",        "ENUM",       "ESCAPE",
-    "EXCEPT",     "EXISTS",    "EXPLAIN",     "FALSE",     "FETCH",    "FLOAT",      "FOR",        "FOREIGN",
-    "FROM",       "FULLTEXT",  "FUNCTION",    "GRANT",     "GROUP",    "HAVING",     "IF",         "IGNORE",
-    "IN",         "INDEX",     "INNER",       "INSERT",    "INT",      "INTERSECT",  "INTERVAL",   "INTO",
-    "IS",         "ITERATE",   "JOIN",        "KEY",       "KEYS",     "KILL",       "LEADING",    "LEAVE",
-    "LEFT",       "LIKE",      "LIMIT",       "LOAD",      "LOCALTIME", "LOCK",      "LONG",       "LOOP",
-    "MATCH",      "MERGE",     "MOD",         "NATURAL",   "NOT",      "NULL",       "NUMERIC",    "OFFSET",
-    "ON",         "OPTIMIZE",  "OR",          "ORDER",     "OUT",      "OUTER",      "OUTFILE",    "OVER",
-    "PARTITION",  "PRECISION", "PRIMARY",     "PROCEDURE", "PURGE",    "RANGE",      "READ",       "REAL",
-    "RECURSIVE",  "REFERENCES", "RELEASE",    "RENAME",    "REPEAT",   "REPLACE",    "RESTRICT",   "RETURN",
-    "REVOKE",     "RIGHT",     "ROLLBACK",    "ROW",       "ROWS",     "SAVEPOINT",  "SCHEMA",     "SELECT",
-    "SEPARATOR",  "SET",       "SHOW",        "SMALLINT",  "SOME",     "SPATIAL",    "SQL",        "STARTING",
-    "TABLE",      "TABLES",    "TEMPORARY",   "TERMINATED", "THEN",    "TINYINT",    "TO",         "TRAILING",
-    "TRIGGER",    "TRUE",      "UNDO",        "UNION",     "UNIQUE",   "UNLOCK",     "UNSIGNED",   "UPDATE",
-    "USAGE",      "USE",       "USING",       "UTC_DATE",  "UTC_TIME", "UTC_TIMESTAMP", "VALUES",  "VARCHAR",
-    "VIEW",       "WHEN",      "WHERE",       "WHILE",     "WINDOW",   "WITH",       "WRITE",      "XOR",
-    "YEAR",       "ZEROFILL",  "BEGIN",       "DATE",      "DATETIME", "TEXT",       "TIME",       "TIMESTAMP",
-    "BOOLEAN",    "JSON",      "COUNT",       "SUM",       "AVG",      "MIN",        "MAX",        "CONCAT",
-    "SUBSTRING",  "COALESCE",  "IFNULL",      "NOW",       "DATE_FORMAT", "GROUP_CONCAT", "ROW_NUMBER",
-    "FORMAT",     "STATUS",    "TRUNCATE",    "SHUTDOWN",
-};
 
 /// The names of the current database, owned, without duplicates.
 pub const Names = struct {
@@ -168,16 +138,4 @@ test "prefix matching ignores case and needs the prefix at the start" {
     try std.testing.expect(matches("people.name", "PEOPLE."));
     try std.testing.expect(!matches("people", "ople"));
     try std.testing.expect(matches("anything", ""));
-}
-
-test "keywords are upper case and the list has no duplicates" {
-    var seen = std.StringHashMap(void).init(std.testing.allocator);
-    defer seen.deinit();
-    for (keywords) |word| {
-        for (word) |byte| {
-            try std.testing.expect(!std.ascii.isLower(byte));
-        }
-        const gop = try seen.getOrPut(word);
-        try std.testing.expect(!gop.found_existing);
-    }
 }

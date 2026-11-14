@@ -8,6 +8,7 @@ const replete = @import("replete");
 const Batch = @import("batch.zig");
 const history_file = @import("history_file.zig");
 const SqlCompletion = @import("sql_completion.zig");
+const SqlKeywords = @import("sql/keywords.zig");
 const SqlLexer = @import("sql/lexer.zig");
 
 /// What `Session.one` read.
@@ -212,9 +213,15 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
     if (prefix.len == 0) {
         return cursor;
     }
-    for (SqlCompletion.keywords) |keyword| {
-        if (SqlCompletion.matches(keyword, prefix)) {
-            try candidates.add(keyword);
+    for (SqlKeywords.keywords) |keyword| {
+        if (SqlCompletion.matches(keyword.name, prefix)) {
+            try candidates.add(keyword.name);
+        }
+    }
+    for (SqlKeywords.functions) |name| {
+        // A word that is both a keyword and a function, such as IF, was offered above.
+        if (SqlCompletion.matches(name, prefix) and SqlKeywords.find(name) == null) {
+            try candidates.add(name);
         }
     }
     for (names.words.items) |name| {
@@ -245,6 +252,25 @@ test "completion offers keywords and names for the word before the cursor" {
     try std.testing.expectEqual(@as(usize, 2), candidates.list.items.len);
     try std.testing.expectEqualStrings("people", candidates.list.items[0].text);
     try std.testing.expectEqualStrings("people.name", candidates.list.items[1].text);
+}
+
+test "completion offers SQL keywords and functions once each" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+
+    var candidates: replete.Candidates = .{ .gpa = allocator };
+    defer candidates.deinit();
+    const line = "if";
+    _ = try completeWord(&names, line, line.len, &candidates);
+    var ifs: usize = 0;
+    var ifnull = false;
+    for (candidates.list.items) |candidate| {
+        if (std.mem.eql(u8, candidate.text, "IF")) ifs += 1;
+        if (std.mem.eql(u8, candidate.text, "IFNULL")) ifnull = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), ifs);
+    try std.testing.expect(ifnull);
 }
 
 test "completion treats dots as part of the word" {
