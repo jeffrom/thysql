@@ -16,7 +16,9 @@ Also needed:
 - Git submodules initialized
 
 On macOS with Homebrew OpenSSL, the default build looks in `/opt/homebrew/lib`.
-Use `-Dopenssl-lib-dir=/path/to/lib` if OpenSSL is somewhere else.
+Use `-Dopenssl-lib-dir=/path/to/lib` if OpenSSL is somewhere else. Headers come from the
+`include/` beside that directory, or from `-Dopenssl-include-dir=/path/to/include`. zstd
+is found on the library search path, or use `-Dzstd-lib-dir=/path/to/lib`.
 
 ## build
 
@@ -32,6 +34,23 @@ its static `libmysqlclient.a` into `thysql`. MySQL 8 auth plugins
 `client_ed25519`, `parsec`, `auth_gssapi_client`, `mysql_clear_password`, and
 `zstd` are built into the static client, so no MariaDB plugin directory is
 required at runtime for those plugins.
+
+### static build
+
+`-Dstatic-deps=true` links OpenSSL and zstd statically, so the binary needs no shared
+libraries from Homebrew. Kerberos stays the system library. Point the library options
+at the directories that hold `libssl.a`, `libcrypto.a` and `libzstd.a`:
+
+```sh
+zig build -Doptimize=ReleaseSafe -Dstatic-deps=true \
+  -Dopenssl-lib-dir=/opt/homebrew/opt/openssl@4/lib \
+  -Dzstd-lib-dir=/opt/homebrew/opt/zstd/lib
+sh tools/check_linkage.sh zig-out/bin/thysql
+```
+
+The bundled MariaDB is built against the same OpenSSL root that thysql links. Zig falls
+back to a shared library when it finds no `.a`, so `tools/check_linkage.sh` fails on macOS
+if anything outside `/System` and `/usr/lib` is loaded.
 
 Run the app:
 
