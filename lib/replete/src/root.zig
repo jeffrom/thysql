@@ -615,7 +615,7 @@ pub const Repl = struct {
             },
             @intFromEnum(KeyCode.TAB) => {
                 // Only a hint on screen: keys typed in one burst never drew theirs.
-                if (self.cfg.tab_accepts_hint and self.hint_shown and try self.acceptHint(.whole)) return ReadEditState.More;
+                if (self.cfg.tab_accepts_hint and try self.acceptShownHint(.whole)) return ReadEditState.More;
                 try self.editComplete(after_tab);
                 self.tab_pending = true;
                 return ReadEditState.More;
@@ -818,6 +818,13 @@ pub const Repl = struct {
         try self.recordUndo(false);
         try self.editInsertSlice(hint[0..take]);
         return true;
+    }
+
+    /// Like `acceptHint`, but only for a hint the user has seen. Hints are drawn once the input is
+    /// idle, so keys typed in one burst never show theirs.
+    fn acceptShownHint(self: *Repl, part: HintPart) !bool {
+        if (!self.hint_shown) return false;
+        return self.acceptHint(part);
     }
 
     /// The message from the diagnoser for the line, or null for none.
@@ -1442,6 +1449,16 @@ pub const Repl = struct {
                 try self.editBackwardWord();
                 return .other;
             },
+            // Meta-W accepts the hint to the end of the word, or completes the word when no hint
+            // is shown. Meta-L accepts the whole hint.
+            'w', 'W' => {
+                if (!(try self.acceptShownHint(.word))) try self.editComplete(false);
+                return .other;
+            },
+            'l', 'L' => {
+                _ = try self.acceptShownHint(.whole);
+                return .other;
+            },
             'f', 'F' => {
                 // With a hint shown, Meta-F accepts its first word.
                 if (!(try self.acceptHint(.word))) try self.editForwardWord();
@@ -1706,6 +1723,8 @@ const testKeys = struct {
     const meta_d = "\x1bd";
     const meta_backspace = "\x1b\x7f";
     const meta_f = "\x1bf";
+    const meta_w = "\x1bw";
+    const meta_l = "\x1bl";
     const meta_y = "\x1by";
     const meta_p = "\x1bp";
 };
@@ -2321,12 +2340,15 @@ test "errors are drawn as a curly underline, or a straight one without undercurl
     try std.testing.expect(std.mem.indexOf(u8, plain_output.written(), "\x1b[4mx\x1b[0m") != null);
 }
 
-/// Suggests " world" after "hello", and " world again" after nothing else.
+/// Suggests " world" after "hello", and the rest of "select * from t" after any start of it from "sel" on.
 const TestHinter = struct {
     fn hint(context: ?*anyopaque, line: []const u8, cursor: usize) ?[]const u8 {
         _ = context;
         _ = cursor;
         if (std.mem.eql(u8, line, "hello")) return " world";
+        // Like a history hint, the rest of "select * from t" for any start of it from "sel" on.
+        const entry = "select * from t";
+        if (line.len >= 3 and line.len < entry.len and std.mem.startsWith(u8, entry, line)) return entry[line.len..];
         return null;
     }
 };
@@ -2413,6 +2435,34 @@ test "undo reverts a tab that accepted a hint" {
 test "tab does not take a hint that was never drawn" {
     // "hello" and Tab arrive in one read, so the line is not idle and no hint is drawn.
     try expectTabWithHint(&.{ "hello" ++ testKeys.tab, testKeys.enter }, true, "hello_there ");
+}
+
+test "meta-w accepts the hint to the end of the word being typed" {
+    try expectTabWithHint(&.{ "sel", testKeys.meta_w, testKeys.enter }, true, "select");
+}
+
+test "meta-w takes the next word of a hint that starts with a blank" {
+    try expectTabWithHint(&.{ "hello", testKeys.meta_w, testKeys.enter }, true, "hello world");
+}
+
+test "meta-w twice takes two words of the hint" {
+    try expectTabWithHint(&.{ "sel", testKeys.meta_w, testKeys.meta_w, testKeys.enter }, true, "select *");
+}
+
+test "meta-w completes the word when no hint is shown" {
+    try expectTabWithHint(&.{ "or", testKeys.meta_w, testKeys.enter }, true, "orders ");
+}
+
+test "meta-l accepts the whole hint" {
+    try expectTabWithHint(&.{ "sel", testKeys.meta_l, testKeys.enter }, true, "select * from t");
+}
+
+test "meta-l does nothing when no hint is shown" {
+    try expectTabWithHint(&.{ "or", testKeys.meta_l, testKeys.enter }, true, "or");
+}
+
+test "meta-w and meta-l take only a hint that was drawn" {
+    try expectTabWithHint(&.{ "sel" ++ testKeys.meta_l, testKeys.enter }, true, "sel");
 }
 
 /// Reads a line with `hello_hinter` and a completer. Each element of `reads` arrives as its own
