@@ -140,8 +140,8 @@ Settings apply in this order, and later ones win:
 4. command-line flags
 
 `-C` may appear anywhere on the command line, and the last one wins. `--print-defaults -C main/ro`
-prints the settings that the connection expands to. Inside the REPL, `connect` does not
-switch connections yet.
+prints the settings that the connection expands to. Inside the REPL, `\C name` switches to
+another connection, as described under client commands.
 
 Errors go to stderr, and thysql exits 1. An unknown name can come with a suggestion, such as
 `did you mean "main/ro"?`. A directory with no `default-conn` lists its children, so you
@@ -231,6 +231,13 @@ at the start of a statement, such as `\P less` on its own line.
   statement with warnings.
 - `connect [db [host]]`, `\r [db [host]]`: reconnects. With no arguments it
   reconnects to the current database and host. A failed connect keeps the old one.
+- `connection <name>`, `\C <name>`: switches to a saved connection, as `-C` does, and the
+  notice and connection info print as with `connect`. The prompt, the completion names,
+  and the reconnects follow the new connection. With no name, it lists the saved
+  connections, with `* ` before the one in use. Tab completes the names after `\C`.
+  A failed switch prints the reason and keeps the old connection. The connection flags
+  given at startup (`-h`, `-P`, `-u`, `-p`, `-D`, `--auth-command`, and so on) do not carry
+  over. The others do, such as `--prompt`, `--connect-timeout`, and `--skip-reconnect`.
 - `prompt [fmt]`, `\R [fmt]`: sets the prompt. With no argument it returns to the default.
   The text after the command is kept as typed, including trailing spaces.
 - `rehash`, `\#`: reloads the names used for completion.
