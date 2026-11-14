@@ -535,8 +535,9 @@ pub const Repl = struct {
             true;
     }
 
-    fn editBackwardWord(self: *Repl) !void {
-        if (self.pos == 0) return;
+    /// Position of the start of the word before the cursor.
+    fn backwardWordStart(self: *const Repl) usize {
+        if (self.pos == 0) return 0;
 
         var next = self.pos;
         var previous = unicode.codepointStartBefore(self.buf.items, next);
@@ -550,16 +551,11 @@ pub const Repl = struct {
             if (!self.isWordCodepointAt(previous)) break;
             next = previous;
         }
-
-        if (next != self.pos) {
-            self.pos = next;
-            try self.refreshLine();
-        }
+        return next;
     }
 
-    fn editForwardWord(self: *Repl) !void {
-        if (self.pos == self.buf.items.len) return;
-
+    /// Position just past the end of the word after the cursor.
+    fn forwardWordEnd(self: *const Repl) usize {
         var next = self.pos;
         while (next < self.buf.items.len and !self.isWordCodepointAt(next)) {
             next += unicode.codepointLenAt(self.buf.items, next);
@@ -567,11 +563,31 @@ pub const Repl = struct {
         while (next < self.buf.items.len and self.isWordCodepointAt(next)) {
             next += unicode.codepointLenAt(self.buf.items, next);
         }
+        return next;
+    }
 
+    fn editBackwardWord(self: *Repl) !void {
+        const next = self.backwardWordStart();
         if (next != self.pos) {
             self.pos = next;
             try self.refreshLine();
         }
+    }
+
+    fn editForwardWord(self: *Repl) !void {
+        const next = self.forwardWordEnd();
+        if (next != self.pos) {
+            self.pos = next;
+            try self.refreshLine();
+        }
+    }
+
+    fn editBackwardKillWord(self: *Repl) !void {
+        try self.killTo(self.backwardWordStart());
+    }
+
+    fn editKillWord(self: *Repl) !void {
+        try self.killTo(self.forwardWordEnd());
     }
 
     fn editDelete(self: *Repl) !void {
@@ -905,6 +921,15 @@ pub const Repl = struct {
                 try self.editForwardWord();
                 return .other;
             },
+            'd', 'D' => {
+                try self.editKillWord();
+                return .kill;
+            },
+            // Meta-Backspace sends ESC DEL on most terminals and ESC BS on some.
+            127, 8 => {
+                try self.editBackwardKillWord();
+                return .kill;
+            },
             'p', 'P' => {
                 try self.editNonIncrementalSearch(.backward);
                 return .other;
@@ -1114,6 +1139,8 @@ const testKeys = struct {
     const home = "\x1b[H";
     const end = "\x1b[F";
     const meta_b = "\x1bb";
+    const meta_d = "\x1bd";
+    const meta_backspace = "\x1b\x7f";
     const meta_f = "\x1bf";
     const meta_y = "\x1by";
     const meta_p = "\x1bp";
@@ -1449,6 +1476,22 @@ test "consecutive ctrl-w kills join one kill ring entry in order" {
         "a b c" ++ testKeys.ctrl_w ++ testKeys.ctrl_w ++ testKeys.ctrl_y ++ testKeys.enter,
         80,
         "a b c",
+    );
+}
+
+test "meta-backspace kills the Readline word before the cursor" {
+    try expectReadline(
+        "one two" ++ testKeys.meta_backspace ++ "!" ++ testKeys.ctrl_y ++ testKeys.enter,
+        80,
+        "one !two",
+    );
+}
+
+test "meta-d kills the Readline word after the cursor" {
+    try expectReadline(
+        "one two" ++ testKeys.home ++ testKeys.meta_d ++ "!" ++ testKeys.ctrl_y ++ testKeys.enter,
+        80,
+        "!one two",
     );
 }
 
