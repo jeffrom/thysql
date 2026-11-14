@@ -334,7 +334,7 @@ def _start_one(name, image, client, password_var, tls):
     exists = docker(["container", "inspect", container], check=False).returncode == 0
     if exists and not _mounts_tls(container, tls.directory):
         # A kept container from a run with other TLS material. Its mount cannot change.
-        docker(["rm", "-f", container])
+        docker(["rm", "-f", "-v", container])
         exists = False
     if exists:
         docker(["start", container])
@@ -374,7 +374,7 @@ def stop_servers():
     if keep_containers():
         return
     for container in _STARTED:
-        docker(["rm", "-f", container], check=False)
+        docker(["rm", "-f", "-v", container], check=False)
     _STARTED.clear()
     for directory in _TLS_DIRS:
         shutil.rmtree(directory, ignore_errors=True)

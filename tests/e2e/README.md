@@ -31,7 +31,7 @@ are reused on the next run (started if stopped), and are not removed. Fixtures
 are re-seeded on each run. Remove them when you are done:
 
 ```sh
-docker rm -f $(docker ps -aq --filter label=thysql-e2e=1)
+docker rm -f -v $(docker ps -aq --filter label=thysql-e2e=1)
 ```
 
 Without `THYSQL_E2E_KEEP`, names get a random suffix. If the runner is killed
