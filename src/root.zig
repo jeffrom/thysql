@@ -68,8 +68,13 @@ const ConnectionSwitch = struct {
 var sigint_requested = std.atomic.Value(bool).init(false);
 var query_executing = std.atomic.Value(bool).init(false);
 
-fn connectionPrompt(allocator: Allocator, user: []const u8, host: []const u8, port: u32, database: []const u8) ![:0]u8 {
+/// The built-in prompt. With a -C or `\C` connection it is `name/database> `, and
+/// otherwise `user@host:port/database> `.
+fn connectionPrompt(allocator: Allocator, connection: []const u8, user: []const u8, host: []const u8, port: u32, database: []const u8) ![:0]u8 {
     const db_name = if (database.len == 0) "(none)" else database;
+    if (connection.len != 0) {
+        return try std.fmt.allocPrintSentinel(allocator, "{s}/{s}> ", .{ connection, db_name }, 0);
+    }
     if (user.len == 0) {
         return try std.fmt.allocPrintSentinel(allocator, "{s}:{}/{s}> ", .{ host, port, db_name }, 0);
     }
@@ -626,7 +631,7 @@ fn mainPrompt(context: *ReplContext, delimiter: []const u8) ![:0]u8 {
     const db = context.db;
     const allocator = db.allocator;
     const format = context.repl.prompt.activeFormat() orelse {
-        return connectionPrompt(allocator, db.user, db.host, db.port, db.database);
+        return connectionPrompt(allocator, context.repl.connection, db.user, db.host, db.port, db.database);
     };
 
     // USER() is a query, so it runs only when the format asks for a user.
@@ -1284,13 +1289,21 @@ test "use strips backticks around a database name" {
 }
 
 test "connection prompt shows connection and database" {
-    const with_database = try connectionPrompt(std.testing.allocator, "root", "db.example", 3307, "app");
+    const with_database = try connectionPrompt(std.testing.allocator, "", "root", "db.example", 3307, "app");
     defer std.testing.allocator.free(with_database);
     try std.testing.expectEqualStrings("root@db.example:3307/app> ", with_database);
 
-    const without_database = try connectionPrompt(std.testing.allocator, "", "localhost", 3306, "");
+    const without_database = try connectionPrompt(std.testing.allocator, "", "", "localhost", 3306, "");
     defer std.testing.allocator.free(without_database);
     try std.testing.expectEqualStrings("localhost:3306/(none)> ", without_database);
+
+    const named = try connectionPrompt(std.testing.allocator, "main/ro", "root", "db.example", 3307, "app");
+    defer std.testing.allocator.free(named);
+    try std.testing.expectEqualStrings("main/ro/app> ", named);
+
+    const named_without_database = try connectionPrompt(std.testing.allocator, "main/ro", "root", "db.example", 3307, "");
+    defer std.testing.allocator.free(named_without_database);
+    try std.testing.expectEqualStrings("main/ro/(none)> ", named_without_database);
 }
 
 test "version line shows the build version and commit" {
