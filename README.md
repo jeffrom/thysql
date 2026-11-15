@@ -52,6 +52,20 @@ The bundled MariaDB is built against the same OpenSSL root that thysql links. Zi
 back to a shared library when it finds no `.a`, so `tools/check_linkage.sh` fails on macOS
 if anything outside `/System` and `/usr/lib` is loaded.
 
+### packaging
+
+`tools/package.sh` builds a release tarball for the machine it runs on. On macOS it uses
+the static build above, with OpenSSL and zstd from `OPENSSL_PREFIX` and `ZSTD_PREFIX`
+(default: `brew --prefix openssl@3` and `brew --prefix zstd`). It then checks the linkage,
+ad-hoc signs the binary, runs smoke tests, and writes the tarball and its sha256:
+
+```sh
+tools/package.sh 0.1.0 darwin arm64    # writes dist/thysql-0.1.0-darwin-arm64.tar.gz
+```
+
+The arguments are `<version> <darwin|linux> <arm64|x86_64>`. It does not cross-compile, so
+run it on the matching OS and architecture.
+
 Run the app:
 
 ```sh
