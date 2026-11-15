@@ -27,8 +27,36 @@ pub fn classify(field: *const C.struct_st_mysql_field, value: ?[]const u8) Kind 
         C.MYSQL_TYPE_NEWDECIMAL,
         => .decimal,
         C.MYSQL_TYPE_JSON => .json,
-        else => if (isBinaryType(field)) .binary else .text,
+        else => if (isBinaryType(field)) .binary else if (isMariaDbJson(field, value.?)) .json else .text,
     };
+}
+
+/// MariaDB has no JSON type: it stores JSON as LONGTEXT. The connector asks for
+/// extended metadata by default, and a MariaDB server that sends it names the format
+/// `json` for such columns. Those values are embedded only when they parse as JSON,
+/// since a CHECK constraint can be dropped. MySQL sends no extended metadata, so
+/// `mariadb_field_attr` fails there and this is always false.
+fn isMariaDbJson(field: *const C.struct_st_mysql_field, bytes: []const u8) bool {
+    var format: C.MARIADB_CONST_STRING = undefined;
+    if (C.mariadb_field_attr(&format, field, C.MARIADB_FIELD_ATTR_FORMAT_NAME) != 0) {
+        return false;
+    }
+    if (format.str == null or format.length != "json".len) {
+        return false;
+    }
+    if (!std.mem.eql(u8, format.str[0..format.length], "json")) {
+        return false;
+    }
+    return isJsonText(bytes);
+}
+
+/// Whether `bytes` is one complete JSON value in valid UTF-8. The parser allocates
+/// only for nesting depth, so it uses the C allocator.
+pub fn isJsonText(bytes: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(bytes)) {
+        return false;
+    }
+    return std.json.validate(std.heap.c_allocator, bytes) catch false;
 }
 
 fn isBinaryType(field: *const C.struct_st_mysql_field) bool {
@@ -98,6 +126,31 @@ test "classify keeps text columns with a text charset as text" {
     for (&fields) |*field| {
         try std.testing.expectEqual(Kind.text, classify(field, "x"));
     }
+}
+
+test "classify keeps LONGTEXT as text when the field has no extended metadata" {
+    // Without extended metadata (MySQL, or a MariaDB server that doesn't send it),
+    // a JSON-looking LONGTEXT column is ordinary text.
+    const longtext = Mysql.mysqlField("doc", 0, C.MYSQL_TYPE_BLOB);
+    try std.testing.expectEqual(Kind.text, classify(&longtext, "{\"a\": 1}"));
+}
+
+test "isJsonText accepts one complete JSON value" {
+    try std.testing.expect(isJsonText("{\"a\": [1, \"b\"]}"));
+    try std.testing.expect(isJsonText("[]"));
+    try std.testing.expect(isJsonText("\"text\""));
+    try std.testing.expect(isJsonText("-1.5e3"));
+    try std.testing.expect(isJsonText("null"));
+    try std.testing.expect(isJsonText(" {} "));
+}
+
+test "isJsonText rejects text that is not one JSON value" {
+    try std.testing.expect(!isJsonText(""));
+    try std.testing.expect(!isJsonText("{"));
+    try std.testing.expect(!isJsonText("[1,]"));
+    try std.testing.expect(!isJsonText("{} {}"));
+    try std.testing.expect(!isJsonText("plain text"));
+    try std.testing.expect(!isJsonText("\"\x80\""));
 }
 
 test "classify reports NULL for any type" {

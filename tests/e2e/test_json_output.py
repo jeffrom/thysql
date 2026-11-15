@@ -1,8 +1,8 @@
 """JSON output: --json (ndjson), --result-format=json and ndjson in -e and stdin input.
 
 Covers the value mapping for every type in the `typed` fixture, ZEROFILL and YEAR 0
-numbers, one array per result set, empty results, duplicate column names, bytes that
-are not UTF-8, and --force.
+numbers, MariaDB JSON text that isn't JSON, one array per result set, empty results,
+duplicate column names, bytes that are not UTF-8, and --force.
 The structure is checked with `jq -e`, and exact number text with plain string checks.
 """
 
@@ -15,16 +15,13 @@ from harness import ROOT_PASSWORD, ROOT_USER, TEST_DB, E2ETestCase, run_thysql
 JQ = shutil.which("jq")
 
 
-def typed_rows(server):
-    """The three rows of the `typed` fixture as JSON values, for `server`.
+def typed_rows():
+    """The three rows of the `typed` fixture as JSON values.
 
-    MySQL reports its JSON type, so the value is embedded. MariaDB stores JSON as
-    LONGTEXT and reports it as text, so the value is a JSON string there.
+    JSON columns are embedded on both servers: MySQL reports its JSON type, and
+    MariaDB sends extended metadata naming the format json for its LONGTEXT JSON.
     """
-    if server.name == "mysql":
-        doc_one, doc_three = {"a": [1, "b"]}, []
-    else:
-        doc_one, doc_three = '{"a": [1, "b"]}', "[]"
+    doc_one, doc_three = {"a": [1, "b"]}, []
     return [
         {
             "id": 1, "tiny": -7, "flag": 1, "big": 18446744073709551615,
@@ -79,10 +76,11 @@ class JsonOutputTests(E2ETestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, "")
                 self.assertEqual(len(result.stdout.splitlines()), 3)
-                self.assertJq(result.stdout, typed_rows(server), slurp=True)
+                self.assertJq(result.stdout, typed_rows(), slurp=True)
                 # jq reads numbers as doubles, so the exact text is checked too.
                 self.assertIn('"big":18446744073709551615,', result.stdout)
                 self.assertIn('"amount":"12.30"', result.stdout)
+                self.assertIn('"doc":{"a": [1, "b"]},', result.stdout)
 
     def test_json_result_format_is_one_array_per_result_set(self):
         for server in self.each_server():
@@ -188,6 +186,34 @@ class JsonOutputTests(E2ETestCase):
                     ],
                     slurp=True,
                 )
+
+    def test_mariadb_json_text_that_is_not_json_is_a_string(self):
+        # MariaDB's JSON is LONGTEXT with a CHECK constraint. With the check off for
+        # the session, text that isn't JSON can be stored, and it must not be embedded.
+        for server in self.each_server():
+            if server.name != "mariadb":
+                continue
+            with self.subTest(server=server.name):
+                setup = self.thysql(
+                    server,
+                    [],
+                    stdin=(
+                        "DROP TABLE IF EXISTS json_bad;\n"
+                        "CREATE TABLE json_bad (id INT PRIMARY KEY, doc JSON);\n"
+                        "SET SESSION check_constraint_checks = 0;\n"
+                        "INSERT INTO json_bad VALUES (1, 'not json'), (2, '{\"a\": 1');\n"
+                    ),
+                )
+                try:
+                    self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+                    result = self.thysql(server, ["--json", "-e", "select id, doc from json_bad order by id"])
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(
+                        result.stdout,
+                        '{"id":1,"doc":"not json"}\n{"id":2,"doc":"{\\"a\\": 1"}\n',
+                    )
+                finally:
+                    self.thysql(server, [], stdin="DROP TABLE IF EXISTS json_bad;\n")
 
     def test_force_keeps_writing_after_an_error_and_exits_nonzero(self):
         script = "select 1 as a; select * from no_such_table; select 2 as b"

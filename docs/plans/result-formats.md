@@ -60,7 +60,7 @@ Copied 50 rows as csv to the clipboard (1.2 KB).
 | Integer types, YEAR | JSON number, using the server's text so BIGINT UNSIGNED stays exact, with leading zeros dropped (ZEROFILL `00042` is `42`, YEAR `0000` is `0`). Only the zeros before the integer digits go; a sign and a single `0` stay. |
 | DECIMAL / NEWDECIMAL | JSON **string**, so precision survives. |
 | FLOAT, DOUBLE | JSON number, with the same leading zeros dropped (`00001.5` is `1.5`, `0.5` is unchanged). |
-| JSON columns (245) | Embedded as raw JSON, not as a quoted string. |
+| JSON columns (245) | Embedded as raw JSON, not as a quoted string. MariaDB has no JSON type: its JSON columns are LONGTEXT, and the server names their format `json` in extended metadata (the connector asks for it by default, with no option). Those are embedded too, if the text parses as JSON. Otherwise, such as after the CHECK constraint was removed, the text is a JSON string. |
 | Binary data (`charsetnr` 63: BLOB, BINARY, VARBINARY, BIT, GEOMETRY) | Standard base64 string, with padding. |
 | Dates, times, ENUM, SET, text | JSON string, escaped (`"`, `\`, control characters as `\uXXXX` or the short forms). |
 | Text that isn't valid UTF-8 | Invalid bytes become `�`. |
