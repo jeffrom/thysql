@@ -28,6 +28,8 @@ zig build
 zig build test
 ```
 
+CI (`.github/workflows/ci.yml`) runs `zig build test` on macOS and Ubuntu, and `zig build e2e` on Ubuntu.
+
 The build compiles MariaDB Connector/C from `deps/mariadb-connector-c` and links
 its static `libmysqlclient.a` into `thysql`. MySQL 8 auth plugins
 `caching_sha2_password` and `sha256_password`, plus `dialog`,
