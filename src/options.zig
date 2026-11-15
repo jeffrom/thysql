@@ -656,10 +656,7 @@ fn applyFileFlag(options: *Options, id: Id, enabled: bool) void {
         .column_names => options.column_names = enabled,
         .silent => options.silent = if (enabled) options.silent +| 1 else 0,
         .force => options.force = enabled,
-        .batch => {
-            options.batch = enabled;
-            setFormatFromFile(options, .tab, enabled);
-        },
+        .batch => options.batch = enabled,
         .table => setFormatFromFile(options, .table, enabled),
         .vertical => setFormatFromFile(options, .vertical, enabled),
         .json => setFormatFromFile(options, .ndjson, enabled),
@@ -733,10 +730,9 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         },
         .force => options.force = true,
         .delimiter => options.delimiter = try delimiterValue(value),
-        .batch => {
-            options.batch = true;
-            options.result_format = .tab;
-        },
+        // As in mysql.cc, -B only turns on batch mode, whose default is tab output.
+        // It does not pick a format, so -t or -E wins in either order.
+        .batch => options.batch = true,
         .table => options.result_format = .table,
         .vertical => options.result_format = .vertical,
         .json => options.result_format = .ndjson,
@@ -983,7 +979,7 @@ test "result format follows mysql.cc: vertical, tab in batch or with -s, else ta
     const with_t = [_][]const u8{ "thysql", "-t", "-B" };
     var forced_table = try parse(std.testing.allocator, &with_t, &env);
     defer forced_table.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.tab, forced_table.resultFormat(false, false));
+    try std.testing.expectEqual(ResultFormat.table, forced_table.resultFormat(false, false));
 
     const table_in_batch = [_][]const u8{ "thysql", "-B", "-t" };
     var table_last = try parse(std.testing.allocator, &table_in_batch, &env);
