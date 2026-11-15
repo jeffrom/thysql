@@ -592,6 +592,8 @@ fn executeQuery(context: *ReplContext, stdout: *std.Io.Writer, query: Batch.Quer
         try client.afterStatement(db, stdout, 0, db.lastErrno());
         return false;
     };
+    // The statement ran, so a new or dropped table is in the names at the next Tab press.
+    if (SqlCompletion.changesNames(query.sql, context.repl.syntax.lexer)) context.repl.names.markStale();
 
     var warnings: u32 = 0;
     while (true) {

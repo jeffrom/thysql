@@ -4,11 +4,13 @@
 //! build_completion_hash does: the list of databases, and the tables, columns and routines of
 //! the current one. The tables and routines of another database are loaded the first time
 //! completion asks for them, after `db.`, so that a server with many databases connects as fast
-//! as mysql.cc does.
+//! as mysql.cc does. A statement that creates, drops, alters or renames something marks the names
+//! stale, and the next Tab press loads them again; see `changesNames`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Mysql = @import("mysql.zig");
+const SqlLexer = @import("sql/lexer.zig");
 
 /// A table or view. Its columns are listed only when it is in the current database.
 pub const Table = struct {
@@ -40,6 +42,8 @@ pub const Names = struct {
     /// The databases whose tables and routines are listed: the current one from `load`, and each
     /// other one that `loadSchema` was asked for, whether or not its queries worked.
     loaded: std.ArrayList([:0]u8) = .empty,
+    /// True after a statement that may have changed the names, until they are loaded again.
+    stale: bool = false,
 
     pub fn init(allocator: Allocator) Names {
         return .{ .allocator = allocator };
@@ -160,6 +164,22 @@ pub const Names = struct {
         try self.loadTablesAndRoutines(db, name);
     }
 
+    /// Notes that a statement may have changed the names. Only names that came from a server are
+    /// marked, so with `-A` nothing is loaded until `rehash`.
+    pub fn markStale(self: *Names) void {
+        if (self.db != null) self.stale = true;
+    }
+
+    /// Loads the names again when a statement has marked them stale. A failed query leaves its
+    /// names out, as in `load`, and they are not retried until the next change.
+    pub fn refreshIfStale(self: *Names) Allocator.Error!void {
+        if (!self.stale) return;
+        const db = self.db orelse return;
+        _ = self.load(db) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+
     fn markLoaded(self: *Names, schema: []const u8) Allocator.Error!void {
         const owned = try self.allocator.dupeSentinel(u8, schema, 0);
         errdefer self.allocator.free(owned);
@@ -199,6 +219,7 @@ pub const Names = struct {
     pub fn load(self: *Names, db: *Mysql.DB) !u32 {
         self.clear();
         self.db = db;
+        self.stale = false;
 
         if (try db.rowsCopy(self.allocator, "SELECT DATABASE()")) |rows| {
             defer Mysql.freeRowsCopy(self.allocator, rows);
@@ -250,6 +271,25 @@ fn freeWords(allocator: Allocator, list: *std.ArrayList([:0]u8)) void {
     for (list.items) |word| allocator.free(word);
     list.deinit(allocator);
     list.* = .empty;
+}
+
+/// True when `sql` may change the names that completion lists: its first word, after comments
+/// and the opening of a version comment, is CREATE, DROP, ALTER or RENAME. Some of these, such
+/// as CREATE USER, change no names, and only cost a reload.
+pub fn changesNames(sql: []const u8, options: SqlLexer.Options) bool {
+    var lexer = SqlLexer.Lexer.init(sql, options);
+    while (lexer.next()) |token| switch (token.kind) {
+        .whitespace, .comment, .version_comment_start => continue,
+        .reserved_keyword, .keyword, .identifier => {
+            const word = sql[token.start..token.end];
+            for ([_][]const u8{ "CREATE", "DROP", "ALTER", "RENAME" }) |verb| {
+                if (std.ascii.eqlIgnoreCase(word, verb)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    };
+    return false;
 }
 
 /// True when `candidate` starts with `prefix`, ignoring ASCII case.
@@ -314,6 +354,25 @@ test "clear empties the names so they can be loaded again" {
     try std.testing.expect(names.database == null);
     try names.addTable("app", "people");
     try std.testing.expectEqual(@as(usize, 1), names.tables.items.len);
+}
+
+test "statements that create, drop, alter or rename something change the names" {
+    try std.testing.expect(changesNames("CREATE TABLE another (id INT)", .{}));
+    try std.testing.expect(changesNames("  drop view v", .{}));
+    try std.testing.expect(changesNames("-- note\nALTER TABLE t ADD c INT", .{}));
+    try std.testing.expect(changesNames("/* x */ rename table a to b", .{}));
+    try std.testing.expect(changesNames("/*!50001 CREATE VIEW v AS SELECT 1 */", .{}));
+    try std.testing.expect(!changesNames("SELECT 'CREATE'", .{}));
+    try std.testing.expect(!changesNames("INSERT INTO created VALUES (1)", .{}));
+    try std.testing.expect(!changesNames("", .{}));
+}
+
+test "only names from a server are marked stale" {
+    var names = Names.init(std.testing.allocator);
+    defer names.deinit();
+    names.markStale();
+    try std.testing.expect(!names.stale);
+    try names.refreshIfStale();
 }
 
 test "prefix matching ignores case and needs the prefix at the start" {

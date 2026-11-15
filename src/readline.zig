@@ -364,6 +364,8 @@ fn completeWord(context: ?*anyopaque, line: []const u8, cursor: usize, candidate
     const completion: *Completion = @ptrCast(@alignCast(context.?));
     _ = completion.scratch.reset(.retain_capacity);
     const scratch = completion.scratch.allocator();
+    // A statement that created or dropped something has marked the names stale since the last press.
+    try completion.names.refreshIfStale();
     if (connectionContext(completion, line, cursor)) |start| {
         try offerConnections(candidates, completion, scratch, line[start..cursor]);
         return start;
