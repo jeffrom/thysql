@@ -194,3 +194,28 @@ git push origin main                # you run this
 - **Intel runner availability.** If `macos-15-intel` goes away, drop
   `darwin-x86_64` and the cask's `arch` stanza becomes arm-only
   (`depends_on arch: :arm64`).
+
+## Status (2026-11-14)
+
+Steps 1–8 are done locally; nothing is pushed. The next actions are in
+`docs/releasing.md` ("Before the first release").
+
+Deviations from the plan above:
+
+- Cask: current Homebrew rejects `postflight do system_command`; the cask uses
+  `postflight_steps do run "/usr/bin/xattr" ... end`. `depends_on macos: :sonoma`
+  replaces `">= :sonoma"`. `zap` also removes `~/.local/state/thysql` (history).
+- `tools/update_cask.sh` runs `brew style`, not `brew audit` (audit needs an
+  installed tap). It also refuses a dirty tree.
+- `tools/release.sh` tags `HEAD` without a commit when `build.zig.zon` already has
+  the version (the case for 0.1.0).
+- The release workflow has no separate smoke-test step; `tools/package.sh` runs
+  `--version` and `bash -n` on the completion script.
+- `Casks/thysql.rb` holds a locally built arm64 sha and an all-zero intel sha until
+  the first `tools/update_cask.sh` run.
+
+Verified locally: static darwin arm64 tarball (linkage, ad-hoc signature,
+`--version`), cask install/uninstall from a throwaway local tap, linux arm64
+build + package on ubuntu:22.04 and the tarball running on bare 22.04 and 24.04,
+actionlint on both workflows, the release scripts in a throwaway clone. Not yet
+verified: anything on GitHub runners, darwin x86_64, linux x86_64.
