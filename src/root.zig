@@ -526,6 +526,7 @@ fn runClientCommand(
         .notee => try client.cmdNotee(out),
         .warnings => try client.cmdWarnings(out, true),
         .nowarnings => try client.cmdWarnings(out, false),
+        .yank => try client.cmdYank(out, command.arg),
     }
     return true;
 }
@@ -638,7 +639,9 @@ fn executeQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.Io.W
         const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(context.io, .awake)).raw.nanoseconds;
         switch (exec_result) {
             .result => |result| {
-                defer Mysql.freeResult(result);
+                // `yank` keeps the last result set, so only the others are freed here.
+                const kept = client.keepResult(result);
+                defer if (!kept) Mysql.freeResult(result);
                 warnings = db.warningCount();
                 try renderResult(client, result, format, render_options, stderr, elapsed_ns, warnings);
             },
@@ -1262,6 +1265,7 @@ pub fn runREPL(
 
     // The pager and the tee file are for interactive use only, as in mysql.cc.
     try client.configurePager(options.pager, env.get("PAGER"));
+    client.configureClipboard(&options, env);
     if (options.tee) |path| {
         try client.cmdTee(stdout, path);
     }

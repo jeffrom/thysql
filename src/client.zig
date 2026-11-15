@@ -1,13 +1,16 @@
 //! Client state shared by the REPL and batch input: the pager, the tee file,
 //! and the warnings switch. Output goes through `Mirror`, which copies it to
 //! the tee file, and through `ResultSink`, which sends result sets to the pager.
-//! The commands that change this state live here too, with `status`.
+//! The commands that change this state live here too, with `status`, and `yank`
+//! copies the last result set kept for it.
 
 const Client = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Mysql = @import("mysql.zig");
+const Options = @import("options.zig");
+const Clipboard = @import("clipboard.zig");
 
 const tee_buffer_len = 4096;
 
@@ -26,10 +29,27 @@ default_pager: ?[]u8 = null,
 outfile: ?[]u8 = null,
 /// The open tee file. Everything written through a `Mirror` is also written here.
 tee: ?Tee = null,
+/// The format `yank` uses with no argument, from --clipboard-format.
+clipboard_format: Options.ResultFormat = .tab,
+/// Largest result set that `yank` keeps, from --clipboard-max-bytes. 0 keeps none.
+clipboard_max_bytes: u64 = 64 * 1024 * 1024,
+/// The backend settings `yank` copies with.
+clipboard: Clipboard.Config = .{},
+/// The last result set of the REPL, kept for `yank`. Owned until the next result set or `deinit`.
+last_result: ?Kept = null,
+/// True when the last result set was over clipboard-max-bytes, so it was not kept.
+last_too_large: bool = false,
 
 const Tee = struct {
     file: std.Io.File,
     writer: std.Io.File.Writer,
+};
+
+const Kept = struct {
+    result: Mysql.Result,
+    rows: u64,
+    /// The field bytes of every row, as counted by `Mysql.countFieldBytes`.
+    bytes: u64,
 };
 
 pub fn init(allocator: Allocator, io: std.Io, stdout: *std.Io.Writer, batch: bool) Client {
@@ -37,6 +57,7 @@ pub fn init(allocator: Allocator, io: std.Io, stdout: *std.Io.Writer, batch: boo
 }
 
 pub fn deinit(self: *Client) void {
+    self.dropLastResult();
     self.closeTee();
     if (self.pager) |text| self.allocator.free(text);
     if (self.default_pager) |text| self.allocator.free(text);
@@ -159,6 +180,104 @@ pub fn cmdPager(self: *Client, out: *std.Io.Writer, arg: []const u8) !void {
 pub fn cmdNopager(self: *Client, out: *std.Io.Writer) !void {
     try self.replaceOwned(&self.pager, null);
     try out.print("PAGER set to stdout\n", .{});
+}
+
+/// Sets the `yank` settings from the options. `env` is read for the clipboard backend.
+pub fn configureClipboard(self: *Client, options: *const Options.Options, env: *const std.process.Environ.Map) void {
+    self.clipboard_format = options.clipboard_format;
+    self.clipboard_max_bytes = options.clipboard_max_bytes;
+    self.clipboard = .{
+        .command = options.clipboard_command,
+        .osc52_max_bytes = options.osc52_max_bytes,
+        .env = env,
+    };
+}
+
+/// Decides whether `yank` keeps a result set that is about to be rendered. The one kept before
+/// is freed, so only the last result set is kept. Returns true when the client now owns `result`,
+/// so the caller must not free it. A result over clipboard-max-bytes is not kept.
+pub fn keepResult(self: *Client, result: Mysql.Result) bool {
+    self.dropLastResult();
+    if (self.clipboard_max_bytes == 0) {
+        return false;
+    }
+    const bytes = Mysql.countFieldBytes(result);
+    if (bytes > self.clipboard_max_bytes) {
+        self.last_too_large = true;
+        return false;
+    }
+    self.last_result = .{ .result = result, .rows = Mysql.resultRows(result), .bytes = bytes };
+    return true;
+}
+
+fn dropLastResult(self: *Client) void {
+    self.last_too_large = false;
+    if (self.last_result) |kept| {
+        Mysql.freeResult(kept.result);
+        self.last_result = null;
+    }
+}
+
+/// `yank [format]`: copies the last result set to the clipboard, in `arg` or the clipboard format.
+/// Batch input has no clipboard, as it has no pager or tee file.
+pub fn cmdYank(self: *Client, out: *std.Io.Writer, arg: []const u8) !void {
+    if (self.batch) {
+        return;
+    }
+    if (self.clipboard_max_bytes == 0) {
+        try out.print("Clipboard copy is off, because clipboard-max-bytes is 0.\n", .{});
+        return;
+    }
+    var format = self.clipboard_format;
+    if (arg.len > 0) {
+        format = std.meta.stringToEnum(Options.ResultFormat, arg) orelse {
+            try out.print("Invalid result format '{s}'. Expected table, tab, vertical, json, ndjson, or csv.\n", .{arg});
+            return;
+        };
+    }
+    const kept = self.last_result orelse {
+        if (self.last_too_large) {
+            try out.print("The last result set is over clipboard-max-bytes, so it was not kept.\n", .{});
+        } else {
+            try out.print("No result set to copy.\n", .{});
+        }
+        return;
+    };
+
+    var text: std.Io.Writer.Allocating = .init(self.allocator);
+    defer text.deinit();
+    Mysql.rewindResult(kept.result);
+    try Mysql.renderResultAs(&text.writer, kept.result, format, .{
+        .allocator = self.allocator,
+        .raw = true,
+        .pretty = format == .json,
+    });
+    const bytes = text.written();
+
+    switch (try Clipboard.copy(self.io, self.clipboard, self.stdout, bytes)) {
+        .copied => {
+            try out.print("Copied {d} rows as {s} to the clipboard (", .{ kept.rows, @tagName(format) });
+            try writeSize(out, bytes.len);
+            try out.print(").\n", .{});
+        },
+        .too_large => try out.print(
+            "Not copied: {d} bytes is more than osc52-max-bytes ({d}). Set clipboard-command to copy it.\n",
+            .{ bytes.len, self.clipboard.osc52_max_bytes },
+        ),
+        .failed => |backend| try out.print("Copy with {s} failed.\n", .{backend.name()}),
+    }
+}
+
+/// Writes a size for the copy message: bytes below 1 KB, else KB or MB to one decimal place.
+fn writeSize(out: *std.Io.Writer, bytes: usize) !void {
+    const kib = 1024;
+    if (bytes < kib) {
+        try out.print("{d} bytes", .{bytes});
+    } else if (bytes < kib * kib) {
+        try out.print("{d:.1} KB", .{@as(f64, @floatFromInt(bytes)) / kib});
+    } else {
+        try out.print("{d:.1} MB", .{@as(f64, @floatFromInt(bytes)) / (kib * kib)});
+    }
 }
 
 /// `warnings` and `nowarning`: turn the warnings shown after each statement on or off.
@@ -430,6 +549,17 @@ test "stat line splits into label, uptime, and the rest" {
     try std.testing.expectEqualStrings("Threads: 2  Questions: 10  Slow queries: 0", parsed.rest);
 
     try std.testing.expect(parseStat("no numbers here") == null);
+}
+
+test "copy size is in bytes, KB or MB" {
+    var buffer: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    try writeSize(&out, 512);
+    try out.writeAll(", ");
+    try writeSize(&out, 1229);
+    try out.writeAll(", ");
+    try writeSize(&out, 3 * 1024 * 1024 / 2);
+    try std.testing.expectEqualStrings("512 bytes, 1.2 KB, 1.5 MB", out.buffered());
 }
 
 test "print frames the statement and always ends with a newline" {
