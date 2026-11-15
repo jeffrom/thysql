@@ -159,7 +159,9 @@ class AuthCommandTests(E2ETestCase):
         killed = self.write_script("killed.sh", "kill -15 $$\n")
         for server in self.each_server():
             with self.subTest(server=server.name):
-                result = self.invoke(server.connect_args(ROOT_USER) + [f"--auth-command={killed}", "-e", "select 1", TEST_DB])
+                # exec, so the script replaces /bin/sh and the signal reaches thysql. Without it,
+                # dash (Ubuntu's /bin/sh) runs the script as a child and exits 143 instead.
+                result = self.invoke(server.connect_args(ROOT_USER) + [f"--auth-command=exec {killed}", "-e", "select 1", TEST_DB])
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("auth command killed by signal 15", result.stderr)
 
