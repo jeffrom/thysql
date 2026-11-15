@@ -393,6 +393,16 @@ test "multiline prompts and readline ignore markers have zero display width" {
     try std.testing.expectEqual(@as(usize, 4), result.cursor_col);
 }
 
+test "a coloured connection tag keeps the cursor column" {
+    // The tag "[main/ro]" and " app> " are 15 columns; the colour codes add none.
+    var result = try layout(std.testing.allocator, "\x1b[31m[main/ro]\x1b[0m app> ", "", 0, 80);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("\x1b[31m[main/ro]\x1b[0m app> ", result.row(0));
+    try std.testing.expectEqual(@as(usize, 0), result.cursor_row);
+    try std.testing.expectEqual(@as(usize, 15), result.cursor_col);
+}
+
 test "kitty graphics setup is not included in repaintable rows" {
     var result = try layout(
         std.testing.allocator,
