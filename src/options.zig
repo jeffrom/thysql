@@ -20,6 +20,7 @@ pub const Error = error{
     InvalidConnectTimeout,
     InvalidBoolValue,
     InvalidResultFormat,
+    InvalidSize,
     DefaultsOptionMisplaced,
     OutOfMemory,
 };
@@ -80,6 +81,10 @@ pub const Id = enum {
     json,
     csv,
     result_format,
+    clipboard_command,
+    clipboard_format,
+    clipboard_max_bytes,
+    osc52_max_bytes,
     raw,
     silent,
     skip_column_names,
@@ -150,6 +155,10 @@ pub const specs = [_]Spec{
     .{ .id = .column_names, .long = "column-names", .group = .output, .help = "Write column names in results. This is the default." },
     .{ .id = .silent, .long = "silent", .short = 's', .group = .output, .help = "Tab-separated results. Give -s twice to also omit column names." },
     .{ .id = .raw, .long = "raw", .short = 'r', .group = .output, .help = "Write tab-separated fields without escaping." },
+    .{ .id = .clipboard_command, .long = "clipboard-command", .arg = .required, .arg_name = "command", .group = .output, .help = "Shell command that copies the text it reads from stdin, for \\y. Defaults to the system clipboard." },
+    .{ .id = .clipboard_format, .long = "clipboard-format", .arg = .required, .arg_name = "format", .group = .output, .help = "Format \\y uses when none is given. Defaults to tab." },
+    .{ .id = .clipboard_max_bytes, .long = "clipboard-max-bytes", .arg = .required, .arg_name = "size", .group = .output, .help = "Largest result that \\y keeps, such as 64M. 0 turns \\y off. Defaults to 64M." },
+    .{ .id = .osc52_max_bytes, .long = "osc52-max-bytes", .arg = .required, .arg_name = "size", .group = .output, .help = "Largest copy sent with the OSC 52 escape, which terminals may cut short. Defaults to 100000." },
     .{ .id = .pager, .long = "pager", .arg = .optional, .arg_name = "command", .group = .output, .help = "Print results through this shell command. With no command, uses $PAGER. Interactive only." },
     .{ .id = .tee, .long = "tee", .arg = .required, .arg_name = "file", .group = .output, .help = "Append all output to this file. Interactive only." },
     .{ .id = .show_warnings, .long = "show-warnings", .group = .output, .help = "Show warnings after every statement." },
@@ -214,6 +223,14 @@ pub const Options = struct {
     /// The format given by -B, -t, -E, -J, --csv or --result-format. The last one wins.
     /// Null when none was given, and the format is then picked per statement.
     result_format: ?ResultFormat = null,
+    /// The shell command for \y, from --clipboard-command. Empty means the system clipboard.
+    clipboard_command: []const u8 = "",
+    /// The format \y uses when it is given no format.
+    clipboard_format: ResultFormat = .tab,
+    /// Results larger than this are not kept for \y. 0 turns \y off.
+    clipboard_max_bytes: u64 = 64 * 1024 * 1024,
+    /// The largest copy sent with OSC 52, which many terminals cut short.
+    osc52_max_bytes: u64 = 100_000,
     raw: bool = false,
     column_names: bool = true,
     /// Number of explicit -s flags.
@@ -446,6 +463,24 @@ fn protocolValue(value: ?[]const u8) Error!Protocol {
 /// A format name, exactly as the ResultFormat tag is spelled.
 fn resultFormatValue(value: ?[]const u8) Error!ResultFormat {
     return std.meta.stringToEnum(ResultFormat, try requiredValue(value)) orelse Error.InvalidResultFormat;
+}
+
+/// A byte count with an optional K, M or G suffix, for powers of 1024. The suffix may be lower case.
+fn parseSize(text: []const u8) Error!u64 {
+    const last = if (text.len > 0) std.ascii.toUpper(text[text.len - 1]) else 0;
+    const multiplier: u64 = switch (last) {
+        'K' => 1 << 10,
+        'M' => 1 << 20,
+        'G' => 1 << 30,
+        else => 1,
+    };
+    const digits = if (multiplier == 1) text else text[0 .. text.len - 1];
+    const count = std.fmt.parseUnsigned(u64, digits, 10) catch return Error.InvalidSize;
+    return std.math.mul(u64, count, multiplier) catch Error.InvalidSize;
+}
+
+fn sizeValue(value: ?[]const u8) Error!u64 {
+    return parseSize(try requiredValue(value));
 }
 
 /// As in mysql.cc, the value is a count of seconds. 0 means the library default.
@@ -707,6 +742,10 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         .json => options.result_format = .ndjson,
         .csv => options.result_format = .csv,
         .result_format => options.result_format = try resultFormatValue(value),
+        .clipboard_command => options.clipboard_command = try requiredValue(value),
+        .clipboard_format => options.clipboard_format = try resultFormatValue(value),
+        .clipboard_max_bytes => options.clipboard_max_bytes = try sizeValue(value),
+        .osc52_max_bytes => options.osc52_max_bytes = try sizeValue(value),
         .raw => options.raw = true,
         .silent => options.silent +|= 1,
         .skip_column_names => options.column_names = false,
@@ -738,6 +777,7 @@ pub fn renderError(out: *std.Io.Writer, err: Error) !void {
         Error.InvalidConnectTimeout => "Invalid connect timeout. Expected a base-10 unsigned integer of seconds.",
         Error.InvalidBoolValue => "Invalid value for a boolean option. Use 1, 0, on, or off.",
         Error.InvalidResultFormat => "Invalid result format. Expected table, tab, vertical, json, ndjson, or csv.",
+        Error.InvalidSize => "Invalid size. Expected a byte count with an optional K, M, or G suffix.",
         Error.DefaultsOptionMisplaced => "--no-defaults, --defaults-file, --defaults-extra-file, and --print-defaults must be the first arguments, each at most once.",
         Error.OutOfMemory => "Out of memory.",
     };
@@ -1050,6 +1090,61 @@ test "option-file format keys set the format, and off clears only the format in 
     try std.testing.expectError(Error.InvalidResultFormat, parseWithSettings(std.testing.allocator, &args, 1, &env, &bad_format));
 }
 
+test "byte sizes take a plain count or a K, M or G suffix, and reject anything else" {
+    try std.testing.expectEqual(@as(u64, 0), try parseSize("0"));
+    try std.testing.expectEqual(@as(u64, 4096), try parseSize("4096"));
+    try std.testing.expectEqual(@as(u64, 2048), try parseSize("2K"));
+    try std.testing.expectEqual(@as(u64, 3 << 20), try parseSize("3m"));
+    try std.testing.expectEqual(@as(u64, 1 << 30), try parseSize("1G"));
+
+    const bad = [_][]const u8{ "", "K", "1T", "-1", "1.5M", "1MB", "99999999999G" };
+    for (bad) |text| {
+        try std.testing.expectError(Error.InvalidSize, parseSize(text));
+    }
+}
+
+test "clipboard and OSC 52 options have defaults and take sizes and formats" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const plain = [_][]const u8{"thysql"};
+    var defaults = try parse(std.testing.allocator, &plain, &env);
+    defer defaults.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", defaults.clipboard_command);
+    try std.testing.expectEqual(ResultFormat.tab, defaults.clipboard_format);
+    try std.testing.expectEqual(@as(u64, 64 * 1024 * 1024), defaults.clipboard_max_bytes);
+    try std.testing.expectEqual(@as(u64, 100_000), defaults.osc52_max_bytes);
+
+    const flags = [_][]const u8{
+        "thysql",
+        "--clipboard-command=pbcopy",
+        "--clipboard-format",
+        "csv",
+        "--clipboard-max-bytes=512K",
+        "--osc52-max-bytes=1g",
+    };
+    var set = try parse(std.testing.allocator, &flags, &env);
+    defer set.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("pbcopy", set.clipboard_command);
+    try std.testing.expectEqual(ResultFormat.csv, set.clipboard_format);
+    try std.testing.expectEqual(@as(u64, 512 * 1024), set.clipboard_max_bytes);
+    try std.testing.expectEqual(@as(u64, 1 << 30), set.osc52_max_bytes);
+
+    const file = [_]OptionFile.Setting{
+        .{ .name = "clipboard-max-bytes", .value = "0" },
+        .{ .name = "clipboard-format", .value = "json" },
+    };
+    var from_file = try parseWithSettings(std.testing.allocator, &plain, 1, &env, &file);
+    defer from_file.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 0), from_file.clipboard_max_bytes);
+    try std.testing.expectEqual(ResultFormat.json, from_file.clipboard_format);
+
+    const bad_size = [_][]const u8{ "thysql", "--osc52-max-bytes=lots" };
+    try std.testing.expectError(Error.InvalidSize, parse(std.testing.allocator, &bad_size, &env));
+    const bad_format = [_][]const u8{ "thysql", "--clipboard-format=xml" };
+    try std.testing.expectError(Error.InvalidResultFormat, parse(std.testing.allocator, &bad_format, &env));
+}
+
 test "column names hide only in tab output with -ss or -N" {
     var env = testEnv();
     defer env.deinit();
@@ -1114,6 +1209,7 @@ test "usage lists every option in its group" {
     try std.testing.expect(std.mem.indexOf(u8, text, "  -J, --json") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --csv") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --result-format=format") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --clipboard-command=command") != null);
 }
 
 test "usage describes the complete, keychain, and completion subcommands" {
