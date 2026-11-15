@@ -1297,7 +1297,9 @@ pub fn runREPL(
         .use_color = use_color,
     };
 
-    const readline = try Readline.Session.setup(allocator, io, env, out, &names, &syntax);
+    // The line editor draws on stdout directly, not through the tee Mirror: its redraws are terminal
+    // control, and `Client.echoInput` already copies each prompt and line to the tee file in plain text.
+    const readline = try Readline.Session.setup(allocator, io, env, stdout, &names, &syntax);
     defer readline.deinit();
     // Names load before the banner, as mysql.cc does at connect.
     try loadNames(&repl, &db, out, true);

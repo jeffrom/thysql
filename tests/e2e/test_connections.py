@@ -271,7 +271,7 @@ class ConnectionTests(E2ETestCase):
 
                 with open(path, encoding="utf-8") as handle:
                     contents = handle.read()
-                # The copied prompt and typed line are plain. The file as a whole is not free of
-                # escapes: the line editor's redraws are mirrored into it, with their colour codes.
+                # The line editor's redraws stay out of the file, so it has no escape codes at all.
                 self.assertIn(f"[local] {TEST_DB}> select 7 as seven;\n", contents)
+                self.assertNotIn("\x1b", contents)
                 self.assertRegex(contents, r"\|\s*7\s*\|")
