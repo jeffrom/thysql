@@ -206,3 +206,72 @@ class ConnectionTests(E2ETestCase):
                 session.expect("[]> ")
                 session.send("\x04")
                 self.assertEqual(session.wait_exit(), 0)
+
+    def test_builtin_prompt_shows_the_bracketed_connection_tag(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.write_connection("main/ro", self.local_text(server))
+                session = self.interactive(["-C", "main/ro"], env=password_env(ROOT_USER))
+                session.expect("Welcome to thysql.")
+                session.expect(f"[main/ro] {TEST_DB}> ")
+                session.send("\x04")
+                self.assertEqual(session.wait_exit(), 0)
+
+    def test_prompt_color_from_a_directory_colours_the_tag_on_a_terminal(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.write_connection("main/config", "prompt-color = red\n")
+                self.write_connection("main/ro", self.local_text(server))
+                session = self.interactive(["-C", "main/ro"], env=password_env(ROOT_USER))
+                session.expect("Welcome to thysql.")
+                session.expect(f"[main/ro] {TEST_DB}> ")
+                self.assertIn("\x1b[31m[main/ro]\x1b[0m", session.raw_text())
+                session.send("\x04")
+                self.assertEqual(session.wait_exit(), 0)
+
+    def test_no_color_turns_the_prompt_colour_off(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.write_connection("local", self.local_text(server, "prompt-color = red\n"))
+                session = self.interactive(
+                    ["-C", "local"],
+                    env={**password_env(ROOT_USER), "NO_COLOR": "1"},
+                )
+                session.expect("Welcome to thysql.")
+                session.expect(f"[local] {TEST_DB}> ")
+                self.assertNotIn("\x1b[31m", session.raw_text())
+                session.send("\x04")
+                self.assertEqual(session.wait_exit(), 0)
+
+    def test_invalid_prompt_color_names_the_file_and_line(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.write_connection(
+                    "local",
+                    f"host = 127.0.0.1\nprompt-color = purple\nport = {server.port}\nuser = {ROOT_USER}\n",
+                )
+                result = self.invoke(["-C", "local"])
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('~/.config/thysql/connections/local:2: unknown prompt-color "purple"', result.stderr)
+
+    def test_tee_file_has_the_prompt_without_colour_codes(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.write_connection("local", self.local_text(server, "prompt-color = red\n"))
+                path = os.path.join(self.home, f"tee-{server.name}.txt")
+                session = self.interactive(["-C", "local", f"--tee={path}"], env=password_env(ROOT_USER))
+                session.expect("Welcome to thysql.")
+                session.expect(f"[local] {TEST_DB}> ")
+                self.assertIn("\x1b[31m", session.raw_text())
+                session.send("select 7 as seven;\r")
+                session.expect("1 row in set")
+                session.expect(f"[local] {TEST_DB}> ")
+                session.send("\x04")
+                self.assertEqual(session.wait_exit(), 0)
+
+                with open(path, encoding="utf-8") as handle:
+                    contents = handle.read()
+                # The copied prompt and typed line are plain. The file as a whole is not free of
+                # escapes: the line editor's redraws are mirrored into it, with their colour codes.
+                self.assertIn(f"[local] {TEST_DB}> select 7 as seven;\n", contents)
+                self.assertRegex(contents, r"\|\s*7\s*\|")

@@ -225,3 +225,18 @@ class SwitchConnectionTests(E2ETestCase):
         failed = run_thysql(["-C", "my"], stdin="\\C nope\n", env={"HOME": self.home})
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn('no connection named "nope"', failed.stdout + failed.stderr)
+
+    def test_builtin_prompt_tag_follows_the_switch(self):
+        # No --prompt, so the built-in [name] database prompt is in use.
+        session = self.interactive(["-C", "my"], env={})
+        session.expect("Welcome to thysql.")
+        session.expect(f"[my] {TEST_DB}> ")
+
+        self.switch(session, "main/ro", f"[main/ro] {TEST_DB}> ")
+        self.assertIn("MariaDB", self.statement(session, "select version() as v;", f"[main/ro] {TEST_DB}> "))
+
+        # A failed switch keeps the tag it had.
+        session.send("\\C nope" + ENTER)
+        session.expect('no connection named "nope"')
+        session.expect(f"[main/ro] {TEST_DB}> ")
+        self.finish(session)
