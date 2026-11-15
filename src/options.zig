@@ -566,10 +566,39 @@ pub fn boolValue(value: ?[]const u8) Error!bool {
     return Error.InvalidBoolValue;
 }
 
-/// Sets one TLS path option. Like the mysql.cc --ssl-ca family, it also enables TLS.
-fn setTlsPath(options: *Options, field: *[]const u8, value: ?[]const u8) Error!void {
-    field.* = try requiredValue(value);
-    options.tls.enabled = true;
+/// Sets the port and selects TCP, as --port does. A field in `locked` is left as it is.
+pub fn setPort(options: *Options, port: u32, locked: ConnectFieldSet) void {
+    if (!locked.contains(.port)) options.port = port;
+    if (!locked.contains(.protocol)) options.protocol = .tcp;
+}
+
+/// Sets the socket path and selects the socket protocol, as --socket does. A field in `locked` is left as it is.
+pub fn setSocket(options: *Options, path: []const u8, locked: ConnectFieldSet) void {
+    if (!locked.contains(.socket)) options.socket = path;
+    if (!locked.contains(.protocol)) options.protocol = .socket;
+}
+
+/// Sets the protocol, as --protocol does. A field in `locked` is left as it is.
+pub fn setProtocol(options: *Options, protocol: Protocol, locked: ConnectFieldSet) void {
+    if (!locked.contains(.protocol)) options.protocol = protocol;
+}
+
+/// Sets one TLS path, as the mysql.cc --ssl-ca family does, and turns TLS on. `field` names the
+/// path, so a locked path is left as it is.
+pub fn setTlsPath(options: *Options, field: ConnectField, value: []const u8, locked: ConnectFieldSet) void {
+    const path: *[]const u8 = switch (field) {
+        .ssl_ca => &options.tls.ca,
+        .ssl_capath => &options.tls.capath,
+        .ssl_cert => &options.tls.cert,
+        .ssl_key => &options.tls.key,
+        .ssl_cipher => &options.tls.cipher,
+        .ssl_crl => &options.tls.crl,
+        .ssl_crlpath => &options.tls.crlpath,
+        .tls_version => &options.tls.tls_version,
+        else => unreachable,
+    };
+    if (!locked.contains(field)) path.* = value;
+    if (!locked.contains(.ssl)) options.tls.enabled = true;
 }
 
 /// The value of the last -C/--connection in args[first..], or null when there is none. It
@@ -744,15 +773,9 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         .host => options.host = try requiredValue(value),
         .database => options.database = try requiredValue(value),
         .user => options.user = try requiredValue(value),
-        .port => {
-            options.port = try parsePort(try requiredValue(value));
-            options.protocol = .tcp;
-        },
-        .socket => {
-            options.socket = try requiredValue(value);
-            options.protocol = .socket;
-        },
-        .protocol => options.protocol = try protocolValue(value),
+        .port => setPort(options, try parsePort(try requiredValue(value)), .{}),
+        .socket => setSocket(options, try requiredValue(value), .{}),
+        .protocol => setProtocol(options, try protocolValue(value), .{}),
         .connect_timeout => options.connect_timeout = try connectTimeoutValue(value),
         // -C is found by connectionArg before parsing, and the resolved name is set by the caller.
         .connection => {},
@@ -765,14 +788,14 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         },
         .ssl => options.tls.enabled = try boolValue(value),
         .skip_ssl => options.tls.enabled = false,
-        .ssl_ca => try setTlsPath(options, &options.tls.ca, value),
-        .ssl_capath => try setTlsPath(options, &options.tls.capath, value),
-        .ssl_cert => try setTlsPath(options, &options.tls.cert, value),
-        .ssl_key => try setTlsPath(options, &options.tls.key, value),
-        .ssl_cipher => try setTlsPath(options, &options.tls.cipher, value),
-        .ssl_crl => try setTlsPath(options, &options.tls.crl, value),
-        .ssl_crlpath => try setTlsPath(options, &options.tls.crlpath, value),
-        .tls_version => try setTlsPath(options, &options.tls.tls_version, value),
+        .ssl_ca => setTlsPath(options, .ssl_ca, try requiredValue(value), .{}),
+        .ssl_capath => setTlsPath(options, .ssl_capath, try requiredValue(value), .{}),
+        .ssl_cert => setTlsPath(options, .ssl_cert, try requiredValue(value), .{}),
+        .ssl_key => setTlsPath(options, .ssl_key, try requiredValue(value), .{}),
+        .ssl_cipher => setTlsPath(options, .ssl_cipher, try requiredValue(value), .{}),
+        .ssl_crl => setTlsPath(options, .ssl_crl, try requiredValue(value), .{}),
+        .ssl_crlpath => setTlsPath(options, .ssl_crlpath, try requiredValue(value), .{}),
+        .tls_version => setTlsPath(options, .tls_version, try requiredValue(value), .{}),
         .ssl_verify_server_cert => options.tls.verify_server_cert = try boolValue(value),
         .skip_ssl_verify_server_cert => options.tls.verify_server_cert = false,
         .password => {
