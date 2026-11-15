@@ -494,6 +494,7 @@ class Interactive:
     def __init__(self, args, *, home, env=None, timeout=20):
         self.timeout = timeout
         self.buffer = ""
+        self.raw = b""  # every byte read so far, escape sequences included
         self.exited = False  # EOF seen on the pty master
         self.exitcode = None  # set once the child has been reaped
         full_env = base_env(home, env)
@@ -525,8 +526,13 @@ class Interactive:
         if not data:
             self.exited = True
             return False
+        self.raw += data
         self.buffer = _ANSI.sub("", (self.buffer + data.decode("utf-8", "replace")).replace("\r\n", "\n"))
         return True
+
+    def raw_text(self):
+        """Everything read so far, with escape sequences kept. Use it to check colour codes."""
+        return self.raw.decode("utf-8", "replace")
 
     def expect(self, pattern, timeout=None):
         """Waits for `pattern` (a literal string or a compiled regex). Returns the consumed text."""

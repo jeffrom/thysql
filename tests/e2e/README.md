@@ -54,7 +54,8 @@ with SIGKILL, the same filter finds any leftovers.
   `send(text)` writes input. `expect(pattern, timeout=...)` waits for a
   literal string or a compiled regex and returns the text up to and including
   the match. ANSI escapes are stripped and CRLF is normalized first.
-  `wait_exit()` returns the exit code.
+  `wait_exit()` returns the exit code. `raw_text()` returns everything read so
+  far with the escape sequences kept, for checks on colour codes.
   Keys matter on a pty. Send `"\r"` to submit a line, as a real Enter does.
   Send `"\x04"` (Ctrl-D) only after `expect` has seen the prompt, because the tty may still
   be in cooked mode before that.
