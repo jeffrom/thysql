@@ -188,6 +188,64 @@ fn writePort(out: *std.Io.Writer, info: Info) !void {
     try out.writeAll(if (slash) |index| info.socket[index + 1 ..] else info.socket);
 }
 
+/// The connection facts that the built-in prompt shows. `connection` is the -C or `\C` name,
+/// empty when there is none.
+pub const ConnectionFacts = struct {
+    connection: []const u8 = "",
+    user: []const u8 = "",
+    host: []const u8 = "",
+    port: u32 = 0,
+    database: []const u8 = "",
+};
+
+/// A colour for the connection tag, as SGR foreground codes.
+pub const Color = enum {
+    black,
+    red,
+    green,
+    yellow,
+    blue,
+    magenta,
+    cyan,
+    white,
+    bright_black,
+    bright_red,
+    bright_green,
+    bright_yellow,
+    bright_blue,
+    bright_magenta,
+    bright_cyan,
+    bright_white,
+
+    /// The SGR parameter that selects this colour as the foreground.
+    pub fn code(self: Color) u8 {
+        const index: u8 = @intFromEnum(self);
+        return if (index < 8) 30 + index else 90 + index - 8;
+    }
+};
+
+/// The built-in prompt. With a -C or `\C` connection it is `[name] database> `, where the
+/// brackets set the name off as a tag. Otherwise it is `user@host:port/database> `. With a
+/// `color` and `use_color`, the tag is drawn in that colour, brackets included.
+pub fn builtinPrompt(allocator: Allocator, facts: ConnectionFacts, color: ?Color, use_color: bool) ![:0]u8 {
+    const db_name = if (facts.database.len == 0) "(none)" else facts.database;
+    if (facts.connection.len == 0) {
+        if (facts.user.len == 0) {
+            return try std.fmt.allocPrintSentinel(allocator, "{s}:{}/{s}> ", .{ facts.host, facts.port, db_name }, 0);
+        }
+        return try std.fmt.allocPrintSentinel(allocator, "{s}@{s}:{}/{s}> ", .{ facts.user, facts.host, facts.port, db_name }, 0);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const paint: ?Color = if (use_color) color else null;
+    if (paint) |chosen| try out.writer.print("\x1b[{d}m", .{chosen.code()});
+    try out.writer.print("[{s}]", .{facts.connection});
+    if (paint != null) try out.writer.writeAll("\x1b[0m");
+    try out.writer.print(" {s}> ", .{db_name});
+    return out.toOwnedSliceSentinel(0);
+}
+
 /// The prompt in use. `format` is the one set by --prompt or `prompt`, and
 /// `default_format` is MYSQL_PS1. Both are owned copies. With neither, the REPL
 /// draws its built-in connection prompt.
@@ -345,4 +403,36 @@ test "state: set restarts the counter" {
     state.counter = 7;
     try state.set("x\\c> ");
     try std.testing.expectEqual(@as(u32, 0), state.counter);
+}
+
+fn expectBuiltin(facts: ConnectionFacts, color: ?Color, use_color: bool, expected: []const u8) !void {
+    const prompt = try builtinPrompt(std.testing.allocator, facts, color, use_color);
+    defer std.testing.allocator.free(prompt);
+    try std.testing.expectEqualStrings(expected, prompt);
+}
+
+test "builtin prompt: user, host, port and database without a connection" {
+    try expectBuiltin(.{ .user = "root", .host = "db.example", .port = 3307, .database = "app" }, null, false, "root@db.example:3307/app> ");
+    try expectBuiltin(.{ .host = "localhost", .port = 3306 }, null, false, "localhost:3306/(none)> ");
+}
+
+test "builtin prompt: a -C connection is a bracketed tag, then the database" {
+    try expectBuiltin(.{ .connection = "local", .user = "root", .host = "db.example", .port = 3307, .database = "app" }, null, false, "[local] app> ");
+    try expectBuiltin(.{ .connection = "main/ro", .database = "app" }, null, false, "[main/ro] app> ");
+    try expectBuiltin(.{ .connection = "main/ro" }, null, false, "[main/ro] (none)> ");
+}
+
+test "builtin prompt: a colour wraps only the tag, and only with use_color" {
+    const facts: ConnectionFacts = .{ .connection = "main/ro", .database = "app" };
+    try expectBuiltin(facts, .red, true, "\x1b[31m[main/ro]\x1b[0m app> ");
+    try expectBuiltin(facts, .bright_cyan, true, "\x1b[96m[main/ro]\x1b[0m app> ");
+    try expectBuiltin(facts, .red, false, "[main/ro] app> ");
+    try expectBuiltin(.{ .user = "root", .host = "db.example", .port = 3307, .database = "app" }, .red, true, "root@db.example:3307/app> ");
+}
+
+test "builtin prompt: colour codes are the 8 ANSI foregrounds and their bright forms" {
+    try std.testing.expectEqual(@as(u8, 30), Color.black.code());
+    try std.testing.expectEqual(@as(u8, 37), Color.white.code());
+    try std.testing.expectEqual(@as(u8, 90), Color.bright_black.code());
+    try std.testing.expectEqual(@as(u8, 97), Color.bright_white.code());
 }
