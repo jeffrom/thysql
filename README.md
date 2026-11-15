@@ -349,6 +349,8 @@ at the start of a statement, such as `\P less` on its own line.
 - `prompt [fmt]`, `\R [fmt]`: sets the prompt. With no argument it returns to the default.
   The text after the command is kept as typed, including trailing spaces.
 - `rehash`, `\#`: reloads the names used for completion.
+- `yank [format]`, `\y [format]`: copies the last result set to the clipboard. This is
+  thysql's own command, not from mysql.cc. See [output formats](#output-formats).
 - Flags: `--pager[=cmd]`, `--tee=file`, `--show-warnings`. Pager and tee are
   interactive only, as in mysql.cc.
 
@@ -356,6 +358,107 @@ Not supported: server-side `help <topic>`, and backslash commands in the middle
 of a statement. In batch input, a named command such as `quit` must end with its
 delimiter, unless it is the last input. Batch input ignores `prompt`, and `rehash`
 does nothing there, as in mysql.cc.
+
+## output formats
+
+| Format | Output |
+|---|---|
+| `table` | Boxed table with a timing footer. The default in the REPL. |
+| `tab` | Tab-separated, escaped as in mysql. No footer. The default in batch mode, with `-e`, and in pipes. |
+| `vertical` | One block per row, as with `\G`. |
+| `json` | One JSON array of objects per result set. |
+| `ndjson` | One JSON object per row, one row per line. |
+| `csv` | RFC 4180 CSV, with a header line. |
+
+Pick one with `--result-format=format`. `-B`, `-t` and `-E` are shorthands for `tab`,
+`table` and `vertical`. `-J` or `--json` is `ndjson`, and `--csv` is `csv`. The last
+output flag given wins. A trailing `\G` or `\J` on a statement picks `vertical` or `ndjson`
+for that statement only. JSON and CSV are opt-in, so the defaults above do not change.
+
+Option files and connections take the same settings: `result-format = csv`, or a bare
+`json` or `csv` line.
+
+```sh
+thysql -C prod_ro --json -e 'select id, name from users limit 2'
+{"id":1,"name":"ada"}
+{"id":2,"name":"grace"}
+
+thysql --csv -e 'select id, name from users limit 2'
+id,name
+1,ada
+2,"grace, rear admiral"
+```
+
+### JSON
+
+- `ndjson` writes one compact object per row. `json` writes one array per result set,
+  compact in batch mode and pretty-printed in the REPL. Several result sets in `json`
+  mode are several top-level documents, one after another. `jq` reads them; strict
+  parsers do not.
+- An empty result is `[]` in `json` and nothing in `ndjson`.
+- Column names are the object keys. A duplicate name gets a suffix (`a`, `a_2`, `a_3`),
+  and one warning goes to stderr for each result set that has duplicates.
+
+| Column type | JSON |
+|---|---|
+| NULL | `null` |
+| Integers, YEAR | Number, from the server's text, so `BIGINT UNSIGNED` stays exact. Leading zeros are dropped: ZEROFILL `00042` is `42`. |
+| DECIMAL | String, so precision survives: `"12.30"`. |
+| FLOAT, DOUBLE | Number. |
+| JSON | Embedded as JSON. MariaDB stores JSON as LONGTEXT, so its values are embedded when the text parses as JSON. Otherwise they are strings. |
+| BLOB, BINARY, VARBINARY, BIT, GEOMETRY | Base64 string, with padding. |
+| Dates, times, ENUM, SET, text | String, escaped. Control characters become `\uXXXX` or the short forms. |
+
+Text that is not valid UTF-8 has each bad byte replaced with `�`. TINYINT(1) is a number,
+because the protocol cannot tell it from a boolean.
+
+### CSV
+
+- A field is quoted when it holds a comma, a double quote, CR or LF, or has leading or
+  trailing spaces. Quotes are doubled. Lines end in `\n`, with no BOM.
+- NULL is an empty field with no quotes. An empty string is `""`, as in PostgreSQL's
+  `COPY ... CSV`.
+- Numbers, dates and text are the server's text. DECIMAL is not quoted. Leading zeros stay,
+  so `00042` is written as it is. Binary data is base64, as in JSON, and JSON columns are
+  their text.
+- The header line is the column names. `-N` leaves it out. An empty result gives the
+  header only, or nothing with `-N`. Several result sets are separated by one blank line.
+- The delimiter is always a comma.
+
+## clipboard
+
+`\y [format]`, or `yank [format]`, copies the last result set shown in the REPL. Without a
+format it uses `clipboard-format`, which defaults to `tab` with no escaping. That format
+pastes into spreadsheet cells, where CSV would paste into one cell in Google Sheets.
+
+```
+thysql> select id, name from users limit 50;
+...
+50 rows in set (0.01 sec)
+
+thysql> \y csv
+Copied 50 rows as csv to the clipboard (1.2 KB).
+```
+
+- Only the last result set of a statement is kept. A statement that returns no result set
+  leaves it alone. A result set over `clipboard-max-bytes` is not kept, and `\y` says so.
+- `clipboard-max-bytes` defaults to `64M`. Sizes take `K`, `M` or `G` for powers of 1024, or
+  a plain byte count. `0` turns `\y` off.
+- The text goes to the first of these that works: `clipboard-command`, run by `/bin/sh -c`
+  with the text on stdin; OSC 52 over SSH, so the copy lands on your local machine; `pbcopy`
+  on macOS; `wl-copy` under Wayland, else `xclip` or `xsel` on Linux; and OSC 52 written to
+  the terminal as a last resort. tmux needs `set-clipboard on` for that last one.
+- Many terminals cut OSC 52 short. A copy over `osc52-max-bytes` (default `100000`) is refused
+  with a message, instead of pasting a truncated result. Set `clipboard-command` for larger
+  copies.
+- Batch input has no `\y`. Pipe the output instead: `thysql --csv -e '...' | pbcopy`.
+
+```sh
+# ~/.config/thysql/connections/main/ro
+clipboard-format = csv
+clipboard-command = pbcopy
+clipboard-max-bytes = 512K
+```
 
 ## prompt
 
