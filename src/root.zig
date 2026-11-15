@@ -1000,6 +1000,10 @@ const BatchContext = struct {
     stdin_is_tty: bool,
     client: *Client,
     switcher: *ConnectionSwitch,
+    /// Flush NDJSON rows as they are written. False when stdout is a regular file.
+    flush_rows: bool,
+    /// Shared by every statement in the run: CSV puts a blank line before each result set after the first.
+    csv_started: *bool,
 };
 
 /// Runs one batch statement. Results go to stdout, and errors go to stderr
@@ -1027,14 +1031,20 @@ fn executeBatchQuery(context: BatchContext, stdout: *std.Io.Writer, stderr: *std
     };
 
     const format = context.options.resultFormat(context.stdin_is_tty, query.vertical);
-    const column_names = context.options.showColumnNames(format);
+    const render_options: Mysql.RenderOptions = .{
+        .allocator = db.allocator,
+        .column_names = context.options.showColumnNames(format),
+        .raw = context.options.raw,
+        .stderr = stderr,
+        .flush_rows = context.flush_rows,
+    };
     var warnings: u32 = 0;
     while (true) {
         switch (exec_result) {
             .result => |result| {
                 defer Mysql.freeResult(result);
                 warnings = db.warningCount();
-                try Mysql.render_script_result(stdout, result, format, column_names, context.options.raw);
+                try Mysql.render_script_result(stdout, result, format, render_options, context.csv_started);
             },
             .ok => |ok| warnings = ok.warnings,
         }
@@ -1082,12 +1092,17 @@ fn runBatch(
         run_options.show_progress = stderr_is_tty;
     }
 
+    // Rows reach a pipe or terminal as they are written. A regular file gets them at the end.
+    const stdout_stat = std.Io.File.stdout().stat(io) catch null;
+    var csv_started = false;
     const context = BatchContext{
         .db = db,
         .options = options,
         .stdin_is_tty = stdin_is_tty,
         .client = client,
         .switcher = switcher,
+        .flush_rows = if (stdout_stat) |stat| stat.kind != .file else true,
+        .csv_started = &csv_started,
     };
     // `quit` ends the input with success, as in mysql.cc.
     return Batch.run(db.allocator, input, stdout, stderr, run_options, context, executeBatchQuery) catch |err| switch (err) {

@@ -737,22 +737,6 @@ pub fn render_error_at_line(out: *std.Io.Writer, errno: u32, sqlstate: ?[]const 
     try out.flush();
 }
 
-/// Renders one result for batch and -e input. As in mysql.cc, a result with no
-/// rows prints nothing, and there is no footer.
-pub fn render_script_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, format: Options.ResultFormat, column_names: bool, raw: bool) !void {
-    if (C.mysql_num_rows(result) == 0) {
-        return;
-    }
-
-    switch (format) {
-        .table => try render_result_columns(out, result, column_names),
-        .tab => try render_result_tab(out, result, column_names, raw),
-        .vertical => try render_result_vertical(out, result),
-        // Until the JSON and CSV writers are wired in, these fail instead of printing another format.
-        .json, .ndjson, .csv => return error.ResultFormatNotYetSupported,
-    }
-}
-
 /// Settings for `renderResultAs`. Each format reads only the fields it needs.
 pub const RenderOptions = struct {
     /// Allocates the JSON key names, which need room for renamed duplicate columns.
@@ -763,7 +747,35 @@ pub const RenderOptions = struct {
     raw: bool = false,
     /// Receives one warning per JSON result set that had duplicate column names. Null drops it.
     stderr: ?*std.Io.Writer = null,
+    /// NDJSON flushes after each row, so a reader on a pipe sees rows as they arrive.
+    flush_rows: bool = false,
 };
+
+/// Renders one result for batch and -e input. As in mysql.cc, table, tab and vertical
+/// print nothing for a result with no rows, and there is no footer. A CSV result with no
+/// rows and no column names writes nothing. CSV separates result sets with one blank line,
+/// so `csv_started` records whether an earlier CSV result set wrote output.
+pub fn render_script_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, format: Options.ResultFormat, options: RenderOptions, csv_started: *bool) !void {
+    const rows = C.mysql_num_rows(result);
+    switch (format) {
+        .table, .tab, .vertical => {
+            if (rows == 0) {
+                return;
+            }
+        },
+        .csv => {
+            if (rows == 0 and !options.column_names) {
+                return;
+            }
+            if (csv_started.*) {
+                try out.writeByte('\n');
+            }
+            csv_started.* = true;
+        },
+        .json, .ndjson => {},
+    }
+    try renderResultAs(out, result, format, options);
+}
 
 /// Renders one result set in any format, without a footer and without skipping empty
 /// results. `json` writes `[]` for no rows, `ndjson` writes nothing, and `csv` writes
@@ -815,6 +827,9 @@ fn renderNdjson(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, options:
         }
         try JsonOutput.writeRowObject(out, keys.names, fields, row, C.mysql_fetch_lengths(result));
         try out.writeByte('\n');
+        if (options.flush_rows) {
+            try out.flush();
+        }
     }
     try out.flush();
 }
@@ -1616,11 +1631,48 @@ fn expectRenderedScript(result: *C.struct_st_mysql_res, format: Options.ResultFo
     defer buf.deinit(gpa);
     var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
     defer buf = writer.toArrayList();
+    var csv_started = false;
 
-    try render_script_result(&writer.writer, result, format, column_names, raw);
+    try render_script_result(&writer.writer, result, format, .{ .allocator = gpa, .column_names = column_names, .raw = raw }, &csv_started);
 
     try std.testing.expectEqualStrings(expect, writer.written());
 }
+
+/// Counts the flushes made on it and keeps the bytes written, for checking when rows are flushed.
+const FlushCountingWriter = struct {
+    interface: std.Io.Writer,
+    gpa: Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+    flushes: usize = 0,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain, .flush = flush };
+
+    fn init(gpa: Allocator) FlushCountingWriter {
+        return .{ .interface = .{ .vtable = &vtable, .buffer = &.{} }, .gpa = gpa };
+    }
+
+    fn deinit(self: *FlushCountingWriter) void {
+        self.bytes.deinit(self.gpa);
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *FlushCountingWriter = @alignCast(@fieldParentPtr("interface", w));
+        var consumed: usize = 0;
+        for (data, 0..) |bytes, index| {
+            const repeat = if (index + 1 == data.len) splat else 1;
+            for (0..repeat) |_| {
+                self.bytes.appendSlice(self.gpa, bytes) catch return error.WriteFailed;
+                consumed += bytes.len;
+            }
+        }
+        return consumed;
+    }
+
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *FlushCountingWriter = @alignCast(@fieldParentPtr("interface", w));
+        self.flushes += 1;
+    }
+};
 
 test "tab output escapes values, writes NULL, and keeps names" {
     var fields = [_]C.struct_st_mysql_field{
@@ -1665,6 +1717,80 @@ test "script output prints nothing for an empty result" {
     try expectRenderedScript(&result, .table, true, false, "");
     try expectRenderedScript(&result, .tab, true, false, "");
     try expectRenderedScript(&result, .vertical, true, false, "");
+}
+
+test "script output writes json [] and csv header for an empty result, and nothing for ndjson" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("1", 0, C.MYSQL_TYPE_LONG),
+        mysqlField("two", 0, C.MYSQL_TYPE_LONG),
+    };
+    var data = mysqlData(null, 0, fields.len);
+    var lengths = [_]c_ulong{ 0, 0 };
+    var result = mysqlResult(&fields, &data, &lengths);
+
+    try expectRenderedScript(&result, .json, true, false, "[]\n");
+    try expectRenderedScript(&result, .ndjson, true, false, "");
+    try expectRenderedScript(&result, .csv, true, false, "1,two\n");
+    try expectRenderedScript(&result, .csv, false, false, "");
+}
+
+test "script csv separates result sets with one blank line and skips empty results without names" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("a", 1, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row_storage, "1");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+    var empty_data = mysqlData(null, 0, fields.len);
+    var empty_lengths = [_]c_ulong{0};
+    var empty = mysqlResult(&fields, &empty_data, &empty_lengths);
+
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+    var csv_started = false;
+    const options: RenderOptions = .{ .allocator = gpa };
+    const no_names: RenderOptions = .{ .allocator = gpa, .column_names = false };
+
+    try render_script_result(&writer.writer, &result, .csv, options, &csv_started);
+    try render_script_result(&writer.writer, &empty, .csv, no_names, &csv_started);
+    _ = C.mysql_data_seek(&result, 0);
+    try render_script_result(&writer.writer, &result, .csv, options, &csv_started);
+
+    try std.testing.expectEqualStrings("a\n1\n\na\n1\n", writer.written());
+}
+
+test "script ndjson flushes after each row only when asked" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("id", 1, C.MYSQL_TYPE_LONGLONG),
+    };
+    var row2_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row2_storage, "2");
+    var row1_storage: MysqlRowStorage1 = undefined;
+    initMysqlRowStorage1(&row1_storage, "1");
+    var row2 = mysqlRow(&row2_storage, null);
+    var row1 = mysqlRow(&row1_storage, &row2);
+    var data = mysqlData(&row1, 2, fields.len);
+    var result = mysqlResult(&fields, &data, &row1_storage.lengths);
+
+    const gpa = std.testing.allocator;
+    var quiet = FlushCountingWriter.init(gpa);
+    defer quiet.deinit();
+    var csv_started = false;
+    try render_script_result(&quiet.interface, &result, .ndjson, .{ .allocator = gpa }, &csv_started);
+    try std.testing.expectEqualStrings("{\"id\":1}\n{\"id\":2}\n", quiet.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), quiet.flushes);
+
+    _ = C.mysql_data_seek(&result, 0);
+    var flushing = FlushCountingWriter.init(gpa);
+    defer flushing.deinit();
+    try render_script_result(&flushing.interface, &result, .ndjson, .{ .allocator = gpa, .flush_rows = true }, &csv_started);
+    try std.testing.expectEqualStrings("{\"id\":1}\n{\"id\":2}\n", flushing.bytes.items);
+    try std.testing.expectEqual(@as(usize, 3), flushing.flushes);
 }
 
 test "table output without column names omits the header" {
