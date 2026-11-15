@@ -77,6 +77,37 @@ INSERT INTO people VALUES
   (3, 'bob', CONCAT('tab', CHAR(9), 'here'), CONCAT('line1', CHAR(10), 'line2'));
 CREATE TABLE blobs (id INT PRIMARY KEY, data VARBINARY(16));
 INSERT INTO blobs VALUES (1, X'00FF10');
+CREATE TABLE typed (
+  id BIGINT PRIMARY KEY,
+  tiny TINYINT,
+  flag TINYINT(1),
+  big BIGINT UNSIGNED,
+  amount DECIMAL(10,2),
+  ratio DOUBLE,
+  small FLOAT,
+  year_col YEAR,
+  day DATE,
+  moment DATETIME,
+  clock TIME,
+  color ENUM('red','green'),
+  flags SET('a','b'),
+  doc JSON,
+  bits BIT(8),
+  data VARBINARY(16),
+  shape GEOMETRY,
+  body TEXT
+);
+INSERT INTO typed VALUES
+  (1, -7, 1, 18446744073709551615, 12.30, 1.5e10, 0.25, 2026, '2026-11-14',
+   '2026-11-14 10:00:00', '10:20:30', 'green', 'a,b', '{{"a": [1, "b"]}}', b'10000001',
+   X'00FF10', ST_GeomFromText('POINT(1 2)'),
+   CONCAT('quote " backslash ', CHAR(92), ' tab', CHAR(9), 'newline', CHAR(10), 'ctl', CHAR(1))),
+  (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+   NULL, NULL, NULL, NULL),
+  (3, 0, 0, 0, 0.00, 0, 0, 1999, '1970-01-01', '1970-01-01 00:00:00', '00:00:00', 'red', '',
+   '[]', b'00000000', X'', ST_GeomFromText('POINT(0 0)'), '');
+CREATE TABLE latin_text (id INT PRIMARY KEY, s VARCHAR(20) CHARACTER SET latin1);
+INSERT INTO latin_text VALUES (1, X'636166E9');
 DROP USER IF EXISTS '{PW_USER}'@'%', '{NOPW_USER}'@'%', '{AUTH_USER}'@'%';
 CREATE USER '{PW_USER}'@'%' IDENTIFIED BY '{PW_PASSWORD}';
 CREATE USER '{NOPW_USER}'@'%';
@@ -197,6 +228,8 @@ class RunResult:
     stdout: str
     stderr: str
     returncode: int
+    # The stdout bytes as the process wrote them, for output that is not valid UTF-8.
+    stdout_bytes: bytes = b""
 
 
 _SERVERS = []
@@ -439,6 +472,7 @@ def run_thysql(args, *, stdin=b"", env=None, timeout=60):
         stdout=result.stdout.decode("utf-8", "replace"),
         stderr=result.stderr.decode("utf-8", "replace"),
         returncode=result.returncode,
+        stdout_bytes=result.stdout,
     )
 
 

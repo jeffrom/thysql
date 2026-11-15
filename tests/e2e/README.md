@@ -7,7 +7,7 @@ install.
 
 ## Running
 
-Requirements: Docker (the daemon must be running) and Python 3.
+Requirements: Docker (the daemon must be running), Python 3, and jq (the JSON tests use `jq -e`).
 
 ```sh
 zig build e2e                 # builds, installs, then runs the whole suite
@@ -49,6 +49,7 @@ with SIGKILL, the same filter finds any leftovers.
   The environment is built from scratch: only `PATH`, a temporary `HOME`,
   `LANG`, and `MYSQL_HISTFILE` are set. Anything you need, such as
   `MYSQL_PWD`, goes in `env=`. Use `None` as a value to unset a variable.
+  `stdout_bytes` holds the raw stdout, for output that is not valid UTF-8.
 - `Interactive(args, home=..., env=...)` runs the binary under a pty.
   `send(text)` writes input. `expect(pattern, timeout=...)` waits for a
   literal string or a compiled regex and returns the text up to and including
@@ -81,6 +82,10 @@ Fixtures live in the `thysql_test` database (`SEED_SQL` in `harness.py`):
 - `people(id, name, nickname, note)`: row 1 has a NULL nickname; row 2 has
   unicode text; row 3 has a tab in `nickname` and a newline in `note`.
 - `blobs(id, data)`: `data` is the bytes `00 FF 10`.
+- `typed`: one column of each type the JSON and CSV output maps (integers, DECIMAL,
+  DOUBLE, FLOAT, YEAR, DATE, DATETIME, TIME, ENUM, SET, JSON, BIT, binary, GEOMETRY,
+  TEXT). Row 1 has values, row 2 is all NULL, row 3 has zeros and empty strings.
+- `latin_text(id, s)`: `s` is latin1, so its value `caf` + `0xE9` is not valid UTF-8 on its own.
 - `thysql_pw` / `e2e-user-pw`: a user with a password, using the server's
   default auth plugin. It has SELECT on `thysql_test.*`.
 - `thysql_nopw`: a user with no password. It also has SELECT on `thysql_test.*`.
