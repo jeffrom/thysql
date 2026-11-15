@@ -241,7 +241,9 @@ Settings apply in this order, and later ones win:
 1. my.cnf files
 2. the `config` files, from the root down to the connection's own directory
 3. the connection file
-4. command-line flags
+4. the settings in an `--auth-command` JSON object, if it prints one (see
+   [JSON settings](#json-settings))
+5. command-line flags
 
 `-C` may appear anywhere on the command line, and the last one wins. `--print-defaults -C main/ro`
 prints the settings that the connection expands to. Inside the REPL, `\C name` switches to
@@ -271,13 +273,15 @@ the REPL. Nothing is cached, so short-lived tokens work.
 
 - The command runs with `/bin/sh -c`. Its stdin and stderr are the terminal's, so a helper
   can prompt or open a browser. Its stdout is captured, up to 64 KiB.
-- The first line of stdout is the password. A trailing `\r\n` or `\n` is removed. Empty
-  output is an error, and so is a nonzero exit status. The command's stderr has already
-  reached you, so thysql does not print it again.
+- The output is either a password or a JSON object. Without a JSON object, the first line
+  of stdout is the password. A trailing `\r\n` or `\n` is removed. Empty output is an error,
+  and so is a nonzero exit status. The command's stderr has already reached you, so thysql
+  does not print it again.
 - The command sees these environment variables, so one script can serve many connections:
   `THYSQL_HOST`, `THYSQL_PORT`, `THYSQL_USER`, `THYSQL_DATABASE`, `THYSQL_SOCKET`,
   `THYSQL_CONNECTION` (empty without `-C`), and `THYSQL_REASON` (`connect`, `reconnect`,
-  or `complete`).
+  or `complete`). They hold the values from flags and files, before any JSON settings are
+  applied, and they stay the same on reconnects.
 
 An example for AWS RDS IAM tokens:
 
@@ -296,6 +300,65 @@ thysql has that plugin built in and always allows it, as the MariaDB client does
 `--enable-cleartext-plugin` is needed. Because the token goes over the wire as plain text,
 set `ssl-ca` to the RDS CA bundle: with a CA, thysql verifies the server certificate. This
 example has not been tested against RDS.
+
+### JSON settings
+
+If the output, with whitespace trimmed from both ends, starts with `{`, thysql reads it as
+a JSON object of connection settings instead of a password line. The object can set the
+password as well as the other connection fields. A helper can then supply a Vault login, a
+failover host, or a client certificate:
+
+```sh
+#!/bin/sh
+# ~/bin/db-creds: print connection settings for thysql
+creds=$(vault read -format=json database/creds/readonly)
+cat <<EOF
+{
+  "host": "db-primary.internal",
+  "port": 3306,
+  "user": $(echo "$creds" | jq .data.username),
+  "password": $(echo "$creds" | jq .data.password),
+  "ssl-ca": "/etc/ssl/internal-ca.pem"
+}
+EOF
+```
+
+```ini
+# ~/.config/thysql/connections/prod
+auth-command = ~/bin/db-creds
+```
+
+The keys are the long option names. `-` and `_` are interchangeable, as they are in
+connection files:
+
+| Key | Value |
+|---|---|
+| `host`, `user`, `password`, `database`, `socket` | string |
+| `port` | number, or a string of digits |
+| `protocol` | a name that `--protocol` takes |
+| `ssl`, `ssl-verify-server-cert` | `true` or `false`. A word that `--ssl` takes, such as `"on"`, also works. |
+| `ssl-ca`, `ssl-capath`, `ssl-cert`, `ssl-key`, `ssl-cipher`, `ssl-crl`, `ssl-crlpath`, `tls-version` | string |
+
+- `null` means the key is not set. A value of any other type is an error that names the key.
+- Any `ssl-*` path or `tls-version` turns TLS on, as the flags do. `"ssl": false` turns it off.
+- No `password` key means an empty password, which suits certificate or socket-peer
+  authentication.
+- An unknown key fails the connect, with a message such as `auth command: unknown key "hostname"`.
+  Keys that start with `_` are ignored, and so are their values. A helper can use them for
+  metadata, such as `"_expires"`.
+- The settings sit between connection files and command-line flags. A flag for a field, such
+  as `-u`, wins over the JSON value. So does a host or database given to `connect`.
+- The command runs again on every connect, and its JSON is applied each time. A failover
+  helper can therefore send a reconnect to another host. After a lost connection, a database
+  chosen with `use` wins over the JSON `database`.
+- `THYSQL_*` hold the values before the JSON is applied, as described above. The prompt,
+  `\s`, and the connect messages show the values in effect, after the JSON.
+- Only the first 64 KiB of output is read. JSON cut off by that limit is an error, and
+  thysql does not fall back to using it as a password.
+
+A password line that starts with `{` but is not valid JSON, such as `{abc`, still works as a
+password. If the connect then fails, thysql says so, for example:
+`auth command output starts with "{" but is not valid JSON (<parse error>); it was used as the password`.
 
 ### keychain (macOS)
 
