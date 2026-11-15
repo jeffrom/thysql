@@ -20,6 +20,7 @@ pub const Kind = enum {
     connection,
     prompt,
     rehash,
+    yank,
 };
 
 pub const Command = struct {
@@ -53,6 +54,7 @@ const named = [_]Named{
     .{ .name = "tee", .kind = .tee, .takes_arg = true },
     .{ .name = "use", .kind = .use, .takes_arg = true },
     .{ .name = "warnings", .kind = .warnings, .takes_arg = false },
+    .{ .name = "yank", .kind = .yank, .takes_arg = true },
 };
 
 /// Backslash forms such as \s. The character must be followed by whitespace or the end.
@@ -73,6 +75,7 @@ const short = [_]Short{
     .{ .char = 'C', .kind = .connection, .takes_arg = true },
     .{ .char = 'R', .kind = .prompt, .takes_arg = true },
     .{ .char = '#', .kind = .rehash, .takes_arg = false },
+    .{ .char = 'y', .kind = .yank, .takes_arg = true },
 };
 
 const whitespace = " \t\r\n";
@@ -186,6 +189,7 @@ pub const help_items = [_]struct { name: []const u8, char: u8, doc: []const u8 }
     .{ .name = "tee", .char = 'T', .doc = "Set outfile [to_outfile]. Append everything into given outfile." },
     .{ .name = "use", .char = 'u', .doc = "Use another database. Takes database name as argument." },
     .{ .name = "warnings", .char = 'W', .doc = "Show warnings after every statement." },
+    .{ .name = "yank", .char = 'y', .doc = "Copy the last result set to the clipboard. Optional format argument." },
 };
 
 /// Prints the list for `help`, in the format of mysql.cc's com_help.
@@ -294,7 +298,7 @@ test "the connection name is where completion of \\C starts" {
 }
 
 test "help lists each command with its backslash form" {
-    var buffer: [2048]u8 = undefined;
+    var buffer: [4096]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buffer);
     try renderHelp(&out);
     const text = out.buffered();
@@ -304,4 +308,20 @@ test "help lists each command with its backslash form" {
     try std.testing.expect(std.mem.indexOf(u8, text, "connection (\\C) Switch to a saved connection. With no name, list them.\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "tee        (\\T) Set outfile [to_outfile].") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "warnings   (\\W) Show warnings after every statement.\n") != null);
+}
+
+test "yank takes an optional format in both forms" {
+    try std.testing.expect(isShortChar('y'));
+    const short_form = parse("\\y csv;").?;
+    try std.testing.expectEqual(Kind.yank, short_form.kind);
+    try std.testing.expectEqualStrings("csv", short_form.arg);
+
+    const bare = parse("\\y").?;
+    try std.testing.expectEqual(Kind.yank, bare.kind);
+    try std.testing.expectEqualStrings("", bare.arg);
+
+    const word_form = parse("YANK json").?;
+    try std.testing.expectEqual(Kind.yank, word_form.kind);
+    try std.testing.expectEqualStrings("json", word_form.arg);
+    try std.testing.expectEqual(@as(?Command, null), parse("\\yank"));
 }
