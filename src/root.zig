@@ -36,6 +36,10 @@ const Repl = struct {
     syntax: *Syntax,
     /// The name of the connection in use, from -C or `\C`, for the prompt escape. Empty when there is none.
     connection: []const u8 = "",
+    /// The colour of the connection tag in the built-in prompt, from `prompt-color`. Null for none.
+    connection_color: ?Prompt.Color = null,
+    /// Whether the built-in prompt may use colour: stdout is a terminal and NO_COLOR is unset or empty.
+    use_color: bool = false,
 };
 
 /// What `\C` needs to open another saved connection. runREPL makes one for the session. The
@@ -218,6 +222,7 @@ fn switchConnection(
     const connection_name = switcher.selection.name() orelse "";
     if (repl) |session| {
         session.connection = connection_name;
+        session.connection_color = switcher.selection.promptColor();
         try session.syntax.refresh(db);
         try out.print("Connected to \"{s}\".\n", .{connection_name});
         try renderConnectionInfo(out, db);
@@ -668,7 +673,7 @@ fn mainPrompt(context: *ReplContext, delimiter: []const u8) ![:0]u8 {
             .host = db.host,
             .port = db.port,
             .database = db.database,
-        }, null, false);
+        }, context.repl.connection_color, context.repl.use_color);
     };
 
     // USER() is a query, so it runs only when the format asks for a user.
@@ -1182,6 +1187,10 @@ pub fn runREPL(
     const stdin = std.Io.File.stdin();
     const stdin_is_tty = try stdin.isTty(io);
     const stderr_is_tty = try std.Io.File.stderr().isTty(io);
+    // The connection tag is coloured only on a terminal, and NO_COLOR, when set, turns colour off.
+    const stdout_is_tty = try std.Io.File.stdout().isTty(io);
+    const no_color = envValue(env, "NO_COLOR") orelse "";
+    const use_color = stdout_is_tty and no_color.len == 0;
 
     // -C adds the saved connection's settings after the option files, so the connection wins. The
     // switcher keeps that connection for `\C`, which replaces it.
@@ -1284,6 +1293,8 @@ pub fn runREPL(
         .silent = options.silent > 0,
         .syntax = &syntax,
         .connection = options.connection orelse "",
+        .connection_color = switcher.selection.promptColor(),
+        .use_color = use_color,
     };
 
     const readline = try Readline.Session.setup(allocator, io, env, out, &names, &syntax);
