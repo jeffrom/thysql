@@ -638,6 +638,34 @@ pub fn freeResult(result: [*c]C.struct_st_mysql_res) void {
     C.mysql_free_result(result);
 }
 
+/// A stored result set, as `DB.exec` returns it.
+pub const Result = [*c]C.struct_st_mysql_res;
+
+pub fn resultRows(result: Result) u64 {
+    return @intCast(C.mysql_num_rows(result));
+}
+
+/// Moves a stored result's row cursor back to the first row, so it can be rendered again.
+pub fn rewindResult(result: Result) void {
+    C.mysql_data_seek(result, 0);
+}
+
+/// Sums the field lengths of every row, which is the size `\y` checks against
+/// clipboard-max-bytes. The cursor is back on the first row afterwards.
+pub fn countFieldBytes(result: Result) u64 {
+    const count: usize = C.mysql_num_fields(result);
+    var total: u64 = 0;
+    rewindResult(result);
+    while (C.mysql_fetch_row(result)) |_| {
+        const lengths = C.mysql_fetch_lengths(result);
+        for (0..count) |index| {
+            total += @intCast(lengths[index]);
+        }
+    }
+    rewindResult(result);
+    return total;
+}
+
 /// Frees a row from `DB.firstRowCopy`.
 pub fn freeRowCopy(allocator: Allocator, values: []?[]u8) void {
     for (values) |value| {
