@@ -13,6 +13,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const OptionFile = @import("option_file.zig");
 const options = @import("options.zig");
+const prompt = @import("prompt.zig");
 
 pub const Error = error{ ConnectionFailed, OutOfMemory };
 
@@ -31,8 +32,11 @@ pub const Resolved = struct {
     /// The final name after any `default-conn`, such as "main/ro".
     name: []const u8,
     /// In the order they apply: the root `config`, then each directory's `config` from the root
-    /// down, then the connection file. `default-conn` is not among them.
+    /// down, then the connection file. `default-conn` and `prompt-color` are not among them.
     settings: []const OptionFile.Setting,
+    /// The colour of the prompt's connection tag, from the last `prompt-color` that applies, or
+    /// null for no colour.
+    prompt_color: ?prompt.Color,
 
     pub fn deinit(self: *Resolved) void {
         self.arena.deinit();
@@ -41,6 +45,7 @@ pub const Resolved = struct {
 
 const config_name = "config";
 const default_conn_key = "default-conn";
+const prompt_color_key = "prompt-color";
 const max_file_size = 1024 * 1024;
 const max_hops = 8;
 const max_depth = 8;
@@ -75,7 +80,7 @@ pub fn resolve(
     }, name);
     // The name can point into `name`, which the caller may free, as the line of `\C` is. Copy it into the arena.
     const owned_name = try allocator.dupe(u8, found.name);
-    return .{ .arena = arena, .name = owned_name, .settings = found.settings };
+    return .{ .arena = arena, .name = owned_name, .settings = found.settings, .prompt_color = found.prompt_color };
 }
 
 /// The connection named by -C, if any, and the settings to parse with: the option-file settings
@@ -98,6 +103,11 @@ pub const Selection = struct {
     /// The resolved name, such as "main/ro", or null without -C.
     pub fn name(self: *const Selection) ?[]const u8 {
         return if (self.resolved) |resolved| resolved.name else null;
+    }
+
+    /// The colour of the prompt's connection tag, or null without -C or without a `prompt-color`.
+    pub fn promptColor(self: *const Selection) ?prompt.Color {
+        return if (self.resolved) |resolved| resolved.prompt_color else null;
     }
 };
 
@@ -254,6 +264,7 @@ const Context = struct {
 const Found = struct {
     name: []const u8,
     settings: []const OptionFile.Setting,
+    prompt_color: ?prompt.Color,
 };
 
 /// Which kind of file is being parsed. Only a directory's config may hold `default-conn`.
@@ -262,6 +273,14 @@ const FileRole = enum { root_config, directory_config, connection };
 const Parsed = struct {
     settings: []const OptionFile.Setting,
     default_conn: ?[]const u8,
+    /// The file's `prompt-color`, or null when it has none. The inner null is `none`, which turns the colour off.
+    prompt_color: ?(?prompt.Color),
+};
+
+/// The settings of one connection, and the colour its prompt tag takes.
+const Collected = struct {
+    settings: []const OptionFile.Setting,
+    prompt_color: ?prompt.Color,
 };
 
 fn resolveIn(ctx: Context, requested: []const u8) Error!Found {
@@ -284,16 +303,20 @@ fn resolveIn(ctx: Context, requested: []const u8) Error!Found {
         }
         name = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ name, next });
     }
-    return .{ .name = name, .settings = try collectSettings(ctx, name) };
+    const collected = try collectSettings(ctx, name);
+    return .{ .name = name, .settings = collected.settings, .prompt_color = collected.prompt_color };
 }
 
 /// The settings of `name`: the root config, the config of each directory on the way down, then the file.
-fn collectSettings(ctx: Context, name: []const u8) Error![]const OptionFile.Setting {
+/// The last `prompt-color` among them wins, so a file's colour overrides its directory's.
+fn collectSettings(ctx: Context, name: []const u8) Error!Collected {
     var settings: std.ArrayList(OptionFile.Setting) = .empty;
+    var prompt_color: ?prompt.Color = null;
 
     const root_config = try std.fs.path.join(ctx.allocator, &.{ ctx.root, config_name });
     if (try parseFile(ctx, root_config, .root_config)) |parsed| {
         try settings.appendSlice(ctx.allocator, parsed.settings);
+        if (parsed.prompt_color) |choice| prompt_color = choice;
     }
 
     var dir_path = ctx.root;
@@ -304,13 +327,15 @@ fn collectSettings(ctx: Context, name: []const u8) Error![]const OptionFile.Sett
         const config_path = try std.fs.path.join(ctx.allocator, &.{ dir_path, config_name });
         if (try parseFile(ctx, config_path, .directory_config)) |parsed| {
             try settings.appendSlice(ctx.allocator, parsed.settings);
+            if (parsed.prompt_color) |choice| prompt_color = choice;
         }
     }
 
     const file_path = try std.fs.path.join(ctx.allocator, &.{ ctx.root, name });
     const parsed = (try parseFile(ctx, file_path, .connection)) orelse return notFound(ctx, name);
     try settings.appendSlice(ctx.allocator, parsed.settings);
-    return settings.toOwnedSlice(ctx.allocator);
+    if (parsed.prompt_color) |choice| prompt_color = choice;
+    return .{ .settings = try settings.toOwnedSlice(ctx.allocator), .prompt_color = prompt_color };
 }
 
 /// Reads and parses one file. Returns null when it does not exist, which is not an error.
@@ -326,6 +351,7 @@ fn parseFile(ctx: Context, path: []const u8, role: FileRole) Error!?Parsed {
 
     var settings: std.ArrayList(OptionFile.Setting) = .empty;
     var default_conn: ?[]const u8 = null;
+    var file_prompt_color: ?(?prompt.Color) = null;
     var line_number: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw_line| {
@@ -350,6 +376,15 @@ fn parseFile(ctx: Context, path: []const u8, role: FileRole) Error!?Parsed {
             }
             // An empty value resets the key, so the directory has no default.
             default_conn = if (target.len > 0) target else null;
+            continue;
+        }
+
+        // The prompt colour is not a connection option, so it is read here and never reaches options.zig.
+        if (OptionFile.sameName(key, prompt_color_key)) {
+            const color_name = value orelse return failAt(ctx, path, line_number, "\"{s}\" needs a value", .{key});
+            file_prompt_color = parseColor(color_name) orelse {
+                return failAt(ctx, path, line_number, "unknown prompt-color \"{s}\"; use a colour such as red or bright-red, or none", .{color_name});
+            };
             continue;
         }
 
@@ -381,7 +416,18 @@ fn parseFile(ctx: Context, path: []const u8, role: FileRole) Error!?Parsed {
     return .{
         .settings = try settings.toOwnedSlice(ctx.allocator),
         .default_conn = default_conn,
+        .prompt_color = file_prompt_color,
     };
+}
+
+/// The colour names that `prompt-color` takes: the eight ANSI colours, their `bright-` forms, and
+/// `none`, which is the null colour. Null when the name is unknown. Dashes and underscores are the same.
+fn parseColor(name: []const u8) ?(?prompt.Color) {
+    if (OptionFile.sameName(name, "none")) return @as(?prompt.Color, null);
+    for (std.enums.values(prompt.Color)) |color| {
+        if (OptionFile.sameName(@tagName(color), name)) return color;
+    }
+    return null;
 }
 
 /// A connection key is any connection or output option, or an execution option, as in
@@ -1072,4 +1118,91 @@ test "select applies the connection after the given settings, and needs no -C wi
     defer plain.deinit();
     try std.testing.expectEqual(@as(?[]const u8, null), plain.name());
     try std.testing.expectEqual(@as(usize, 1), plain.settings.len);
+}
+
+test "prompt-color names: each colour, its bright form, none, and - and _ are the same" {
+    for (std.enums.values(prompt.Color)) |color| {
+        try std.testing.expectEqual(color, parseColor(@tagName(color)).?.?);
+    }
+    try std.testing.expectEqual(prompt.Color.bright_cyan, parseColor("bright-cyan").?.?);
+    try std.testing.expectEqual(prompt.Color.red, parseColor("red").?.?);
+    try std.testing.expectEqual(@as(?prompt.Color, null), parseColor("none").?);
+    try std.testing.expect(parseColor("purple") == null);
+    try std.testing.expect(parseColor("") == null);
+}
+
+test "an invalid or bare prompt-color names the file and line" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(&tmp, "purple", "host = a\nprompt-color = purple\n");
+    try writeTestFile(&tmp, "bare", "host = a\nprompt-color\n");
+    const root = try tmpRoot(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(root);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [512]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&buffer);
+
+    try std.testing.expectError(error.ConnectionFailed, resolveIn(testContext(&arena, root, null, &stderr), "purple"));
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "purple:2: unknown prompt-color \"purple\"") != null);
+
+    stderr = .fixed(&buffer);
+    try std.testing.expectError(error.ConnectionFailed, resolveIn(testContext(&arena, root, null, &stderr), "bare"));
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "bare:2: \"prompt-color\" needs a value") != null);
+}
+
+test "prompt-color is not a setting, and the nearest file or directory with one wins" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(&tmp, "config", "prompt-color = blue\nuser = root_user\n");
+    try writeTestFile(&tmp, "main/config", "prompt-color = red\n");
+    try writeTestFile(&tmp, "main/ro", "user = ro_user\n");
+    try writeTestFile(&tmp, "main/eu/config", "prompt-color = none\n");
+    try writeTestFile(&tmp, "main/eu/ro", "prompt-color = bright-green\n");
+    try writeTestFile(&tmp, "main/eu/rw", "user = rw_user\n");
+    try writeTestFile(&tmp, "other", "host = o\n");
+    const root = try tmpRoot(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(root);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [512]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&buffer);
+
+    const inherited = try resolveIn(testContext(&arena, root, null, &stderr), "main/ro");
+    try std.testing.expectEqual(prompt.Color.red, inherited.prompt_color.?);
+    try expectSettings(inherited.settings, &.{
+        .{ .name = "user", .value = "root_user" },
+        .{ .name = "user", .value = "ro_user" },
+    });
+
+    const own = try resolveIn(testContext(&arena, root, null, &stderr), "main/eu/ro");
+    try std.testing.expectEqual(prompt.Color.bright_green, own.prompt_color.?);
+
+    const reset = try resolveIn(testContext(&arena, root, null, &stderr), "main/eu/rw");
+    try std.testing.expectEqual(@as(?prompt.Color, null), reset.prompt_color);
+
+    const from_root = try resolveIn(testContext(&arena, root, null, &stderr), "other");
+    try std.testing.expectEqual(prompt.Color.blue, from_root.prompt_color.?);
+}
+
+test "select carries the connection's prompt colour, and there is none without -C" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(&tmp, "xdg/thysql/connections/main/config", "prompt-color = yellow\n");
+    try writeTestFile(&tmp, "xdg/thysql/connections/main/ro", "host = h\n");
+    const xdg = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/xdg", .{&tmp.sub_path});
+    defer std.testing.allocator.free(xdg);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", xdg);
+    var buffer: [512]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&buffer);
+
+    var selected = try selectName(std.testing.allocator, std.testing.io, &env, &stderr, "main/ro", &.{});
+    defer selected.deinit();
+    try std.testing.expectEqual(prompt.Color.yellow, selected.promptColor().?);
+
+    var plain = try select(std.testing.allocator, std.testing.io, &env, &stderr, &.{"thysql"}, 1, &.{});
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(?prompt.Color, null), plain.promptColor());
 }
