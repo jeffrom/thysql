@@ -240,7 +240,11 @@ class ScriptingTests(E2ETestCase):
                     "--column-names",
                     "-s, --silent",
                     "-E, --vertical",
+                    "-J, --json",
+                    "--csv",
+                    "--result-format=format",
                     "-r, --raw",
+                    "--clipboard-max-bytes=size",
                     "-V, --version",
                 ):
                     self.assertIn(expected, result.stdout)
