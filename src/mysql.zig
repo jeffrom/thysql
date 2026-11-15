@@ -746,6 +746,8 @@ pub fn render_script_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_r
         .table => try render_result_columns(out, result, column_names),
         .tab => try render_result_tab(out, result, column_names, raw),
         .vertical => try render_result_vertical(out, result),
+        // Until the JSON and CSV writers are wired in, these fail instead of printing another format.
+        .json, .ndjson, .csv => return error.ResultFormatNotYetSupported,
     }
 }
 

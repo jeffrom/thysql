@@ -19,11 +19,14 @@ pub const Error = error{
     InvalidProtocol,
     InvalidConnectTimeout,
     InvalidBoolValue,
+    InvalidResultFormat,
     DefaultsOptionMisplaced,
     OutOfMemory,
 };
 
-pub const ResultFormat = enum { table, tab, vertical };
+/// The shape of a statement's result. `table`, `tab` and `vertical` are the mysql.cc
+/// formats; `ndjson` writes one JSON object per row, `json` one array per result set.
+pub const ResultFormat = enum { table, tab, vertical, json, ndjson, csv };
 
 /// How to reach the server. `default` lets the library choose: a socket for
 /// host "localhost", TCP otherwise. -P selects tcp and -S selects socket.
@@ -74,6 +77,9 @@ pub const Id = enum {
     batch,
     table,
     vertical,
+    json,
+    csv,
+    result_format,
     raw,
     silent,
     skip_column_names,
@@ -137,6 +143,9 @@ pub const specs = [_]Spec{
     .{ .id = .batch, .long = "batch", .short = 'B', .group = .output, .help = "Tab-separated output with no footers. Implied when stdin is not a terminal." },
     .{ .id = .table, .long = "table", .short = 't', .group = .output, .help = "Table output, even in batch mode." },
     .{ .id = .vertical, .long = "vertical", .short = 'E', .group = .output, .help = "Print every row vertically." },
+    .{ .id = .json, .long = "json", .short = 'J', .group = .output, .help = "One JSON object per row. Same as --result-format=ndjson." },
+    .{ .id = .csv, .long = "csv", .group = .output, .help = "CSV with a header line. Same as --result-format=csv." },
+    .{ .id = .result_format, .long = "result-format", .arg = .required, .arg_name = "format", .group = .output, .help = "Output format: table, tab, vertical, json, ndjson or csv. The last output flag given wins." },
     .{ .id = .skip_column_names, .long = "skip-column-names", .short = 'N', .group = .output, .help = "Don't write column names in results." },
     .{ .id = .column_names, .long = "column-names", .group = .output, .help = "Write column names in results. This is the default." },
     .{ .id = .silent, .long = "silent", .short = 's', .group = .output, .help = "Tab-separated results. Give -s twice to also omit column names." },
@@ -199,9 +208,12 @@ pub const Options = struct {
     force: bool = false,
     /// Delimiter for batch and REPL input. Checked when it is set.
     delimiter: []const u8 = ";",
+    /// Batch mode, from -B. It is separate from the format, so -B still makes
+    /// batch mode when -t or -E picks the format.
     batch: bool = false,
-    table: bool = false,
-    vertical: bool = false,
+    /// The format given by -B, -t, -E, -J, --csv or --result-format. The last one wins.
+    /// Null when none was given, and the format is then picked per statement.
+    result_format: ?ResultFormat = null,
     raw: bool = false,
     column_names: bool = true,
     /// Number of explicit -s flags.
@@ -240,14 +252,18 @@ pub const Options = struct {
     }
 
     /// Picks the output format for one statement's result. A trailing \G
-    /// always means vertical. Tab output is the default in batch mode (-B, -e, or non-tty
-    /// input) and with -s, as mysql.cc sets status.batch for -e.
+    /// always means vertical. Otherwise the format given by a flag wins. Without one, tab
+    /// output is the default in batch mode (-B, -e, or non-tty input) and with -s, as
+    /// mysql.cc sets status.batch for -e.
     pub fn resultFormat(self: *const Options, stdin_is_tty: bool, query_vertical: bool) ResultFormat {
-        if (query_vertical or self.vertical) {
+        if (query_vertical) {
             return .vertical;
         }
+        if (self.result_format) |format| {
+            return format;
+        }
         const tab_output = self.isBatch(stdin_is_tty) or self.silent > 0;
-        return if (tab_output and !self.table) .tab else .table;
+        return if (tab_output) .tab else .table;
     }
 
     /// As in mysql.cc, -ss hides column names in tab output only. Table output keeps them.
@@ -427,6 +443,11 @@ fn protocolValue(value: ?[]const u8) Error!Protocol {
     return Error.InvalidProtocol;
 }
 
+/// A format name, exactly as the ResultFormat tag is spelled.
+fn resultFormatValue(value: ?[]const u8) Error!ResultFormat {
+    return std.meta.stringToEnum(ResultFormat, try requiredValue(value)) orelse Error.InvalidResultFormat;
+}
+
 /// As in mysql.cc, the value is a count of seconds. 0 means the library default.
 fn connectTimeoutValue(value: ?[]const u8) Error!u32 {
     return std.fmt.parseUnsigned(u32, try requiredValue(value), 10) catch Error.InvalidConnectTimeout;
@@ -574,6 +595,16 @@ fn applySetting(allocator: Allocator, options: *Options, setting: OptionFile.Set
     try apply(allocator, options, spec.id, setting.value);
 }
 
+/// An option-file format flag. On picks the format. Off clears it, but only when it is
+/// the format in effect, so `table = 0` does not undo a `csv` from an earlier source.
+fn setFormatFromFile(options: *Options, format: ResultFormat, enabled: bool) void {
+    if (enabled) {
+        options.result_format = format;
+    } else if (options.result_format == format) {
+        options.result_format = null;
+    }
+}
+
 /// Makes the keychain the password source. The account is --keychain-account when it was given, else
 /// the connection name, which `password.fetch` fills in.
 fn useKeychain(options: *Options) void {
@@ -590,9 +621,14 @@ fn applyFileFlag(options: *Options, id: Id, enabled: bool) void {
         .column_names => options.column_names = enabled,
         .silent => options.silent = if (enabled) options.silent +| 1 else 0,
         .force => options.force = enabled,
-        .batch => options.batch = enabled,
-        .table => options.table = enabled,
-        .vertical => options.vertical = enabled,
+        .batch => {
+            options.batch = enabled;
+            setFormatFromFile(options, .tab, enabled);
+        },
+        .table => setFormatFromFile(options, .table, enabled),
+        .vertical => setFormatFromFile(options, .vertical, enabled),
+        .json => setFormatFromFile(options, .ndjson, enabled),
+        .csv => setFormatFromFile(options, .csv, enabled),
         .raw => options.raw = enabled,
         .show_warnings => options.show_warnings = enabled,
         .auto_rehash => options.auto_rehash = enabled,
@@ -662,9 +698,15 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         },
         .force => options.force = true,
         .delimiter => options.delimiter = try delimiterValue(value),
-        .batch => options.batch = true,
-        .table => options.table = true,
-        .vertical => options.vertical = true,
+        .batch => {
+            options.batch = true;
+            options.result_format = .tab;
+        },
+        .table => options.result_format = .table,
+        .vertical => options.result_format = .vertical,
+        .json => options.result_format = .ndjson,
+        .csv => options.result_format = .csv,
+        .result_format => options.result_format = try resultFormatValue(value),
         .raw => options.raw = true,
         .silent => options.silent +|= 1,
         .skip_column_names => options.column_names = false,
@@ -695,6 +737,7 @@ pub fn renderError(out: *std.Io.Writer, err: Error) !void {
         Error.InvalidProtocol => "Invalid protocol. Expected tcp or socket.",
         Error.InvalidConnectTimeout => "Invalid connect timeout. Expected a base-10 unsigned integer of seconds.",
         Error.InvalidBoolValue => "Invalid value for a boolean option. Use 1, 0, on, or off.",
+        Error.InvalidResultFormat => "Invalid result format. Expected table, tab, vertical, json, ndjson, or csv.",
         Error.DefaultsOptionMisplaced => "--no-defaults, --defaults-file, --defaults-extra-file, and --print-defaults must be the first arguments, each at most once.",
         Error.OutOfMemory => "Out of memory.",
     };
@@ -829,7 +872,7 @@ test "short flags cluster and -s counts repeats" {
     defer options.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 3), options.silent);
     try std.testing.expect(!options.column_names);
-    try std.testing.expect(options.vertical);
+    try std.testing.expectEqual(ResultFormat.vertical, options.result_format.?);
 }
 
 test "execute collects statements in order and accepts dash-prefixed values" {
@@ -900,12 +943,111 @@ test "result format follows mysql.cc: vertical, tab in batch or with -s, else ta
     const with_t = [_][]const u8{ "thysql", "-t", "-B" };
     var forced_table = try parse(std.testing.allocator, &with_t, &env);
     defer forced_table.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.table, forced_table.resultFormat(false, false));
+    try std.testing.expectEqual(ResultFormat.tab, forced_table.resultFormat(false, false));
+
+    const table_in_batch = [_][]const u8{ "thysql", "-B", "-t" };
+    var table_last = try parse(std.testing.allocator, &table_in_batch, &env);
+    defer table_last.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ResultFormat.table, table_last.resultFormat(false, false));
+    try std.testing.expect(table_last.isBatch(true));
 
     const with_e_vertical = [_][]const u8{ "thysql", "-E", "-s" };
     var vertical = try parse(std.testing.allocator, &with_e_vertical, &env);
     defer vertical.deinit(std.testing.allocator);
     try std.testing.expectEqual(ResultFormat.vertical, vertical.resultFormat(true, false));
+}
+
+test "output format flags set the format, and the last one wins" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const json = [_][]const u8{ "thysql", "-J" };
+    var json_options = try parse(std.testing.allocator, &json, &env);
+    defer json_options.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ResultFormat.ndjson, json_options.resultFormat(true, false));
+
+    const csv = [_][]const u8{ "thysql", "--csv" };
+    var csv_options = try parse(std.testing.allocator, &csv, &env);
+    defer csv_options.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ResultFormat.csv, csv_options.resultFormat(false, false));
+
+    const named = [_][]const u8{ "thysql", "--result-format=json", "--csv", "--result-format", "tab" };
+    var named_options = try parse(std.testing.allocator, &named, &env);
+    defer named_options.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ResultFormat.tab, named_options.resultFormat(true, false));
+
+    const shorthand_then_json = [_][]const u8{ "thysql", "-E", "--json" };
+    var json_last = try parse(std.testing.allocator, &shorthand_then_json, &env);
+    defer json_last.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ResultFormat.ndjson, json_last.resultFormat(true, false));
+
+    const json_flag = [_][]const u8{ "thysql", "--json" };
+    var query_wins = try parse(std.testing.allocator, &json_flag, &env);
+    defer query_wins.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ResultFormat.vertical, query_wins.resultFormat(true, true));
+}
+
+test "--result-format names each format and rejects anything else" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const names = [_]struct { text: []const u8, format: ResultFormat }{
+        .{ .text = "table", .format = .table },
+        .{ .text = "tab", .format = .tab },
+        .{ .text = "vertical", .format = .vertical },
+        .{ .text = "json", .format = .json },
+        .{ .text = "ndjson", .format = .ndjson },
+        .{ .text = "csv", .format = .csv },
+    };
+    for (names) |entry| {
+        const args = [_][]const u8{ "thysql", "--result-format", entry.text };
+        var options = try parse(std.testing.allocator, &args, &env);
+        defer options.deinit(std.testing.allocator);
+        try std.testing.expectEqual(entry.format, options.result_format.?);
+    }
+
+    const upper = [_][]const u8{ "thysql", "--result-format=CSV" };
+    try std.testing.expectError(Error.InvalidResultFormat, parse(std.testing.allocator, &upper, &env));
+    const unknown = [_][]const u8{ "thysql", "--result-format=xml" };
+    try std.testing.expectError(Error.InvalidResultFormat, parse(std.testing.allocator, &unknown, &env));
+    const empty = [_][]const u8{ "thysql", "--result-format=" };
+    try std.testing.expectError(Error.InvalidResultFormat, parse(std.testing.allocator, &empty, &env));
+}
+
+test "option-file format keys set the format, and off clears only the format in effect" {
+    var env = testEnv();
+    defer env.deinit();
+    const args = [_][]const u8{"thysql"};
+
+    const csv_key = [_]OptionFile.Setting{.{ .name = "result-format", .value = "csv" }};
+    var from_key = try parseWithSettings(std.testing.allocator, &args, 1, &env, &csv_key);
+    defer from_key.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ResultFormat.csv, from_key.result_format.?);
+
+    const json_bare = [_]OptionFile.Setting{.{ .name = "json", .value = null }};
+    var from_json = try parseWithSettings(std.testing.allocator, &args, 1, &env, &json_bare);
+    defer from_json.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ResultFormat.ndjson, from_json.result_format.?);
+
+    // table = 0 comes after csv, so it leaves the csv format alone.
+    const table_off = [_]OptionFile.Setting{
+        .{ .name = "csv", .value = null },
+        .{ .name = "table", .value = "0" },
+    };
+    var kept = try parseWithSettings(std.testing.allocator, &args, 1, &env, &table_off);
+    defer kept.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ResultFormat.csv, kept.result_format.?);
+
+    const csv_off = [_]OptionFile.Setting{
+        .{ .name = "csv", .value = null },
+        .{ .name = "csv", .value = "0" },
+    };
+    var cleared = try parseWithSettings(std.testing.allocator, &args, 1, &env, &csv_off);
+    defer cleared.deinit(std.testing.allocator);
+    try std.testing.expect(cleared.result_format == null);
+
+    const bad_format = [_]OptionFile.Setting{.{ .name = "result-format", .value = "xml" }};
+    try std.testing.expectError(Error.InvalidResultFormat, parseWithSettings(std.testing.allocator, &args, 1, &env, &bad_format));
 }
 
 test "column names hide only in tab output with -ss or -N" {
@@ -969,6 +1111,9 @@ test "usage lists every option in its group" {
     try std.testing.expect(std.mem.indexOf(u8, text, "      --ssl-ca=file") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --skip-ssl") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --keychain-account=name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  -J, --json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --csv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "      --result-format=format") != null);
 }
 
 test "usage describes the complete, keychain, and completion subcommands" {
@@ -1570,5 +1715,5 @@ test "a rebuilt command line parses without the connection flags" {
     defer options.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("localhost", options.host);
     try std.testing.expectEqual(@as(u32, 3306), options.port);
-    try std.testing.expect(options.table);
+    try std.testing.expectEqual(ResultFormat.table, options.result_format.?);
 }
