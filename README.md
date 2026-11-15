@@ -220,6 +220,10 @@ connections/
   belong to thysql, so a typo is not ignored.
 - `password = value` is refused, so a password is never stored in these files. Use
   `keychain = true` or `auth-command` instead. A bare `password` line means prompt.
+- `prompt-color = name` colours the `[name]` tag in the prompt. It can go in a connection
+  file or a `config` file, and a connection's own file overrides its directory's. It is
+  not a setting, so it is not a command-line flag and not a my.cnf key. See
+  [prompt](#prompt).
 
 ```
 # ~/.config/thysql/connections/main/ro
@@ -531,6 +535,24 @@ another one with `--prompt=fmt`,
 the `prompt` command, or `MYSQL_PS1`. The option wins over `MYSQL_PS1`, and
 `prompt` with no argument goes back to `MYSQL_PS1`, or to the default when that
 is not set. Continuation prompts such as `    -> ` do not change.
+
+The tag can be coloured with `prompt-color` in a connection file or a `config` file. Set it
+to `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan` or `white`, or to a `bright-`
+form such as `bright-red`. `none` turns colour off, which is the default. The brackets are
+part of the tag, so they are coloured too. An unknown name is an error that names the file and line. Put it in
+a `config` file to colour every connection below it. Colour is drawn only when stdout is a
+terminal and `NO_COLOR` is unset or empty, so `NO_COLOR=1 thysql -C prod` prints the plain
+tag. The tee file never has colour codes. A prompt set with `--prompt`, `MYSQL_PS1` or the
+`prompt` command replaces the built-in prompt, colour included.
+
+```
+# ~/.config/thysql/connections/prod
+host = db.example.com
+user = app_ro
+prompt-color = red
+```
+
+With `thysql -C prod`, the prompt is `[prod] (none)> `, and `[prod]` is drawn in red.
 
 Escapes are those of mysql.cc: `\u` user, `\U` user@host, `\h` host, `\H` host
 name, `\p` port or socket name, `\d` database, `\N` server name, `\v` server
