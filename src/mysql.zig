@@ -51,7 +51,7 @@ pub const ConnectFailure = struct {
 /// keeps no password when a provider is set.
 pub const PasswordProvider = struct {
     ctx: *anyopaque,
-    fetchFn: *const fn (ctx: *anyopaque, target: Password.Target, reason: Password.Reason) anyerror!Password.Secret,
+    fetchFn: *const fn (ctx: *anyopaque, target: Password.Target, reason: Password.Reason) anyerror!Password.AuthOutput,
 };
 
 pub const DBInfo = struct {
@@ -68,6 +68,8 @@ pub const DBInfo = struct {
     tls: Options.Tls = .{},
     /// Seconds to wait for the connection to open. 0 keeps the library default.
     connect_timeout: u32 = 0,
+    /// Connection fields set on the command line. The auth command's settings may not change them.
+    locked: Options.ConnectFieldSet = .{},
     /// Do not print a failed connect to stderr. `thysql complete` sets this unless it is debugging.
     quiet_connect_error: bool = false,
 };
@@ -129,6 +131,12 @@ pub const DB = struct {
     connect_timeout: u32,
     connect_failure: ConnectFailure = .{},
     password_provider: ?PasswordProvider,
+    /// The connection fields before the auth command's settings. Each connect starts from these, and
+    /// the fields above are what the last connect used. Strings are owned by `base_strings`.
+    base: Options.Options,
+    base_strings: std.heap.ArenaAllocator,
+    /// Connection fields set on the command line. The auth command's settings may not change them.
+    locked: Options.ConnectFieldSet,
 
     /// Connects as `info` says, and prints a failed connect to stderr unless `info.quiet_connect_error`.
     pub fn init(allocator: Allocator, info: DBInfo) !DB {
@@ -144,48 +152,32 @@ pub const DB = struct {
     /// Connects as `info` says, and prints nothing. A failed connect leaves its error in
     /// `failure`, for `ConnectFailure.render`. The caller closes the DB that it returns.
     pub fn open(allocator: Allocator, info: DBInfo, failure: *ConnectFailure) !DB {
-        const host = try allocator.dupeSentinel(u8, info.host, 0);
-        errdefer allocator.free(host);
-        const user = try allocator.dupeSentinel(u8, info.user, 0);
-        errdefer allocator.free(user);
+        var base_strings = std.heap.ArenaAllocator.init(allocator);
+        errdefer base_strings.deinit();
+        const base = try dupeBase(base_strings.allocator(), info);
         // With a provider, the password is fetched for each connect and not kept here.
         const password = try allocator.dupeSentinel(u8, if (info.password_provider == null) info.password else "", 0);
         errdefer allocator.free(password);
-        const database = try allocator.dupeSentinel(u8, info.database, 0);
-        errdefer allocator.free(database);
 
-        var strings = std.heap.ArenaAllocator.init(allocator);
-        errdefer strings.deinit();
-        const socket = try strings.allocator().dupeSentinel(u8, info.socket, 0);
-        const tls = try dupeTls(strings.allocator(), info.tls);
-
-        const connect_params: ConnectParams = .{
-            .host = host,
-            .user = user,
-            .password = password,
-            .database = database,
-            .port = info.port,
-            .socket = socket,
-            .protocol = info.protocol,
-            .tls = tls,
-            .connect_timeout = info.connect_timeout,
-        };
-        const db = try connectWith(connect_params, info.password_provider, .connect, failure);
+        const next = try connectWith(allocator, base, password, info.locked, info.password_provider, .connect, failure);
 
         return .{
-            .conn = db,
+            .conn = next.conn,
             .allocator = allocator,
-            .strings = strings,
-            .host = host,
-            .user = user,
+            .strings = next.strings,
+            .host = next.host,
+            .user = next.user,
             .password = password,
-            .database = database,
-            .port = info.port,
-            .socket = socket,
-            .protocol = info.protocol,
-            .tls = tls,
+            .database = next.database,
+            .port = next.port,
+            .socket = next.socket,
+            .protocol = next.protocol,
+            .tls = next.tls,
             .connect_timeout = info.connect_timeout,
             .password_provider = info.password_provider,
+            .base = base,
+            .base_strings = base_strings,
+            .locked = info.locked,
         };
     }
 
@@ -196,6 +188,7 @@ pub const DB = struct {
         self.allocator.free(self.password);
         self.allocator.free(self.database);
         self.strings.deinit();
+        self.base_strings.deinit();
     }
 
     fn params(self: *const DB) ConnectParams {
@@ -438,30 +431,42 @@ pub const DB = struct {
 
     /// `connectTo`, for a connect made for `reason`, which the password provider sees.
     fn connectAs(self: *DB, database: ?[]const u8, host: ?[]const u8, reason: Password.Reason) DBError!void {
-        const new_database: ?[:0]u8 = if (database) |name| try self.allocator.dupeSentinel(u8, name, 0) else null;
-        errdefer if (new_database) |name| self.allocator.free(name);
-        const new_host: ?[:0]u8 = if (host) |name| try self.allocator.dupeSentinel(u8, name, 0) else null;
-        errdefer if (new_host) |name| self.allocator.free(name);
+        // The database is the one named, else the current one, and the auth command may not change it.
+        // A named host is locked for this connect, and it becomes the base for the connects after it.
+        var base = self.base;
+        base.database = database orelse self.database;
+        var locked = self.locked;
+        locked.insert(.database);
+        if (host) |name| {
+            base.host = try self.base_strings.allocator().dupe(u8, name);
+            locked.insert(.host);
+        }
 
-        var next_params = self.params();
-        if (new_database) |name| next_params.database = name;
-        if (new_host) |name| next_params.host = name;
-
-        const conn = connectWith(next_params, self.password_provider, reason, &self.connect_failure) catch |err| switch (err) {
+        const next = connectWith(self.allocator, base, self.password, locked, self.password_provider, reason, &self.connect_failure) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.PasswordFailed => return error.PasswordFailed,
             else => return error.ConnectError,
         };
         C.mysql_close(self.conn);
-        self.conn = conn;
-        if (new_database) |name| {
-            self.allocator.free(self.database);
-            self.database = name;
-        }
-        if (new_host) |name| {
-            self.allocator.free(self.host);
-            self.host = name;
-        }
+        self.conn = next.conn;
+        self.base.host = base.host;
+        self.adopt(next);
+    }
+
+    /// Takes the values of a connect that succeeded, and frees the ones they replace.
+    fn adopt(self: *DB, next: Connected) void {
+        self.allocator.free(self.host);
+        self.allocator.free(self.user);
+        self.allocator.free(self.database);
+        self.strings.deinit();
+        self.host = next.host;
+        self.user = next.user;
+        self.database = next.database;
+        self.strings = next.strings;
+        self.port = next.port;
+        self.socket = next.socket;
+        self.protocol = next.protocol;
+        self.tls = next.tls;
     }
 
     /// Prints the last failed connect attempt as mysql.cc's put_error does. `line` adds
@@ -574,29 +579,121 @@ fn applyConnectOptions(db: *C.struct_st_mysql, params: ConnectParams) void {
     _ = C.mysql_options(db, C.MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &verify);
 }
 
-/// Opens a connection. With a provider, the password comes from it for this connect only.
-/// The secret is zeroed when this function returns, after the connect attempt. Any failure
-/// to get the password is `error.PasswordFailed`, and the provider has reported it.
-fn connectWith(params: ConnectParams, provider: ?PasswordProvider, reason: Password.Reason, failure: *ConnectFailure) !*C.struct_st_mysql {
-    const source = provider orelse return connect(params, failure);
-    const target: Password.Target = .{
-        .host = params.host,
-        .user = params.user,
-        .port = params.port,
-        .database = params.database,
-        .socket = params.socket,
-    };
-    var secret = source.fetchFn(source.ctx, target, reason) catch |err| {
-        if (err == error.OutOfMemory) {
-            return error.OutOfMemory;
-        }
-        return error.PasswordFailed;
-    };
-    defer secret.deinit();
+/// A connect that succeeded, with the values it used. `host`, `user` and `database` are
+/// allocated with the allocator that `connectWith` was given. The rest are in `strings`.
+const Connected = struct {
+    conn: *C.struct_st_mysql,
+    strings: std.heap.ArenaAllocator,
+    host: [:0]u8,
+    user: [:0]u8,
+    database: [:0]u8,
+    port: u32,
+    socket: [:0]const u8,
+    protocol: Options.Protocol,
+    tls: Tls,
+};
 
-    var with_password = params;
-    with_password.password = secret.bytes;
-    return connect(with_password, failure);
+/// Copies the connection fields of `info` into `arena`. The base lives as long as the DB.
+fn dupeBase(arena: Allocator, info: DBInfo) !Options.Options {
+    return .{
+        .host = try arena.dupe(u8, info.host),
+        .user = try arena.dupe(u8, info.user),
+        .database = try arena.dupe(u8, info.database),
+        .port = info.port,
+        .socket = try arena.dupe(u8, info.socket),
+        .protocol = info.protocol,
+        .tls = try dupeOptionsTls(arena, info.tls),
+        .connect_timeout = info.connect_timeout,
+    };
+}
+
+fn dupeOptionsTls(arena: Allocator, tls: Options.Tls) !Options.Tls {
+    return .{
+        .enabled = tls.enabled,
+        .ca = try arena.dupe(u8, tls.ca),
+        .capath = try arena.dupe(u8, tls.capath),
+        .cert = try arena.dupe(u8, tls.cert),
+        .key = try arena.dupe(u8, tls.key),
+        .cipher = try arena.dupe(u8, tls.cipher),
+        .crl = try arena.dupe(u8, tls.crl),
+        .crlpath = try arena.dupe(u8, tls.crlpath),
+        .tls_version = try arena.dupe(u8, tls.tls_version),
+        .verify_server_cert = tls.verify_server_cert,
+    };
+}
+
+/// Opens a connection with `base`, the connection fields before the auth command, plus the
+/// settings from the provider's auth command for the fields that are not `locked`. With a
+/// provider, the password and the settings come from it for this connect only, and the secret
+/// is zeroed when this function returns, after the connect attempt. Without one, `password` is
+/// used. Any failure to get the password is `error.PasswordFailed`, and the provider has reported
+/// it. On failure, `failure` holds the connect error.
+fn connectWith(
+    allocator: Allocator,
+    base: Options.Options,
+    password: [:0]const u8,
+    locked: Options.ConnectFieldSet,
+    provider: ?PasswordProvider,
+    reason: Password.Reason,
+    failure: *ConnectFailure,
+) !Connected {
+    var values = base;
+    var auth: ?Password.AuthOutput = null;
+    defer if (auth) |*output| output.deinit();
+
+    var secret: [:0]const u8 = password;
+    if (provider) |source| {
+        const target: Password.Target = .{
+            .host = base.host,
+            .user = base.user,
+            .port = base.port,
+            .database = base.database,
+            .socket = base.socket,
+        };
+        auth = source.fetchFn(source.ctx, target, reason) catch |err| {
+            if (err == error.OutOfMemory) {
+                return error.OutOfMemory;
+            }
+            return error.PasswordFailed;
+        };
+        Password.applySettings(&values, auth.?.settings, locked);
+        secret = auth.?.password.bytes;
+    }
+
+    // The values are copied before the auth output is freed, so they outlive it.
+    var strings = std.heap.ArenaAllocator.init(allocator);
+    errdefer strings.deinit();
+    const host = try allocator.dupeSentinel(u8, values.host, 0);
+    errdefer allocator.free(host);
+    const user = try allocator.dupeSentinel(u8, values.user, 0);
+    errdefer allocator.free(user);
+    const database = try allocator.dupeSentinel(u8, values.database, 0);
+    errdefer allocator.free(database);
+    const socket = try strings.allocator().dupeSentinel(u8, values.socket, 0);
+    const tls = try dupeTls(strings.allocator(), values.tls);
+
+    const conn = try connect(.{
+        .host = host,
+        .user = user,
+        .password = secret,
+        .database = database,
+        .port = values.port,
+        .socket = socket,
+        .protocol = values.protocol,
+        .tls = tls,
+        .connect_timeout = values.connect_timeout,
+    }, failure);
+    return .{
+        .conn = conn,
+        .strings = strings,
+        .host = host,
+        .user = user,
+        .database = database,
+        .port = values.port,
+        .socket = socket,
+        .protocol = values.protocol,
+        .tls = tls,
+    };
 }
 
 /// Opens a connection. On failure, `failure` holds the error and the handle is closed.

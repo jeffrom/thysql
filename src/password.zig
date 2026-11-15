@@ -97,25 +97,58 @@ pub const AuthOutput = struct {
     }
 };
 
-/// Returns the password for `source`. The caller owns the result and calls `deinit`.
-/// `.prompt` without an interactive stdin returns `error.NeedsPrompt`.
-pub fn fetch(allocator: Allocator, io: std.Io, source: Options.PasswordSource, context: FetchContext) !Secret {
+/// Applies the settings from an auth command's JSON to `options`, as the option of each name would,
+/// except that a field in `locked` is left as it is. The strings in `options` borrow from `settings`.
+/// An explicit protocol or TLS switch is applied last, so it wins over the protocol or TLS that a
+/// port, socket or TLS path implies.
+pub fn applySettings(options: *Options.Options, settings: Settings, locked: Options.ConnectFieldSet) void {
+    if (settings.host) |host| {
+        if (!locked.contains(.host)) options.host = host;
+    }
+    if (settings.user) |user| {
+        if (!locked.contains(.user)) options.user = user;
+    }
+    if (settings.database) |database| {
+        if (!locked.contains(.database)) options.database = database;
+    }
+    if (settings.port) |port| Options.setPort(options, port, locked);
+    if (settings.socket) |path| Options.setSocket(options, path, locked);
+    if (settings.ssl_ca) |path| Options.setTlsPath(options, .ssl_ca, path, locked);
+    if (settings.ssl_capath) |path| Options.setTlsPath(options, .ssl_capath, path, locked);
+    if (settings.ssl_cert) |path| Options.setTlsPath(options, .ssl_cert, path, locked);
+    if (settings.ssl_key) |path| Options.setTlsPath(options, .ssl_key, path, locked);
+    if (settings.ssl_cipher) |text| Options.setTlsPath(options, .ssl_cipher, text, locked);
+    if (settings.ssl_crl) |path| Options.setTlsPath(options, .ssl_crl, path, locked);
+    if (settings.ssl_crlpath) |path| Options.setTlsPath(options, .ssl_crlpath, path, locked);
+    if (settings.tls_version) |text| Options.setTlsPath(options, .tls_version, text, locked);
+    if (settings.ssl_verify_server_cert) |verify| {
+        if (!locked.contains(.ssl_verify_server_cert)) options.tls.verify_server_cert = verify;
+    }
+    if (settings.protocol) |protocol| Options.setProtocol(options, protocol, locked);
+    if (settings.ssl) |enabled| {
+        if (!locked.contains(.ssl)) options.tls.enabled = enabled;
+    }
+}
+
+/// Returns the password and any auth settings for `source`. The caller owns the result and calls `deinit`.
+/// Only `.command` has settings. `.prompt` without an interactive stdin returns `error.NeedsPrompt`.
+pub fn fetch(allocator: Allocator, io: std.Io, source: Options.PasswordSource, context: FetchContext) !AuthOutput {
     switch (source) {
-        .literal => |value| return .{ .bytes = try allocator.dupeSentinel(u8, value, 0), .allocator = allocator },
+        .literal => |value| return plainOutput(allocator, .{ .bytes = try allocator.dupeSentinel(u8, value, 0), .allocator = allocator }),
         .prompt => {
             if (!context.interactive) {
                 return error.NeedsPrompt;
             }
-            return .{ .bytes = try readHiddenLine(allocator, io, context.stderr, "Enter password: "), .allocator = allocator };
+            return plainOutput(allocator, .{ .bytes = try readHiddenLine(allocator, io, context.stderr, "Enter password: "), .allocator = allocator });
         },
-        .command => |command| {
-            // Until connect applies the settings, only the password is used.
-            var output = try runCommand(allocator, io, command, context);
-            defer output.arena.deinit();
-            return output.password;
-        },
-        .keychain => |account| return fetchKeychain(allocator, io, account, context),
+        .command => |command| return runCommand(allocator, io, command, context),
+        .keychain => |account| return plainOutput(allocator, try fetchKeychain(allocator, io, account, context)),
     }
+}
+
+/// An `AuthOutput` for a source that has no settings.
+fn plainOutput(allocator: Allocator, password: Secret) AuthOutput {
+    return .{ .password = password, .arena = .init(allocator) };
 }
 
 /// Reads the keychain password for `account`, or for the connection name when `account` is "".
@@ -440,11 +473,13 @@ pub const Supplier = struct {
         if (self.source != .prompt or self.prompted != null) {
             return;
         }
-        self.prompted = try fetch(self.allocator, self.io, self.source, self.context);
+        var output = try fetch(self.allocator, self.io, self.source, self.context);
+        defer output.arena.deinit();
+        self.prompted = output.password;
     }
 
-    /// Returns a password for a connect to `target`, for `reason`.
-    pub fn get(self: *Supplier, target: Target, reason: Reason) !Secret {
+    /// Returns the password, and any settings, for a connect to `target`, for `reason`.
+    pub fn get(self: *Supplier, target: Target, reason: Reason) !AuthOutput {
         if (self.source != .prompt) {
             var context = self.context;
             context.target = target;
@@ -453,11 +488,11 @@ pub const Supplier = struct {
             return fetch(self.allocator, self.io, self.source, context);
         }
         try self.prime();
-        return self.prompted.?.dupe();
+        return plainOutput(self.allocator, try self.prompted.?.dupe());
     }
 
     /// The `fetchFn` for `Mysql.PasswordProvider`, with `ctx` set to a `*Supplier`.
-    pub fn fetchOpaque(ctx: *anyopaque, target: Target, reason: Reason) anyerror!Secret {
+    pub fn fetchOpaque(ctx: *anyopaque, target: Target, reason: Reason) anyerror!AuthOutput {
         const self: *Supplier = @ptrCast(@alignCast(ctx));
         return self.get(target, reason);
     }
@@ -519,10 +554,10 @@ test "literal copies the value and deinit frees it" {
     defer env.deinit();
     var stderr_buffer: [64]u8 = undefined;
     var stderr: std.Io.Writer = .fixed(&stderr_buffer);
-    const secret = try fetch(std.testing.allocator, std.testing.io, .{ .literal = "pw" }, .{ .interactive = false, .stderr = &stderr, .env = &env });
-    defer secret.deinit();
-    try std.testing.expectEqualStrings("pw", secret.bytes);
-    try std.testing.expectEqual(@as(u8, 0), secret.bytes[secret.bytes.len]);
+    var output = try fetch(std.testing.allocator, std.testing.io, .{ .literal = "pw" }, .{ .interactive = false, .stderr = &stderr, .env = &env });
+    defer output.deinit();
+    try std.testing.expectEqualStrings("pw", output.password.bytes);
+    try std.testing.expectEqual(@as(u8, 0), output.password.bytes[output.password.bytes.len]);
 }
 
 test "prompt without an interactive stdin needs a prompt, and never prints one" {
@@ -547,9 +582,9 @@ test "a supplier returns a copy of its literal on every call" {
     };
     defer supplier.deinit();
     for (0..2) |_| {
-        const secret = try Supplier.fetchOpaque(&supplier, .{}, .connect);
-        defer secret.deinit();
-        try std.testing.expectEqualStrings("again", secret.bytes);
+        var output = try Supplier.fetchOpaque(&supplier, .{}, .connect);
+        defer output.deinit();
+        try std.testing.expectEqualStrings("again", output.password.bytes);
     }
 }
 
@@ -559,12 +594,12 @@ test "auth command prints the password on its first line, without the line endin
     var stderr_buffer: [64]u8 = undefined;
     var stderr: std.Io.Writer = .fixed(&stderr_buffer);
     const context: FetchContext = .{ .interactive = false, .stderr = &stderr, .env = &env };
-    const crlf = try fetch(std.testing.allocator, std.testing.io, .{ .command = "printf 'pw\\r\\nignored\\n'" }, context);
+    var crlf = try fetch(std.testing.allocator, std.testing.io, .{ .command = "printf 'pw\\r\\nignored\\n'" }, context);
     defer crlf.deinit();
-    try std.testing.expectEqualStrings("pw", crlf.bytes);
-    const bare = try fetch(std.testing.allocator, std.testing.io, .{ .command = "printf 'no-newline'" }, context);
+    try std.testing.expectEqualStrings("pw", crlf.password.bytes);
+    var bare = try fetch(std.testing.allocator, std.testing.io, .{ .command = "printf 'no-newline'" }, context);
     defer bare.deinit();
-    try std.testing.expectEqualStrings("no-newline", bare.bytes);
+    try std.testing.expectEqualStrings("no-newline", bare.password.bytes);
 }
 
 test "auth command sees the target and the reason as THYSQL_* variables" {
@@ -580,9 +615,9 @@ test "auth command sees the target and the reason as THYSQL_* variables" {
         .connection = "main/ro",
     };
     defer supplier.deinit();
-    const secret = try Supplier.fetchOpaque(&supplier, .{ .host = "db.example", .user = "app", .port = 3307, .database = "shop", .socket = "" }, .reconnect);
-    defer secret.deinit();
-    try std.testing.expectEqualStrings("reconnect|db.example|3307|app|shop||main/ro", secret.bytes);
+    var output = try Supplier.fetchOpaque(&supplier, .{ .host = "db.example", .user = "app", .port = 3307, .database = "shop", .socket = "" }, .reconnect);
+    defer output.deinit();
+    try std.testing.expectEqualStrings("reconnect|db.example|3307|app|shop||main/ro", output.password.bytes);
 }
 
 test "auth command failures are reported on stderr, and an empty password is an error" {
@@ -833,4 +868,59 @@ test "auth command output cut off at 64 KiB is an error through runCommand" {
     const command = "printf '{\"host\":\"'; head -c 70000 /dev/zero | tr '\\0' h";
     try std.testing.expectError(error.AuthCommandFailed, runCommand(std.testing.allocator, std.testing.io, command, context));
     try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "cut off") != null);
+}
+
+test "auth settings change the connection fields, and implied fields follow the options" {
+    var options: Options.Options = .{ .host = "cli-default", .port = 3306, .user = "app" };
+    const settings: Settings = .{ .host = "db.example", .port = 3307, .user = "reader", .database = "shop", .ssl_ca = "ca.pem" };
+    applySettings(&options, settings, .{});
+    try std.testing.expectEqualStrings("db.example", options.host);
+    try std.testing.expectEqualStrings("reader", options.user);
+    try std.testing.expectEqualStrings("shop", options.database);
+    try std.testing.expectEqual(@as(u32, 3307), options.port);
+    try std.testing.expectEqual(Options.Protocol.tcp, options.protocol);
+    try std.testing.expectEqualStrings("ca.pem", options.tls.ca);
+    try std.testing.expect(options.tls.enabled);
+}
+
+test "a socket setting selects the socket protocol, and an explicit protocol wins over it" {
+    var options: Options.Options = .{};
+    applySettings(&options, .{ .socket = "/tmp/db.sock" }, .{});
+    try std.testing.expectEqualStrings("/tmp/db.sock", options.socket);
+    try std.testing.expectEqual(Options.Protocol.socket, options.protocol);
+
+    var explicit: Options.Options = .{};
+    applySettings(&explicit, .{ .socket = "/tmp/db.sock", .protocol = .tcp }, .{});
+    try std.testing.expectEqual(Options.Protocol.tcp, explicit.protocol);
+}
+
+test "an explicit ssl setting wins over the TLS that a path implies" {
+    var options: Options.Options = .{};
+    applySettings(&options, .{ .ssl_cert = "client.pem", .ssl = false }, .{});
+    try std.testing.expectEqualStrings("client.pem", options.tls.cert);
+    try std.testing.expect(!options.tls.enabled);
+
+    var verified: Options.Options = .{};
+    applySettings(&verified, .{ .ssl_verify_server_cert = false }, .{});
+    try std.testing.expectEqual(@as(?bool, false), verified.tls.verify_server_cert);
+}
+
+test "locked fields keep their command-line values, and the other fields still change" {
+    var options: Options.Options = .{ .host = "cli-host", .port = 3307, .protocol = .tcp, .user = "cli-user" };
+    const locked = Options.ConnectFieldSet.initMany(&.{ .host, .port, .protocol, .user });
+    applySettings(&options, .{ .host = "json-host", .port = 3308, .user = "json-user", .socket = "/tmp/db.sock", .ssl_key = "key.pem" }, locked);
+    try std.testing.expectEqualStrings("cli-host", options.host);
+    try std.testing.expectEqualStrings("cli-user", options.user);
+    try std.testing.expectEqual(@as(u32, 3307), options.port);
+    // -P locks the protocol too, so a socket setting does not select it.
+    try std.testing.expectEqual(Options.Protocol.tcp, options.protocol);
+    try std.testing.expectEqualStrings("/tmp/db.sock", options.socket);
+    try std.testing.expectEqualStrings("key.pem", options.tls.key);
+    try std.testing.expect(options.tls.enabled);
+
+    // A locked TLS switch is not changed by a path either.
+    var no_tls: Options.Options = .{ .tls = .{ .enabled = false } };
+    applySettings(&no_tls, .{ .ssl_ca = "ca.pem", .ssl = true }, Options.ConnectFieldSet.initOne(.ssl));
+    try std.testing.expectEqualStrings("ca.pem", no_tls.tls.ca);
+    try std.testing.expect(!no_tls.tls.enabled);
 }

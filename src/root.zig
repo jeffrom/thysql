@@ -111,6 +111,7 @@ fn connectInfo(options: *const Options.Options, provider: Mysql.PasswordProvider
         .protocol = options.protocol,
         .tls = options.tls,
         .connect_timeout = options.connect_timeout,
+        .locked = options.lockedFields(),
     };
 }
 
