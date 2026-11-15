@@ -93,6 +93,23 @@ Example with the password supplied by the environment:
 MYSQL_PWD=foo zig build run -- -h 127.0.0.1 -uroot hi
 ```
 
+## releasing
+
+A release is a tag `vX.Y.Z` that matches `.version` in `build.zig.zon`. Pushing the tag starts
+`.github/workflows/release.yml`, which builds all four tarballs and creates a **draft** GitHub
+release with `SHA256SUMS`. Publish the draft by hand after checking it, then update the cask:
+
+```sh
+tools/release.sh 0.1.0              # version bump, zig build test, commit, annotated tag
+git push origin main v0.1.0         # starts the release workflow
+# wait for the workflow, then publish the draft release on GitHub
+tools/update_cask.sh 0.1.0          # cask version and sha256s from SHA256SUMS, commit
+git push origin main
+```
+
+`tools/release.sh --dry-run` shows what it would do. `tools/update_cask.sh 0.1.0 --sums FILE`
+reads a local `SHA256SUMS` instead of downloading it. Both scripts need a clean tree on `main`.
+
 ## TLS and sockets
 
 These options match mysql.cc and are passed to the bundled Connector/C.
