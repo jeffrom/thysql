@@ -268,13 +268,13 @@ pub const Options = struct {
         return self.batch or self.execute != null or !stdin_is_tty;
     }
 
-    /// Picks the output format for one statement's result. A trailing \G
-    /// always means vertical. Otherwise the format given by a flag wins. Without one, tab
-    /// output is the default in batch mode (-B, -e, or non-tty input) and with -s, as
-    /// mysql.cc sets status.batch for -e.
-    pub fn resultFormat(self: *const Options, stdin_is_tty: bool, query_vertical: bool) ResultFormat {
-        if (query_vertical) {
-            return .vertical;
+    /// Picks the output format for one statement's result. A trailing \G or \J
+    /// (`query_format`, null for neither) always wins. Otherwise the format given by a flag wins.
+    /// Without one, tab output is the default in batch mode (-B, -e, or non-tty input) and with
+    /// -s, as mysql.cc sets status.batch for -e.
+    pub fn resultFormat(self: *const Options, stdin_is_tty: bool, query_format: ?ResultFormat) ResultFormat {
+        if (query_format) |format| {
+            return format;
         }
         if (self.result_format) |format| {
             return format;
@@ -967,30 +967,30 @@ test "result format follows mysql.cc: vertical, tab in batch or with -s, else ta
     const plain = [_][]const u8{"thysql"};
     var interactive = try parse(std.testing.allocator, &plain, &env);
     defer interactive.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.table, interactive.resultFormat(true, false));
-    try std.testing.expectEqual(ResultFormat.tab, interactive.resultFormat(false, false));
-    try std.testing.expectEqual(ResultFormat.vertical, interactive.resultFormat(false, true));
+    try std.testing.expectEqual(ResultFormat.table, interactive.resultFormat(true, null));
+    try std.testing.expectEqual(ResultFormat.tab, interactive.resultFormat(false, null));
+    try std.testing.expectEqual(ResultFormat.vertical, interactive.resultFormat(false, .vertical));
 
     const with_e = [_][]const u8{ "thysql", "-e", "select 1" };
     var execute = try parse(std.testing.allocator, &with_e, &env);
     defer execute.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.tab, execute.resultFormat(true, false));
+    try std.testing.expectEqual(ResultFormat.tab, execute.resultFormat(true, null));
 
     const with_t = [_][]const u8{ "thysql", "-t", "-B" };
     var forced_table = try parse(std.testing.allocator, &with_t, &env);
     defer forced_table.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.table, forced_table.resultFormat(false, false));
+    try std.testing.expectEqual(ResultFormat.table, forced_table.resultFormat(false, null));
 
     const table_in_batch = [_][]const u8{ "thysql", "-B", "-t" };
     var table_last = try parse(std.testing.allocator, &table_in_batch, &env);
     defer table_last.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.table, table_last.resultFormat(false, false));
+    try std.testing.expectEqual(ResultFormat.table, table_last.resultFormat(false, null));
     try std.testing.expect(table_last.isBatch(true));
 
     const with_e_vertical = [_][]const u8{ "thysql", "-E", "-s" };
     var vertical = try parse(std.testing.allocator, &with_e_vertical, &env);
     defer vertical.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.vertical, vertical.resultFormat(true, false));
+    try std.testing.expectEqual(ResultFormat.vertical, vertical.resultFormat(true, null));
 }
 
 test "output format flags set the format, and the last one wins" {
@@ -1000,27 +1000,28 @@ test "output format flags set the format, and the last one wins" {
     const json = [_][]const u8{ "thysql", "-J" };
     var json_options = try parse(std.testing.allocator, &json, &env);
     defer json_options.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.ndjson, json_options.resultFormat(true, false));
+    try std.testing.expectEqual(ResultFormat.ndjson, json_options.resultFormat(true, null));
 
     const csv = [_][]const u8{ "thysql", "--csv" };
     var csv_options = try parse(std.testing.allocator, &csv, &env);
     defer csv_options.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.csv, csv_options.resultFormat(false, false));
+    try std.testing.expectEqual(ResultFormat.csv, csv_options.resultFormat(false, null));
 
     const named = [_][]const u8{ "thysql", "--result-format=json", "--csv", "--result-format", "tab" };
     var named_options = try parse(std.testing.allocator, &named, &env);
     defer named_options.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.tab, named_options.resultFormat(true, false));
+    try std.testing.expectEqual(ResultFormat.tab, named_options.resultFormat(true, null));
 
     const shorthand_then_json = [_][]const u8{ "thysql", "-E", "--json" };
     var json_last = try parse(std.testing.allocator, &shorthand_then_json, &env);
     defer json_last.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.ndjson, json_last.resultFormat(true, false));
+    try std.testing.expectEqual(ResultFormat.ndjson, json_last.resultFormat(true, null));
 
     const json_flag = [_][]const u8{ "thysql", "--json" };
     var query_wins = try parse(std.testing.allocator, &json_flag, &env);
     defer query_wins.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ResultFormat.vertical, query_wins.resultFormat(true, true));
+    try std.testing.expectEqual(ResultFormat.vertical, query_wins.resultFormat(true, .vertical));
+    try std.testing.expectEqual(ResultFormat.ndjson, query_wins.resultFormat(true, .ndjson));
 }
 
 test "--result-format names each format and rejects anything else" {

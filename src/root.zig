@@ -530,24 +530,54 @@ fn runClientCommand(
     return true;
 }
 
-/// Renders one result set. With a pager set, it goes through the pager. A pager that exits
-/// early makes the writes fail, which is not an error for the session.
-fn renderResult(client: *Client, result: [*c]C.struct_st_mysql_res, vertical: bool, elapsed_ns: i96, warnings: u32) !void {
-    var sink: Client.ResultSink = undefined;
-    try sink.open(client);
-    defer sink.close();
+/// The format for one statement typed at the prompt: its `\G` or `\J` terminator, else a format
+/// flag, else table. As before, `-s` does not change the REPL from table output.
+fn replFormat(options: *const Options.Options, query: Batch.Query) Options.ResultFormat {
+    return query.terminator.format() orelse options.result_format orelse .table;
+}
 
-    const out = sink.writer();
-    const rendered = if (vertical)
-        Mysql.render_result_vertical_timed_with_warnings(out, result, elapsed_ns, warnings)
-    else
-        Mysql.render_result_timed_with_warnings(out, result, elapsed_ns, warnings);
-    rendered catch |err| {
-        if (err == error.WriteFailed and sink.isPiped()) {
-            return;
-        }
-        return err;
-    };
+/// Renders one result set in the REPL, through the pager. A pager that exits early makes the writes
+/// fail, which is not an error for the session. Table, tab and vertical keep their footer in the
+/// pager. JSON and CSV write the footer to stderr after the rows, so the rows stay clean.
+fn renderResult(
+    client: *Client,
+    result: [*c]C.struct_st_mysql_res,
+    format: Options.ResultFormat,
+    render_options: Mysql.RenderOptions,
+    stderr: *std.Io.Writer,
+    elapsed_ns: i96,
+    warnings: u32,
+) !void {
+    {
+        var sink: Client.ResultSink = undefined;
+        try sink.open(client);
+        defer sink.close();
+
+        const out = sink.writer();
+        const rendered = switch (format) {
+            .table => Mysql.render_result_timed_with_warnings(out, result, elapsed_ns, warnings),
+            .vertical => Mysql.render_result_vertical_timed_with_warnings(out, result, elapsed_ns, warnings),
+            .tab => renderTabResult(out, result, render_options, elapsed_ns, warnings),
+            .json, .ndjson, .csv => Mysql.renderResultAs(out, result, format, render_options),
+        };
+        rendered catch |err| {
+            if (err == error.WriteFailed and sink.isPiped()) {
+                return;
+            }
+            return err;
+        };
+    }
+
+    switch (format) {
+        .json, .ndjson, .csv => try Mysql.render_result_footer(stderr, result, elapsed_ns, warnings),
+        .table, .tab, .vertical => {},
+    }
+}
+
+/// Tab output with its footer, both through the pager, as table output has.
+fn renderTabResult(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, render_options: Mysql.RenderOptions, elapsed_ns: i96, warnings: u32) !void {
+    try Mysql.renderResultAs(out, result, .tab, render_options);
+    try Mysql.render_result_footer(out, result, elapsed_ns, warnings);
 }
 
 /// Runs one statement for the REPL. As in mysql.cc, a lost connection prints the error,
@@ -577,7 +607,7 @@ fn execReplStatement(context: *ReplContext, stdout: *std.Io.Writer, sql: []const
 }
 
 /// Runs one SQL statement from the REPL and renders its result sets. Errors and warnings go to `stdout`.
-fn executeQuery(context: *ReplContext, stdout: *std.Io.Writer, query: Batch.Query) !bool {
+fn executeQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.Io.Writer, query: Batch.Query) !bool {
     if (query.sql.len == 0) {
         return true;
     }
@@ -595,6 +625,14 @@ fn executeQuery(context: *ReplContext, stdout: *std.Io.Writer, query: Batch.Quer
     // The statement ran, so a new or dropped table is in the names at the next Tab press.
     if (SqlCompletion.changesNames(query.sql, context.repl.syntax.lexer)) context.repl.names.markStale();
 
+    const format = replFormat(context.options, query);
+    const render_options: Mysql.RenderOptions = .{
+        .allocator = db.allocator,
+        .column_names = context.options.showColumnNames(format),
+        .raw = context.options.raw,
+        .stderr = stderr,
+        .pretty = format == .json,
+    };
     var warnings: u32 = 0;
     while (true) {
         const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(context.io, .awake)).raw.nanoseconds;
@@ -602,7 +640,7 @@ fn executeQuery(context: *ReplContext, stdout: *std.Io.Writer, query: Batch.Quer
             .result => |result| {
                 defer Mysql.freeResult(result);
                 warnings = db.warningCount();
-                try renderResult(client, result, query.vertical, elapsed_ns, warnings);
+                try renderResult(client, result, format, render_options, stderr, elapsed_ns, warnings);
             },
             .ok => |ok| {
                 warnings = ok.warnings;
@@ -726,8 +764,8 @@ fn formatHistoryEntry(allocator: Allocator, query: Batch.Query, delimiter: []con
     for (query.sql) |byte| {
         try appendHistoryChar(&entry, allocator, byte, &in_string, &escaped);
     }
-    if (query.vertical) {
-        try entry.appendSlice(allocator, "\\G");
+    if (query.terminator.text()) |text| {
+        try entry.appendSlice(allocator, text);
     } else {
         try entry.appendSlice(allocator, delimiter);
     }
@@ -752,8 +790,8 @@ fn rememberLastQuery(allocator: Allocator, last_query: *std.ArrayList(u8), query
 
     last_query.clearRetainingCapacity();
     try last_query.appendSlice(allocator, query.sql);
-    if (query.vertical) {
-        try last_query.appendSlice(allocator, "\\G");
+    if (query.terminator.text()) |text| {
+        try last_query.appendSlice(allocator, text);
     }
 }
 
@@ -878,6 +916,7 @@ fn openEditorForQuery(
 const ReplContext = struct {
     db: *Mysql.DB,
     io: std.Io,
+    options: *const Options.Options,
     switcher: *ConnectionSwitch,
     scanner: *Batch.Scanner,
     last_query: *std.ArrayList(u8),
@@ -891,7 +930,6 @@ const ReplContext = struct {
 /// Runs one statement typed at the prompt. Errors are printed, and the REPL keeps going.
 /// Statements from a sourced file are run, but they are not added to history.
 fn executeReplQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.Io.Writer, query: Batch.Query) !bool {
-    _ = stderr;
     const allocator = context.db.allocator;
     const command = ClientCommand.parse(query.sql);
     if (context.session.depth == 0) {
@@ -903,7 +941,7 @@ fn executeReplQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.
     if (command) |client_command| {
         return try runClientCommand(context.client, context.db, stdout, stdout, null, &context.repl, context.scanner.delimiterText(), context.switcher, client_command);
     }
-    return try executeQuery(context, stdout, query);
+    return try executeQuery(context, stdout, stderr, query);
 }
 
 fn feedInteractiveInput(
@@ -1030,7 +1068,7 @@ fn executeBatchQuery(context: BatchContext, stdout: *std.Io.Writer, stderr: *std
         }
     };
 
-    const format = context.options.resultFormat(context.stdin_is_tty, query.vertical);
+    const format = context.options.resultFormat(context.stdin_is_tty, query.terminator.format());
     const render_options: Mysql.RenderOptions = .{
         .allocator = db.allocator,
         .column_names = context.options.showColumnNames(format),
@@ -1268,6 +1306,7 @@ pub fn runREPL(
     var context = ReplContext{
         .db = &db,
         .io = io,
+        .options = &options,
         .switcher = &switcher,
         .scanner = &interactive_scanner,
         .last_query = &last_query,
@@ -1363,7 +1402,7 @@ test "connection banner shows connection and version details" {
 test "history entry folds multiline query outside strings" {
     const entry = try formatHistoryEntry(std.testing.allocator, .{
         .sql = "select\n'kept\nnewline'\nfrom dual",
-        .vertical = false,
+        .terminator = .none,
     }, ";");
     defer std.testing.allocator.free(entry);
 
@@ -1373,21 +1412,27 @@ test "history entry folds multiline query outside strings" {
 test "history entry ends with the delimiter in effect" {
     const entry = try formatHistoryEntry(std.testing.allocator, .{
         .sql = "create procedure p() begin select 1; end",
-        .vertical = false,
+        .terminator = .none,
     }, "$$");
     defer std.testing.allocator.free(entry);
 
     try std.testing.expectEqualStrings("create procedure p() begin select 1; end$$", entry);
 }
 
-test "history entry keeps vertical terminator" {
-    const entry = try formatHistoryEntry(std.testing.allocator, .{
+test "history entry keeps vertical and ndjson terminators" {
+    const vertical = try formatHistoryEntry(std.testing.allocator, .{
         .sql = "select 1",
-        .vertical = true,
+        .terminator = .vertical,
     }, ";");
-    defer std.testing.allocator.free(entry);
+    defer std.testing.allocator.free(vertical);
+    try std.testing.expectEqualStrings("select 1\\G", vertical);
 
-    try std.testing.expectEqualStrings("select 1\\G", entry);
+    const ndjson = try formatHistoryEntry(std.testing.allocator, .{
+        .sql = "select 1",
+        .terminator = .ndjson,
+    }, ";");
+    defer std.testing.allocator.free(ndjson);
+    try std.testing.expectEqualStrings("select 1\\J", ndjson);
 }
 
 test "editor initial query prefers pending input over last query" {

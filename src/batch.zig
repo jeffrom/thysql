@@ -1,26 +1,58 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ClientCommand = @import("client_command.zig");
+const Options = @import("options.zig");
+
+/// The result format that a statement's `\G` or `\J` terminator asks for. `none` leaves the
+/// format to the output flags.
+pub const Terminator = enum {
+    none,
+    vertical,
+    ndjson,
+
+    pub fn format(self: Terminator) ?Options.ResultFormat {
+        return switch (self) {
+            .none => null,
+            .vertical => .vertical,
+            .ndjson => .ndjson,
+        };
+    }
+
+    /// The text that ends a statement with this terminator, or null for the delimiter.
+    pub fn text(self: Terminator) ?[]const u8 {
+        return switch (self) {
+            .none => null,
+            .vertical => "\\G",
+            .ndjson => "\\J",
+        };
+    }
+};
 
 pub const Query = struct {
     sql: []const u8,
-    vertical: bool,
+    terminator: Terminator,
     /// Line where the statement starts (1-based), for error messages.
     line: usize = 0,
 };
 
 pub fn parseQueryInput(line: []const u8) Query {
     var sql = std.mem.trim(u8, line, " \t\r\n");
-    var vertical = false;
+    var terminator: Terminator = .none;
 
-    if (sql.len >= 2 and sql[sql.len - 2] == '\\' and sql[sql.len - 1] == 'G') {
-        vertical = true;
+    if (sql.len >= 2 and sql[sql.len - 2] == '\\') {
+        terminator = switch (sql[sql.len - 1]) {
+            'G' => .vertical,
+            'J' => .ndjson,
+            else => .none,
+        };
+    }
+    if (terminator != .none) {
         sql = std.mem.trim(u8, sql[0 .. sql.len - 2], " \t\r\n");
     }
 
     return .{
         .sql = sql,
-        .vertical = vertical,
+        .terminator = terminator,
     };
 }
 
@@ -233,7 +265,7 @@ pub const Scanner = struct {
                     self.reset();
                     return false;
                 }
-                if (byte == 'G') {
+                if (byte == 'G' or byte == 'J') {
                     try self.buffer.append(allocator, byte);
                     self.state = .normal;
                     return true;
@@ -816,18 +848,24 @@ pub fn run(
     return if (session.had_error) 1 else 0;
 }
 
-test "parse vertical query terminator" {
+test "parse \\G and \\J query terminators" {
     var query = parseQueryInput("select 1\\G");
     try std.testing.expectEqualStrings("select 1", query.sql);
-    try std.testing.expect(query.vertical);
+    try std.testing.expectEqual(Terminator.vertical, query.terminator);
 
     query = parseQueryInput("  select 1  \\G  ");
     try std.testing.expectEqualStrings("select 1", query.sql);
-    try std.testing.expect(query.vertical);
+    try std.testing.expectEqual(Terminator.vertical, query.terminator);
+
+    query = parseQueryInput("select 1\\J");
+    try std.testing.expectEqualStrings("select 1", query.sql);
+    try std.testing.expectEqual(Terminator.ndjson, query.terminator);
 
     query = parseQueryInput("select 1;");
     try std.testing.expectEqualStrings("select 1;", query.sql);
-    try std.testing.expect(!query.vertical);
+    try std.testing.expectEqual(Terminator.none, query.terminator);
+    try std.testing.expectEqual(@as(?Options.ResultFormat, null), query.terminator.format());
+    try std.testing.expectEqual(@as(?Options.ResultFormat, .ndjson), parseQueryInput("select 1\\J").terminator.format());
 }
 
 test "scanner splits statements outside strings and comments" {
@@ -879,19 +917,31 @@ test "scanner splits slash command terminators outside strings" {
             saw_vertical = true;
             const query = scanner.pendingQuery();
             try std.testing.expectEqualStrings("select 1", query.sql);
-            try std.testing.expect(query.vertical);
+            try std.testing.expectEqual(Terminator.vertical, query.terminator);
             scanner.reset();
         }
     }
     try std.testing.expect(saw_vertical);
 
+    var saw_ndjson = false;
+    for ("select 2\\J") |byte| {
+        if (try scanner.feed(std.testing.allocator, byte)) {
+            saw_ndjson = true;
+            const query = scanner.pendingQuery();
+            try std.testing.expectEqualStrings("select 2", query.sql);
+            try std.testing.expectEqual(Terminator.ndjson, query.terminator);
+            scanner.reset();
+        }
+    }
+    try std.testing.expect(saw_ndjson);
+
     var saw_regular = false;
-    for ("select 2\\g") |byte| {
+    for ("select 3\\g") |byte| {
         if (try scanner.feed(std.testing.allocator, byte)) {
             saw_regular = true;
             const query = scanner.pendingQuery();
-            try std.testing.expectEqualStrings("select 2", query.sql);
-            try std.testing.expect(!query.vertical);
+            try std.testing.expectEqualStrings("select 3", query.sql);
+            try std.testing.expectEqual(Terminator.none, query.terminator);
             scanner.reset();
         }
     }
