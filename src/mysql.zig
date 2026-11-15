@@ -5,6 +5,8 @@ const C = @import("mysql_c");
 const Unicode = @import("unicode.zig");
 const Options = @import("options.zig");
 const Password = @import("password.zig");
+const CsvOutput = @import("csv_output.zig");
+const JsonOutput = @import("json_output.zig");
 
 const maxTableColumnDisplayWidth: usize = 1024;
 const crServerGoneError: u32 = 2006;
@@ -749,6 +751,106 @@ pub fn render_script_result(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_r
         // Until the JSON and CSV writers are wired in, these fail instead of printing another format.
         .json, .ndjson, .csv => return error.ResultFormatNotYetSupported,
     }
+}
+
+/// Settings for `renderResultAs`. Each format reads only the fields it needs.
+pub const RenderOptions = struct {
+    /// Allocates the JSON key names, which need room for renamed duplicate columns.
+    allocator: Allocator,
+    /// Table, tab and CSV output write the column names first. False for `-N`.
+    column_names: bool = true,
+    /// Tab output writes values unescaped, as with `-r`.
+    raw: bool = false,
+    /// Receives one warning per JSON result set that had duplicate column names. Null drops it.
+    stderr: ?*std.Io.Writer = null,
+};
+
+/// Renders one result set in any format, without a footer and without skipping empty
+/// results. `json` writes `[]` for no rows, `ndjson` writes nothing, and `csv` writes
+/// only the header. `table`, `tab` and `vertical` keep their own output.
+pub fn renderResultAs(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, format: Options.ResultFormat, options: RenderOptions) !void {
+    switch (format) {
+        .table => try render_result_columns(out, result, options.column_names),
+        .tab => try render_result_tab(out, result, options.column_names, options.raw),
+        .vertical => try render_result_vertical(out, result),
+        .json => try renderJsonArray(out, result, options),
+        .ndjson => try renderNdjson(out, result, options),
+        .csv => try renderCsv(out, result, options),
+    }
+}
+
+/// One JSON array of row objects, `[{...},{...}]`, on one line and ending with a newline.
+fn renderJsonArray(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, options: RenderOptions) !void {
+    const fields = resultFields(result);
+    const keys = try JsonOutput.columnKeys(options.allocator, fields);
+    defer keys.deinit(options.allocator);
+    try warnRenamedKeys(options, keys.renamed);
+
+    try out.writeByte('[');
+    var rowCount: usize = 0;
+    while (C.mysql_fetch_row(result)) |row| {
+        if (row == null) {
+            break;
+        }
+        if (rowCount > 0) {
+            try out.writeByte(',');
+        }
+        try JsonOutput.writeRowObject(out, keys.names, fields, row, C.mysql_fetch_lengths(result));
+        rowCount += 1;
+    }
+    try out.writeAll("]\n");
+    try out.flush();
+}
+
+/// One JSON object per row, each on its own line. An empty result writes nothing.
+fn renderNdjson(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, options: RenderOptions) !void {
+    const fields = resultFields(result);
+    const keys = try JsonOutput.columnKeys(options.allocator, fields);
+    defer keys.deinit(options.allocator);
+    try warnRenamedKeys(options, keys.renamed);
+
+    while (C.mysql_fetch_row(result)) |row| {
+        if (row == null) {
+            break;
+        }
+        try JsonOutput.writeRowObject(out, keys.names, fields, row, C.mysql_fetch_lengths(result));
+        try out.writeByte('\n');
+    }
+    try out.flush();
+}
+
+/// RFC 4180 rows, with the column names on the first line unless `column_names` is false.
+fn renderCsv(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, options: RenderOptions) !void {
+    const fields = resultFields(result);
+    if (options.column_names) {
+        try CsvOutput.writeHeader(out, fields);
+    }
+
+    while (C.mysql_fetch_row(result)) |row| {
+        if (row == null) {
+            break;
+        }
+        try CsvOutput.writeRow(out, fields, row, C.mysql_fetch_lengths(result));
+    }
+    try out.flush();
+}
+
+/// The result's column descriptions, one per column, in order.
+fn resultFields(result: [*c]C.struct_st_mysql_res) []C.struct_st_mysql_field {
+    const count: usize = C.mysql_num_fields(result);
+    return C.mysql_fetch_fields(result)[0..count];
+}
+
+fn warnRenamedKeys(options: RenderOptions, renamed: usize) !void {
+    if (renamed == 0) {
+        return;
+    }
+    const stderr = options.stderr orelse return;
+    try stderr.print("warning: {} duplicate column name{s} given a suffix in JSON output\n", .{
+        renamed,
+        if (renamed == 1) "" else "s",
+    });
+    try stderr.flush();
 }
 
 /// Writes a value with the escaping mysql.cc uses for --batch output. With
@@ -1581,6 +1683,140 @@ test "table output without column names omits the header" {
         \\+---+
         \\
     );
+}
+
+fn expectRenderedAs(result: *C.struct_st_mysql_res, format: Options.ResultFormat, options: RenderOptions, expect: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = writer.toArrayList();
+
+    try renderResultAs(&writer.writer, result, format, options);
+
+    try std.testing.expectEqualStrings(expect, writer.written());
+}
+
+test "renderResultAs writes json as one array and [] when empty" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("id", 1, C.MYSQL_TYPE_LONGLONG),
+        mysqlField("name", 1, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row2_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row2_storage, "2", "grace, rear admiral");
+    var row1_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row1_storage, "1", "ada");
+    var row2 = mysqlRow(&row2_storage, null);
+    var row1 = mysqlRow(&row1_storage, &row2);
+    var data = mysqlData(&row1, 2, fields.len);
+    var result = mysqlResult(&fields, &data, &row1_storage.lengths);
+
+    try expectRenderedAs(&result, .json, .{ .allocator = std.testing.allocator },
+        \\[{"id":1,"name":"ada"},{"id":2,"name":"grace, rear admiral"}]
+        \\
+    );
+
+    var empty_data = mysqlData(null, 0, fields.len);
+    var empty_lengths = [_]c_ulong{0};
+    var empty = mysqlResult(&fields, &empty_data, &empty_lengths);
+    try expectRenderedAs(&empty, .json, .{ .allocator = std.testing.allocator }, "[]\n");
+}
+
+test "renderResultAs writes ndjson with one object per line and nothing when empty" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("id", 1, C.MYSQL_TYPE_LONGLONG),
+        mysqlBinaryField("blob", 1, C.MYSQL_TYPE_BLOB),
+        mysqlField("n", 1, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage3 = undefined;
+    initMysqlRowStorage3(&row_storage, "1", "f", null);
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    try expectRenderedAs(&result, .ndjson, .{ .allocator = std.testing.allocator },
+        \\{"id":1,"blob":"Zg==","n":null}
+        \\
+    );
+
+    var empty_data = mysqlData(null, 0, fields.len);
+    var empty_lengths = [_]c_ulong{0};
+    var empty = mysqlResult(&fields, &empty_data, &empty_lengths);
+    try expectRenderedAs(&empty, .ndjson, .{ .allocator = std.testing.allocator }, "");
+}
+
+test "renderResultAs writes csv with a header, quoting, NULL and empty strings" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("a", 1, C.MYSQL_TYPE_VAR_STRING),
+        mysqlField("b", 1, C.MYSQL_TYPE_VAR_STRING),
+        mysqlField("c", 1, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage3 = undefined;
+    initMysqlRowStorage3(&row_storage, "x,y", "", null);
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    try expectRenderedAs(&result, .csv, .{ .allocator = std.testing.allocator },
+        \\a,b,c
+        \\"x,y","",
+        \\
+    );
+    _ = C.mysql_data_seek(&result, 0);
+    try expectRenderedAs(&result, .csv, .{ .allocator = std.testing.allocator, .column_names = false },
+        \\"x,y","",
+        \\
+    );
+}
+
+test "renderResultAs csv writes only the header for an empty result" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("1", 0, C.MYSQL_TYPE_LONG),
+        mysqlField("two", 0, C.MYSQL_TYPE_LONG),
+    };
+    var data = mysqlData(null, 0, fields.len);
+    var lengths = [_]c_ulong{ 0, 0 };
+    var result = mysqlResult(&fields, &data, &lengths);
+
+    try expectRenderedAs(&result, .csv, .{ .allocator = std.testing.allocator }, "1,two\n");
+    try expectRenderedAs(&result, .csv, .{ .allocator = std.testing.allocator, .column_names = false }, "");
+}
+
+test "renderResultAs json suffixes duplicate names and warns once per result set" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("a", 1, C.MYSQL_TYPE_LONG),
+        mysqlField("a", 1, C.MYSQL_TYPE_LONG),
+    };
+    var row_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row_storage, "1", "2");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    const gpa = std.testing.allocator;
+    var warn_buf: std.ArrayList(u8) = .empty;
+    defer warn_buf.deinit(gpa);
+    var warn_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &warn_buf);
+    defer warn_buf = warn_writer.toArrayList();
+
+    try expectRenderedAs(&result, .ndjson, .{ .allocator = gpa, .stderr = &warn_writer.writer },
+        \\{"a":1,"a_2":2}
+        \\
+    );
+    try std.testing.expectEqualStrings("warning: 1 duplicate column name given a suffix in JSON output\n", warn_writer.written());
+}
+
+test "renderResultAs keeps table, tab and vertical output for empty results" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("1", 0, C.MYSQL_TYPE_LONG),
+    };
+    var data = mysqlData(null, 0, fields.len);
+    var lengths = [_]c_ulong{0};
+    var result = mysqlResult(&fields, &data, &lengths);
+
+    try expectRenderedAs(&result, .table, .{ .allocator = std.testing.allocator }, "Empty set\n\n");
+    try expectRenderedAs(&result, .tab, .{ .allocator = std.testing.allocator }, "1\n");
+    try expectRenderedAs(&result, .vertical, .{ .allocator = std.testing.allocator }, "Empty set\n\n");
 }
 
 test "batch error line has the mysql.cc at-line format" {
