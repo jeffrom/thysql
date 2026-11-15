@@ -19,7 +19,7 @@ Do these once, before the first tag.
    Run workflow, on `main`, with `version` set to the version in `build.zig.zon` (`0.1.0` for
    the first release). Or from a shell: `gh workflow run release.yml -f version=0.1.0`.
 
-3. Check that all four build jobs pass: darwin arm64 (`macos-14`), darwin x86_64
+3. Check that all four build jobs pass: darwin arm64 (`macos-15`), darwin x86_64
    (`macos-15-intel`), linux x86_64 and linux arm64 (`ubuntu-22.04-arm`). The `release` job is
    skipped on a manual run by design, so no draft is created.
 

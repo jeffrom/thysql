@@ -134,9 +134,9 @@ run it on the matching OS and architecture. On Linux it builds the dynamic binar
 
 `.github/workflows/ci.yml` runs on pushes to `main`, on pull requests, and on demand:
 
-- `test`: `zig build test` on `macos-14` and `ubuntu-22.04`.
+- `test`: `zig build test` on `macos-15` and `ubuntu-22.04`.
 - `e2e`: `zig build e2e` on `ubuntu-22.04`, with Docker.
-- `static-macos`: `tools/package.sh` for darwin arm64 on `macos-14`, which checks the static
+- `static-macos`: `tools/package.sh` for darwin arm64 on `macos-15`, which checks the static
   linkage and runs the smoke tests.
 
 The release builds are in `.github/workflows/release.yml`, described under releasing.

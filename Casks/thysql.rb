@@ -16,7 +16,7 @@ cask "thysql" do
     strategy :github_latest
   end
 
-  depends_on macos: :sonoma
+  depends_on macos: :sequoia
 
   binary "thysql-#{version}-darwin-#{arch}/thysql"
   bash_completion "thysql-#{version}-darwin-#{arch}/completions/thysql.bash"

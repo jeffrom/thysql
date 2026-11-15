@@ -24,7 +24,7 @@ brew install --cask thysql
 ## Open questions
 
 1. **Minimum macOS.** Homebrew's static `libssl.a` is built for the runner's macOS
-   version, so the binary's floor is the runner's (macOS 14 on `macos-14`). Good
+   version, so the binary's floor is the runner's (macOS 15 on `macos-15`; `macos-14` was retired). Good
    enough, or build OpenSSL from source with a lower `MACOSX_DEPLOYMENT_TARGET`?
 2. **Intel runner.** `macos-13` is retired; use `macos-15-intel` while GitHub
    still offers it. Alternative: cross-compile x86_64 on arm64 — fails today
