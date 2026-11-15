@@ -150,7 +150,10 @@ def make_tls_material(directory):
             directory,
         )
     # The server reads its key as the mysql user inside the container, and
-    # the key is a throwaway, so it is made world-readable.
+    # the key is a throwaway, so it is made world-readable. The directory must
+    # be traversable too: mkdtemp makes it 0700, and on Linux the bind mount
+    # keeps that, so the server would start without TLS.
+    os.chmod(directory, 0o755)
     for key in ("server-key.pem", "client-key.pem"):
         os.chmod(os.path.join(directory, key), 0o644)
 
@@ -272,7 +275,11 @@ def _wait_ready(server):
             return
         last_error = result.stderr.strip()
         time.sleep(1)
-    raise RuntimeError(f"{server.name} did not become ready: {last_error}")
+    logs = docker(["logs", "--tail", "30", server.container], check=False)
+    raise RuntimeError(
+        f"{server.name} did not become ready: {last_error}\n"
+        f"last server log lines:\n{(logs.stdout + logs.stderr).strip()}"
+    )
 
 
 def _seed(server):
