@@ -171,6 +171,32 @@ pub fn writeRowObject(
     try out.writeByte('}');
 }
 
+/// Like `writeRowObject`, with one member per line. Members are indented four spaces and the
+/// closing brace two, so the object sits inside a pretty-printed array. No newline at the end.
+pub fn writePrettyRowObject(
+    out: *std.Io.Writer,
+    keys: []const []u8,
+    fields: []const C.struct_st_mysql_field,
+    row: C.MYSQL_ROW,
+    lengths: [*c]c_ulong,
+) !void {
+    try out.writeByte('{');
+    for (keys, 0..) |key, i| {
+        if (i > 0) {
+            try out.writeByte(',');
+        }
+        try out.writeAll("\n    ");
+        try writeString(out, key);
+        try out.writeAll(": ");
+        const value: ?[]const u8 = if (row[i] == null) null else row[i][0..lengths[i]];
+        try writeValue(out, &fields[i], value);
+    }
+    if (keys.len > 0) {
+        try out.writeAll("\n  ");
+    }
+    try out.writeByte('}');
+}
+
 fn expectValue(field: *const C.struct_st_mysql_field, value: ?[]const u8, expected: []const u8) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
@@ -338,4 +364,26 @@ test "writeRowObject writes one object with NULL and escaped keys" {
         "{\"id\":1,\"a\":\"x\\\"y\",\"a_2\":\"2.50\",\"b\":\"Zg==\",\"n\":null}",
         writer.written(),
     );
+}
+
+test "writePrettyRowObject puts each member on its own line" {
+    var fields = [_]C.struct_st_mysql_field{
+        Mysql.mysqlField("id", 0, C.MYSQL_TYPE_LONGLONG),
+        Mysql.mysqlField("name", 0, C.MYSQL_TYPE_VAR_STRING),
+    };
+    const keys = try columnKeys(std.testing.allocator, &fields);
+    defer keys.deinit(std.testing.allocator);
+
+    var id = "7".*;
+    var name = "ada".*;
+    var row = [_][*c]u8{ &id, &name };
+    var lengths = [_]c_ulong{ 1, 3 };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    defer buf = writer.toArrayList();
+
+    try writePrettyRowObject(&writer.writer, keys.names, &fields, &row, &lengths);
+    try std.testing.expectEqualStrings("{\n    \"id\": 7,\n    \"name\": \"ada\"\n  }", writer.written());
 }

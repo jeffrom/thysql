@@ -749,6 +749,8 @@ pub const RenderOptions = struct {
     stderr: ?*std.Io.Writer = null,
     /// NDJSON flushes after each row, so a reader on a pipe sees rows as they arrive.
     flush_rows: bool = false,
+    /// JSON prints one member per line, indented, as the REPL does. False is compact.
+    pretty: bool = false,
 };
 
 /// Renders one result for batch and -e input. As in mysql.cc, table, tab and vertical
@@ -792,6 +794,7 @@ pub fn renderResultAs(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, fo
 }
 
 /// One JSON array of row objects, `[{...},{...}]`, on one line and ending with a newline.
+/// With `pretty`, each object is indented on its own lines inside the array.
 fn renderJsonArray(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, options: RenderOptions) !void {
     const fields = resultFields(result);
     const keys = try JsonOutput.columnKeys(options.allocator, fields);
@@ -807,8 +810,16 @@ fn renderJsonArray(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, optio
         if (rowCount > 0) {
             try out.writeByte(',');
         }
-        try JsonOutput.writeRowObject(out, keys.names, fields, row, C.mysql_fetch_lengths(result));
+        if (options.pretty) {
+            try out.writeAll("\n  ");
+            try JsonOutput.writePrettyRowObject(out, keys.names, fields, row, C.mysql_fetch_lengths(result));
+        } else {
+            try JsonOutput.writeRowObject(out, keys.names, fields, row, C.mysql_fetch_lengths(result));
+        }
         rowCount += 1;
+    }
+    if (options.pretty and rowCount > 0) {
+        try out.writeByte('\n');
     }
     try out.writeAll("]\n");
     try out.flush();
@@ -1088,7 +1099,8 @@ pub fn render_result_vertical_timed_with_warnings(out: *std.Io.Writer, result: [
     try render_result_footer(out, result, elapsed_ns, warnings);
 }
 
-fn render_result_footer(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96, warnings: u32) !void {
+/// The footer line after a result set, `N rows in set (time)`, with a blank line after it.
+pub fn render_result_footer(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96, warnings: u32) !void {
     const rows = C.mysql_num_rows(result);
     try out.print("{} {s} in set", .{ rows, if (rows == 1) "row" else "rows" });
     try renderWarningCount(out, warnings);
@@ -1846,6 +1858,40 @@ test "renderResultAs writes json as one array and [] when empty" {
     var empty_lengths = [_]c_ulong{0};
     var empty = mysqlResult(&fields, &empty_data, &empty_lengths);
     try expectRenderedAs(&empty, .json, .{ .allocator = std.testing.allocator }, "[]\n");
+}
+
+test "renderResultAs writes pretty json with one member per line" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("id", 1, C.MYSQL_TYPE_LONGLONG),
+        mysqlField("name", 1, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row2_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row2_storage, "2", "grace");
+    var row1_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row1_storage, "1", "ada");
+    var row2 = mysqlRow(&row2_storage, null);
+    var row1 = mysqlRow(&row1_storage, &row2);
+    var data = mysqlData(&row1, 2, fields.len);
+    var result = mysqlResult(&fields, &data, &row1_storage.lengths);
+
+    try expectRenderedAs(&result, .json, .{ .allocator = std.testing.allocator, .pretty = true },
+        \\[
+        \\  {
+        \\    "id": 1,
+        \\    "name": "ada"
+        \\  },
+        \\  {
+        \\    "id": 2,
+        \\    "name": "grace"
+        \\  }
+        \\]
+        \\
+    );
+
+    var empty_data = mysqlData(null, 0, fields.len);
+    var empty_lengths = [_]c_ulong{0};
+    var empty = mysqlResult(&fields, &empty_data, &empty_lengths);
+    try expectRenderedAs(&empty, .json, .{ .allocator = std.testing.allocator, .pretty = true }, "[]\n");
 }
 
 test "renderResultAs writes ndjson with one object per line and nothing when empty" {
