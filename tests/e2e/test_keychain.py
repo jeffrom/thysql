@@ -122,7 +122,7 @@ class KeychainTests(E2ETestCase):
                 session.expect("Enter password: ")
                 session.send(ROOT_PASSWORD + ENTER)
                 session.expect("Welcome to thysql.")
-                session.expect(f"{ROOT_USER}@127.0.0.1:{server.port}/{TEST_DB}> ")
+                session.expect(f"{ACCOUNT}/{TEST_DB}> ")
                 session.send("\x04")
                 self.assertEqual(session.wait_exit(), 0)
 
