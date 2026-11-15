@@ -1446,6 +1446,7 @@ test {
         @import("completion_script.zig"),
         @import("connections.zig"),
         @import("history_file.zig"),
+        @import("json_output.zig"),
         @import("mysql.zig"),
         @import("option_file.zig"),
         @import("options.zig"),
