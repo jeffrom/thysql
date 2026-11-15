@@ -127,7 +127,7 @@ pub const specs = [_]Spec{
     .{ .id = .protocol, .long = "protocol", .arg = .required, .arg_name = "name", .group = .connection, .help = "Connection protocol: tcp or socket. Socket applies only to host localhost." },
     .{ .id = .connect_timeout, .long = "connect-timeout", .arg = .required, .arg_name = "#", .group = .connection, .help = "Seconds to wait for the connection to open. Defaults to the library's timeout." },
     .{ .id = .connection, .long = "connection", .short = 'C', .arg = .required, .arg_name = "name", .group = .connection, .help = "Connect with a saved connection from ~/.config/thysql/connections." },
-    .{ .id = .auth_command, .long = "auth-command", .arg = .required, .arg_name = "command", .group = .connection, .help = "Run this shell command to get the password, on every connect and reconnect." },
+    .{ .id = .auth_command, .long = "auth-command", .arg = .required, .arg_name = "command", .group = .connection, .help = "Run this shell command on every connect. It prints the password, or a JSON object of connection settings." },
     .{ .id = .keychain, .long = "keychain", .group = .connection, .help = "Get the password from the macOS keychain, for the connection name or --keychain-account." },
     .{ .id = .keychain_account, .long = "keychain-account", .arg = .required, .arg_name = "name", .group = .connection, .help = "Keychain account for the password. Defaults to the connection name." },
     .{ .id = .ssl, .long = "ssl", .arg = .optional, .group = .connection, .help = "Use TLS when the server offers it. This is the default." },
@@ -1316,6 +1316,7 @@ test "usage puts the help of a long flag on the line after it" {
     const text = out.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, text, "      --auth-command=command\n" ++ "                            " ++ "Run this shell command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "It prints the password, or a JSON object of connection settings.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "      --skip-ssl-verify-server-cert\n" ++ "                            " ++ "Do not verify") != null);
     // A short flag fits, so its help stays on the same line.
     try std.testing.expect(std.mem.indexOf(u8, text, "  -C, --connection=name     Connect with") != null);
