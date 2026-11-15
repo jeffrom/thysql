@@ -1,0 +1,174 @@
+# Builds the release tarballs for a tag (v<version>) on macOS and Linux, then creates a draft
+# GitHub release with them and SHA256SUMS. A workflow_dispatch run builds and verifies only,
+# so it can be used as a dry run.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, without the v (must match build.zig.zon)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version against build.zig.zon
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            version=${GITHUB_REF_NAME#v}
+          else
+            version=$INPUT_VERSION
+          fi
+          manifest=$(sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' build.zig.zon)
+          if [ -z "$manifest" ]; then
+            echo "could not read .version from build.zig.zon" >&2
+            exit 1
+          fi
+          if [ "$version" != "$manifest" ]; then
+            echo "version $version does not match build.zig.zon .version $manifest" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $version"
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: darwin
+            arch: arm64
+            runner: macos-14
+          - os: darwin
+            arch: x86_64
+            runner: macos-15-intel
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-22.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      PKG_OS: ${{ matrix.os }}
+      PKG_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libzstd-dev libkrb5-dev
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          for formula in openssl@3 zstd cmake; do
+            brew list --versions "$formula" >/dev/null 2>&1 || brew install "$formula"
+          done
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
+        # Pass the library dirs explicitly, so the build never picks up /opt/homebrew/lib.
+        run: |
+          zig build test \
+            -Dopenssl-lib-dir="$(brew --prefix openssl@3)/lib" \
+            -Dzstd-lib-dir="$(brew --prefix zstd)/lib"
+      - name: Test (Ubuntu)
+        if: runner.os == 'Linux'
+        run: zig build test
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        # package.sh runs the linkage check and the --version and completion smoke tests.
+        run: |
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)" \
+          ZSTD_PREFIX="$(brew --prefix zstd)" \
+          tools/package.sh "$VERSION" "$PKG_OS" "$PKG_ARCH"
+      - name: Package (Ubuntu)
+        if: runner.os == 'Linux'
+        run: tools/package.sh "$VERSION" "$PKG_OS" "$PKG_ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thysql-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    # Dispatch runs stop after build. Only a tag push publishes a (draft) release.
+    needs: [verify, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: thysql-*
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS
+        # Names only, no paths, so `sha256sum -c SHA256SUMS` works after download.
+        run: |
+          cd dist
+          sha256sum thysql-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Write release notes header
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          ## Install
+
+          macOS (Homebrew cask, arm64 or Intel):
+
+          ```sh
+          brew tap jeffrom/thysql https://github.com/jeffrom/thysql
+          brew install --cask thysql
+          ```
+
+          Linux (x86_64 or arm64 tarball). Install the runtime packages first:
+
+          ```sh
+          sudo apt-get install -y libssl3 libzstd1 libkrb5-3 libgssapi-krb5-2
+          ```
+
+          Then untar `thysql-<version>-linux-<arch>.tar.gz` and run
+          `thysql-<version>-linux-<arch>/thysql`.
+          Docker is the option with no runtime dependencies.
+
+          Verify downloads with `sha256sum -c SHA256SUMS`.
+
+          ---
+
+          EOF
+      - name: Create draft release
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --draft \
+            --title "thysql $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --generate-notes
