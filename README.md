@@ -525,8 +525,9 @@ clipboard-max-bytes = 512K
 
 ## prompt
 
-The default prompt is `user@host:port/db> `, or `connection/db> ` when connected
-with `-C` or `\C`. Set another one with `--prompt=fmt`,
+The default prompt is `user@host:port/db> `, or `[connection] db> ` when connected
+with `-C` or `\C`. The brackets set the connection name off from the database. Set
+another one with `--prompt=fmt`,
 the `prompt` command, or `MYSQL_PS1`. The option wins over `MYSQL_PS1`, and
 `prompt` with no argument goes back to `MYSQL_PS1`, or to the default when that
 is not set. Continuation prompts such as `    -> ` do not change.
