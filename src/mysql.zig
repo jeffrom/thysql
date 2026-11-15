@@ -1151,7 +1151,7 @@ fn serializeType(kind: u32, col: [*:0]const u8) ![*:0]const u8 {
     return "";
 }
 
-fn mysqlFieldWithFlags(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_field_types, flags: c_uint) C.struct_st_mysql_field {
+pub fn mysqlFieldWithFlags(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_field_types, flags: c_uint) C.struct_st_mysql_field {
     var field: C.struct_st_mysql_field = std.mem.zeroes(C.struct_st_mysql_field);
     field.name = @constCast(name);
     field.length = @intCast(max_length);
@@ -1162,11 +1162,11 @@ fn mysqlFieldWithFlags(name: [*:0]const u8, max_length: usize, kind: C.enum_enum
     return field;
 }
 
-fn mysqlField(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_field_types) C.struct_st_mysql_field {
+pub fn mysqlField(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_field_types) C.struct_st_mysql_field {
     return mysqlFieldWithFlags(name, max_length, kind, C.NOT_NULL_FLAG);
 }
 
-fn mysqlBinaryField(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_field_types) C.struct_st_mysql_field {
+pub fn mysqlBinaryField(name: [*:0]const u8, max_length: usize, kind: C.enum_enum_field_types) C.struct_st_mysql_field {
     var field = mysqlField(name, max_length, kind);
     field.charsetnr = 63;
     return field;

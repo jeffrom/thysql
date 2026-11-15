@@ -1452,6 +1452,7 @@ test {
         @import("password.zig"),
         @import("prompt.zig"),
         @import("readline.zig"),
+        @import("result_value.zig"),
         @import("sql/keywords.zig"),
         @import("sql/lexer.zig"),
         @import("sql/context.zig"),
