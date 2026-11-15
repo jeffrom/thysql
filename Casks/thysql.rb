@@ -30,5 +30,8 @@ cask "thysql" do
         must_succeed:   false
   end
 
-  zap trash: "~/.config/thysql"
+  zap trash: [
+    "~/.config/thysql",
+    "~/.local/state/thysql",
+  ]
 end
