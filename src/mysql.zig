@@ -24,19 +24,30 @@ pub const ConnectFailure = struct {
     errno: u32 = 0,
     message_buffer: [512]u8 = undefined,
     message_len: usize = 0,
+    hint_buffer: [256]u8 = undefined,
+    hint_len: usize = 0,
 
     pub fn message(self: *const ConnectFailure) []const u8 {
         return self.message_buffer[0..self.message_len];
     }
 
-    /// Prints the failure as mysql.cc's put_error does. `line` adds the "at line N" suffix that
-    /// batch input uses.
+    /// The hint for a failed connect, or "" when there is none. It is set when the password came
+    /// from an auth command whose output started with "{" but did not parse as JSON.
+    pub fn hint(self: *const ConnectFailure) []const u8 {
+        return self.hint_buffer[0..self.hint_len];
+    }
+
+    /// Prints the failure as mysql.cc's put_error does, then the hint if there is one. `line` adds
+    /// the "at line N" suffix that batch input uses.
     pub fn render(self: *const ConnectFailure, out: *std.Io.Writer, line: ?usize) !void {
         try out.print("ERROR {d} (HY000)", .{self.errno});
         if (line) |number| {
             try out.print(" at line {d}", .{number});
         }
         try out.print(": {s}\n", .{self.message()});
+        if (self.hint_len > 0) {
+            try out.print("{s}\n", .{self.hint()});
+        }
     }
 
     fn record(self: *ConnectFailure, db: *C.struct_st_mysql) void {
@@ -44,6 +55,19 @@ pub const ConnectFailure = struct {
         const text = std.mem.sliceTo(C.mysql_error(db), 0);
         self.message_len = @min(text.len, self.message_buffer.len);
         @memcpy(self.message_buffer[0..self.message_len], text[0..self.message_len]);
+    }
+
+    /// Sets the hint for a connect that used the output of an auth command as its password, after
+    /// the output failed to parse as JSON. `json_error` is null otherwise, which clears the hint.
+    fn setJsonHint(self: *ConnectFailure, json_error: ?anyerror) void {
+        self.hint_len = 0;
+        const err = json_error orelse return;
+        const text = std.fmt.bufPrint(
+            &self.hint_buffer,
+            "auth command output starts with \"{{\" but is not valid JSON ({s}); it was used as the password",
+            .{@errorName(err)},
+        ) catch return;
+        self.hint_len = text.len;
     }
 };
 
@@ -144,6 +168,9 @@ pub const DB = struct {
         return open(allocator, info, &failure) catch |err| {
             if (err == error.ConnectError and !info.quiet_connect_error) {
                 std.debug.print("Connect to database failed: {s}\n", .{failure.message()});
+                if (failure.hint().len > 0) {
+                    std.debug.print("{s}\n", .{failure.hint()});
+                }
             }
             return err;
         };
@@ -672,6 +699,7 @@ fn connectWith(
     const socket = try strings.allocator().dupeSentinel(u8, values.socket, 0);
     const tls = try dupeTls(strings.allocator(), values.tls);
 
+    failure.setJsonHint(if (auth) |output| output.json_error else null);
     const conn = try connect(.{
         .host = host,
         .user = user,
@@ -1675,6 +1703,33 @@ test "a connect failure keeps the message and error number" {
     @memcpy(failure.message_buffer[0..text.len], text);
     failure.errno = 2003;
     try std.testing.expectEqualStrings(text, failure.message());
+}
+
+test "a connect failure after a password line that looked like JSON adds the hint" {
+    var failure: ConnectFailure = .{};
+    failure.errno = 1045;
+    const text = "Access denied for user 'app'@'localhost'";
+    failure.message_len = text.len;
+    @memcpy(failure.message_buffer[0..text.len], text);
+
+    var buffer: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    try failure.render(&out, null);
+    try std.testing.expectEqualStrings("ERROR 1045 (HY000): Access denied for user 'app'@'localhost'\n", out.buffered());
+
+    failure.setJsonHint(error.SyntaxError);
+    var hinted_buffer: [512]u8 = undefined;
+    var hinted: std.Io.Writer = .fixed(&hinted_buffer);
+    try failure.render(&hinted, 3);
+    try std.testing.expectEqualStrings(
+        "ERROR 1045 (HY000) at line 3: Access denied for user 'app'@'localhost'\n" ++
+            "auth command output starts with \"{\" but is not valid JSON (SyntaxError); it was used as the password\n",
+        hinted.buffered(),
+    );
+
+    // A connect whose password came from valid output has no hint.
+    failure.setJsonHint(null);
+    try std.testing.expectEqualStrings("", failure.hint());
 }
 
 test "render query OK with affected rows" {
