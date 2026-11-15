@@ -197,6 +197,30 @@ pub const Tls = struct {
     verify_server_cert: ?bool = null,
 };
 
+/// The connection settings that `--auth-command` JSON can set. A command-line flag
+/// for one of them locks it against the JSON.
+pub const ConnectField = enum {
+    host,
+    port,
+    user,
+    password,
+    database,
+    socket,
+    protocol,
+    ssl,
+    ssl_ca,
+    ssl_capath,
+    ssl_cert,
+    ssl_key,
+    ssl_cipher,
+    ssl_crl,
+    ssl_crlpath,
+    tls_version,
+    ssl_verify_server_cert,
+};
+
+pub const ConnectFieldSet = std.EnumSet(ConnectField);
+
 pub const Options = struct {
     host: []const u8 = "",
     user: []const u8 = "",
@@ -250,6 +274,8 @@ pub const Options = struct {
     parser: bool = true,
     show_help: bool = false,
     show_version: bool = false,
+    /// The options given on the command line, not in files or the environment.
+    cli_set: std.EnumSet(Id) = .{},
 
     pub fn deinit(self: *Options, allocator: Allocator) void {
         if (self.execute) |*text| {
@@ -261,6 +287,16 @@ pub const Options = struct {
     /// The -e statements joined by newlines, or null when -e was not given.
     pub fn executeText(self: *const Options) ?[]const u8 {
         return if (self.execute) |text| text.items else null;
+    }
+
+    /// The connection fields that a command-line flag set, which `--auth-command` JSON may not change.
+    pub fn lockedFields(self: *const Options) ConnectFieldSet {
+        var locked: ConnectFieldSet = .{};
+        var ids = self.cli_set.iterator();
+        while (ids.next()) |id| {
+            locked = locked.unionWith(fieldsSetBy(id));
+        }
+        return locked;
     }
 
     /// Batch mode suppresses footers and uses the batch error format.
@@ -362,6 +398,32 @@ fn setPositionalDatabase(options: *Options, seen_database: *bool, database: []co
     }
     seen_database.* = true;
     options.database = database;
+    options.cli_set.insert(.database);
+}
+
+/// The connection fields that a command-line flag sets. Flags also set the fields they imply:
+/// -P and -S select a protocol, and a TLS path option turns TLS on.
+fn fieldsSetBy(id: Id) ConnectFieldSet {
+    return switch (id) {
+        .host => ConnectFieldSet.initOne(.host),
+        .database => ConnectFieldSet.initOne(.database),
+        .user => ConnectFieldSet.initOne(.user),
+        .password => ConnectFieldSet.initOne(.password),
+        .port => ConnectFieldSet.initMany(&.{ .port, .protocol }),
+        .socket => ConnectFieldSet.initMany(&.{ .socket, .protocol }),
+        .protocol => ConnectFieldSet.initOne(.protocol),
+        .ssl, .skip_ssl => ConnectFieldSet.initOne(.ssl),
+        .ssl_ca => ConnectFieldSet.initMany(&.{ .ssl_ca, .ssl }),
+        .ssl_capath => ConnectFieldSet.initMany(&.{ .ssl_capath, .ssl }),
+        .ssl_cert => ConnectFieldSet.initMany(&.{ .ssl_cert, .ssl }),
+        .ssl_key => ConnectFieldSet.initMany(&.{ .ssl_key, .ssl }),
+        .ssl_cipher => ConnectFieldSet.initMany(&.{ .ssl_cipher, .ssl }),
+        .ssl_crl => ConnectFieldSet.initMany(&.{ .ssl_crl, .ssl }),
+        .ssl_crlpath => ConnectFieldSet.initMany(&.{ .ssl_crlpath, .ssl }),
+        .tls_version => ConnectFieldSet.initMany(&.{ .tls_version, .ssl }),
+        .ssl_verify_server_cert, .skip_ssl_verify_server_cert => ConnectFieldSet.initOne(.ssl_verify_server_cert),
+        else => .{},
+    };
 }
 
 /// Matches a long option name. As in MariaDB, "-" and "_" are interchangeable.
@@ -388,6 +450,7 @@ fn parseLong(allocator: Allocator, options: *Options, args: []const []const u8, 
     const name = if (eq_index) |idx| body[0..idx] else body;
     if (OptionFile.isLeadingOnly(name)) return Error.DefaultsOptionMisplaced;
     const spec = findLong(name) orelse return Error.UnknownOption;
+    options.cli_set.insert(spec.id);
     const inline_value = if (eq_index) |idx| body[idx + 1 ..] else null;
     const value = try argumentValue(spec, args, index, inline_value);
     try apply(allocator, options, spec.id, value);
@@ -398,6 +461,7 @@ fn parseLong(allocator: Allocator, options: *Options, args: []const []const u8, 
 fn parseShortCluster(allocator: Allocator, options: *Options, args: []const []const u8, index: *usize, cluster: []const u8) Error!void {
     for (cluster, 0..) |flag, pos| {
         const spec = findShort(flag) orelse return Error.UnknownOption;
+        options.cli_set.insert(spec.id);
         if (spec.arg == .none) {
             try apply(allocator, options, spec.id, null);
             continue;
@@ -1533,6 +1597,61 @@ test "auth-command sets the password source from a flag and from an option file,
     // The option needs a value.
     const bare = [_][]const u8{ "thysql", "--auth-command" };
     try std.testing.expectError(Error.MissingOptionValue, parse(std.testing.allocator, &bare, &env));
+}
+
+test "a connection field from the command line is locked; the same field from a file is not" {
+    var env = testEnv();
+    defer env.deinit();
+    try env.put("MYSQL_PWD", "env-secret");
+
+    const settings = [_]OptionFile.Setting{
+        .{ .name = "host", .value = "file-host" },
+        .{ .name = "ssl-ca", .value = "/file/ca.pem" },
+    };
+    const file_only = [_][]const u8{"thysql"};
+    var from_file = try parseWithSettings(std.testing.allocator, &file_only, 1, &env, &settings);
+    defer from_file.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), from_file.lockedFields().count());
+
+    const args = [_][]const u8{ "thysql", "-h", "cli-host", "--ssl-ca=/cli/ca.pem", "app" };
+    var from_cli = try parseWithSettings(std.testing.allocator, &args, 1, &env, &settings);
+    defer from_cli.deinit(std.testing.allocator);
+    const locked = from_cli.lockedFields();
+    try std.testing.expect(locked.contains(.host));
+    try std.testing.expect(locked.contains(.database));
+    try std.testing.expect(locked.contains(.ssl_ca));
+    // A path option turns TLS on, so the TLS switch is locked too.
+    try std.testing.expect(locked.contains(.ssl));
+    try std.testing.expect(!locked.contains(.user));
+    try std.testing.expect(!locked.contains(.password));
+}
+
+test "-P and -S lock the protocol they select; --skip-ssl locks TLS; -p locks the password; --auth-command locks nothing" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const port_flag = [_][]const u8{ "thysql", "-P", "3307", "--auth-command=print-json" };
+    var by_port = try parseWithSettings(std.testing.allocator, &port_flag, 1, &env, &.{});
+    defer by_port.deinit(std.testing.allocator);
+    const port_locked = by_port.lockedFields();
+    try std.testing.expect(port_locked.contains(.port));
+    try std.testing.expect(port_locked.contains(.protocol));
+    try std.testing.expect(!port_locked.contains(.host));
+    try std.testing.expect(!port_locked.contains(.password));
+
+    const socket_flag = [_][]const u8{ "thysql", "--skip-ssl", "-S", "/tmp/cli.sock" };
+    var by_socket = try parseWithSettings(std.testing.allocator, &socket_flag, 1, &env, &.{});
+    defer by_socket.deinit(std.testing.allocator);
+    const socket_locked = by_socket.lockedFields();
+    try std.testing.expect(socket_locked.contains(.socket));
+    try std.testing.expect(socket_locked.contains(.protocol));
+    try std.testing.expect(socket_locked.contains(.ssl));
+    try std.testing.expect(!socket_locked.contains(.port));
+
+    const prompt_flag = [_][]const u8{ "thysql", "--password" };
+    var by_prompt = try parseWithSettings(std.testing.allocator, &prompt_flag, 1, &env, &.{});
+    defer by_prompt.deinit(std.testing.allocator);
+    try std.testing.expect(by_prompt.lockedFields().contains(.password));
 }
 
 test "option-file names treat dashes and underscores alike, accept loose-, and ignore unknown names" {
