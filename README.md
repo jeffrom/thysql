@@ -1,26 +1,56 @@
 # thysql
 
-tql -u root -h 127.0.0.1 -p
+```sh
+thysql -u root -h 127.0.0.1 -p
+```
 
 ## install
 
-On macOS, install from this repo's Homebrew cask (`Casks/thysql.rb`):
+Three ways to install. Each release has one tarball per platform and a `SHA256SUMS`
+file, on the [releases page](https://github.com/jeffrom/thysql/releases).
+
+### Homebrew (macOS)
 
 ```sh
 brew tap jeffrom/thysql https://github.com/jeffrom/thysql
 brew install --cask thysql
 ```
 
-The binary is ad-hoc signed and not notarized by Apple. After installing, the cask
-removes the `com.apple.quarantine` attribute from it, so Gatekeeper does not block the
-first run. Bash completion is linked into `$(brew --prefix)/etc/bash_completion.d/`.
+The cask installs the darwin tarball for Apple silicon or Intel. The binary is ad-hoc
+signed and not notarized by Apple. After installing, the cask removes the
+`com.apple.quarantine` attribute, so Gatekeeper does not block the first run. Bash
+completion is linked into `$(brew --prefix)/etc/bash_completion.d/`.
+
+### Linux tarball
+
+Download `thysql-<version>-linux-<arch>.tar.gz` (`x86_64` or `arm64`) and `SHA256SUMS`
+from the release, then check and unpack it:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf thysql-<version>-linux-<arch>.tar.gz
+thysql-<version>-linux-<arch>/thysql --version
+```
+
+The Linux binaries use the system OpenSSL, zstd and Kerberos libraries. On Ubuntu 22.04
+and 24.04, install these first:
+
+```sh
+sudo apt-get install -y libssl3 libzstd1 libkrb5-3 libgssapi-krb5-2
+```
+
+### Build it yourself
+
+Build from source with the steps under [build](#build). The Docker image is the option
+with no runtime dependencies. No image is published, so build it here:
+
+```sh
+docker build -t thysql .
+```
 
 ## dependencies
 
-<!-- zig 0.17.1 -->
-zig 0.16 should be good now
-
-Also needed:
+Building needs Zig 0.17.1, as `build.zig.zon` requires. Also needed:
 
 - CMake
 - OpenSSL headers/libs
@@ -39,9 +69,17 @@ is found on the library search path, or use `-Dzstd-lib-dir=/path/to/lib`.
 git submodule update --init --recursive
 zig build
 zig build test
+zig build run -- -u root -h 127.0.0.1 -p
 ```
 
-CI (`.github/workflows/ci.yml`) runs `zig build test` on macOS and Ubuntu, and `zig build e2e` on Ubuntu.
+Example with the password supplied by the environment:
+
+```sh
+MYSQL_PWD=foo zig build run -- -h 127.0.0.1 -uroot hi
+```
+
+`zig build e2e` runs the end-to-end suite against MySQL 8.4 and MariaDB 11.4 in Docker.
+See [tests/e2e/README.md](tests/e2e/README.md).
 
 The build compiles MariaDB Connector/C from `deps/mariadb-connector-c` and links
 its static `libmysqlclient.a` into `thysql`. MySQL 8 auth plugins
@@ -58,8 +96,8 @@ at the directories that hold `libssl.a`, `libcrypto.a` and `libzstd.a`:
 
 ```sh
 zig build -Doptimize=ReleaseSafe -Dstatic-deps=true \
-  -Dopenssl-lib-dir=/opt/homebrew/opt/openssl@4/lib \
-  -Dzstd-lib-dir=/opt/homebrew/opt/zstd/lib
+  -Dopenssl-lib-dir="$(brew --prefix openssl@3)/lib" \
+  -Dzstd-lib-dir="$(brew --prefix zstd)/lib"
 sh tools/check_linkage.sh zig-out/bin/thysql
 ```
 
@@ -67,48 +105,49 @@ The bundled MariaDB is built against the same OpenSSL root that thysql links. Zi
 back to a shared library when it finds no `.a`, so `tools/check_linkage.sh` fails on macOS
 if anything outside `/System` and `/usr/lib` is loaded.
 
+### docker
+
+```sh
+docker build -t thysql .
+docker run --rm --entrypoint ldd thysql /usr/local/bin/thysql
+```
+
+The image compiles in a stage with the toolchain, then copies the binary into a plain
+Ubuntu 24.04 image with only the runtime libraries.
+
 ### packaging
 
 `tools/package.sh` builds a release tarball for the machine it runs on. On macOS it uses
 the static build above, with OpenSSL and zstd from `OPENSSL_PREFIX` and `ZSTD_PREFIX`
 (default: `brew --prefix openssl@3` and `brew --prefix zstd`). It then checks the linkage,
-ad-hoc signs the binary, runs smoke tests, and writes the tarball and its sha256:
+ad-hoc signs the binary, runs smoke tests, and prints the tarball's sha256:
 
 ```sh
 tools/package.sh 0.1.0 darwin arm64    # writes dist/thysql-0.1.0-darwin-arm64.tar.gz
 ```
 
 The arguments are `<version> <darwin|linux> <arm64|x86_64>`. It does not cross-compile, so
-run it on the matching OS and architecture.
+run it on the matching OS and architecture. On Linux it builds the dynamic binary, and
+`check_linkage.sh` prints its `ldd` output instead of checking the linkage.
 
-Run the app:
+## ci
 
-```sh
-zig build run -- -u root -h 127.0.0.1 -p
-```
+`.github/workflows/ci.yml` runs on pushes to `main`, on pull requests, and on demand:
 
-Example with the password supplied by the environment:
+- `test`: `zig build test` on `macos-14` and `ubuntu-22.04`.
+- `e2e`: `zig build e2e` on `ubuntu-22.04`, with Docker.
+- `static-macos`: `tools/package.sh` for darwin arm64 on `macos-14`, which checks the static
+  linkage and runs the smoke tests.
 
-```sh
-MYSQL_PWD=foo zig build run -- -h 127.0.0.1 -uroot hi
-```
+The release builds are in `.github/workflows/release.yml`, described under releasing.
 
 ## releasing
 
-A release is a tag `vX.Y.Z` that matches `.version` in `build.zig.zon`. Pushing the tag starts
-`.github/workflows/release.yml`, which builds all four tarballs and creates a **draft** GitHub
-release with `SHA256SUMS`. Publish the draft by hand after checking it, then update the cask:
-
-```sh
-tools/release.sh 0.1.0              # version bump, zig build test, commit, annotated tag
-git push origin main v0.1.0         # starts the release workflow
-# wait for the workflow, then publish the draft release on GitHub
-tools/update_cask.sh 0.1.0          # cask version and sha256s from SHA256SUMS, commit
-git push origin main
-```
-
-`tools/release.sh --dry-run` shows what it would do. `tools/update_cask.sh 0.1.0 --sums FILE`
-reads a local `SHA256SUMS` instead of downloading it. Both scripts need a clean tree on `main`.
+A release is a tag `vX.Y.Z` that matches `.version` in `build.zig.zon`. Pushing the tag runs
+`.github/workflows/release.yml`, which builds the four tarballs and a **draft** GitHub release
+with `SHA256SUMS`. `tools/release.sh` and `tools/update_cask.sh` cut the tag and update the
+cask; neither pushes. The full checklist, the first-release steps, the end-to-end checks and
+troubleshooting are in [docs/releasing.md](docs/releasing.md).
 
 ## TLS and sockets
 
@@ -421,12 +460,6 @@ any run of characters, `?` matches one, and case is ignored.
 ```sql
 select concat('line1', char(10), 'line2') as text_value, cast(unhex('0001FF') as binary) as binary_value;
 select concat('safe ', '東京', char(9), 'end') as mixed;
-```
-
-```sh
-docker build --target build -t thysql-build .
-docker build -t thysql-release .
-docker run --rm --entrypoint ldd thysql-release /usr/local/bin/thysql
 ```
 
 ## license
