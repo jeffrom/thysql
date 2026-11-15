@@ -1,0 +1,92 @@
+# Runs the unit tests on macOS and Ubuntu, the end-to-end suite on Ubuntu (Docker),
+# and the macOS release build (tools/package.sh) that checks the static linkage.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same ref cancels the run still in progress for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libzstd-dev libkrb5-dev
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          for formula in openssl@3 zstd cmake; do
+            brew list --versions "$formula" >/dev/null 2>&1 || brew install "$formula"
+          done
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
+        # Pass the library dirs explicitly, so the build never picks up /opt/homebrew/lib.
+        run: |
+          zig build test \
+            -Dopenssl-lib-dir="$(brew --prefix openssl@3)/lib" \
+            -Dzstd-lib-dir="$(brew --prefix zstd)/lib"
+      - name: Test (Ubuntu)
+        if: runner.os == 'Linux'
+        run: zig build test
+
+  e2e:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libzstd-dev libkrb5-dev
+      # The harness starts mysql:8.4 and mariadb:11.4 with the runner's Docker.
+      - name: End-to-end tests
+        run: zig build e2e
+
+  static-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          for formula in openssl@3 zstd cmake; do
+            brew list --versions "$formula" >/dev/null 2>&1 || brew install "$formula"
+          done
+      # Release build with static OpenSSL and zstd, the linkage check and the smoke tests.
+      - name: Package (darwin arm64)
+        run: tools/package.sh 0.0.0-ci darwin arm64
