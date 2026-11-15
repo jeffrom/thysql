@@ -6,6 +6,7 @@ change between connects. The reconnect tests drop the connection with KILL from 
 second client, as test_reconnect.py does.
 """
 
+import json
 import os
 import re
 import shlex
@@ -19,6 +20,7 @@ from harness import (
     E2ETestCase,
     password_env,
     run_thysql,
+    tls_material,
 )
 
 ENTER = "\r"
@@ -46,14 +48,34 @@ class AuthCommandTests(E2ETestCase):
         # Logs the context, fails while the flag file exists, and otherwise prints the password file.
         self.script = self.write_script(
             "auth.sh",
-            f"printf '%s|%s|%s|%s|%s\\n' \"$THYSQL_REASON\" \"$THYSQL_HOST\" \"$THYSQL_PORT\" "
-            f"\"$THYSQL_USER\" \"$THYSQL_CONNECTION\" >> {shlex.quote(self.log_path)}\n"
-            f"if [ -e {shlex.quote(self.fail_flag)} ]; then\n"
+            self.log_context()
+            + f"if [ -e {shlex.quote(self.fail_flag)} ]; then\n"
             "  echo 'auth backend is down' >&2\n"
             "  exit 3\n"
             "fi\n"
             f"cat {shlex.quote(self.password_path)}\n",
         )
+
+    def log_context(self):
+        """The shell line that appends the context of a connect to the log."""
+        return (
+            f"printf '%s|%s|%s|%s|%s\\n' \"$THYSQL_REASON\" \"$THYSQL_HOST\" \"$THYSQL_PORT\" "
+            f"\"$THYSQL_USER\" \"$THYSQL_CONNECTION\" >> {shlex.quote(self.log_path)}\n"
+        )
+
+    def output_command(self, text):
+        """A command that logs its context and then prints `text`, which may be JSON."""
+        output_path = os.path.join(self.home, "auth-output")
+        with open(output_path, "w") as handle:
+            handle.write(text)
+        return self.write_script("auth-output.sh", self.log_context() + f"cat {shlex.quote(output_path)}\n")
+
+    def json_command(self, settings):
+        return self.output_command(json.dumps(settings))
+
+    def forget_log(self):
+        if os.path.exists(self.log_path):
+            os.remove(self.log_path)
 
     def clear_fail_flag(self):
         if os.path.exists(self.fail_flag):
@@ -303,6 +325,148 @@ class AuthCommandTests(E2ETestCase):
                 self.clear_fail_flag()
                 session.send("select 9 as nine;" + ENTER)
                 self.assertRegex(session.expect("1 row in set"), r"\|\s*9\s*\|")
+                session.expect(main_prompt(server))
+                self.finish(session)
+                os.remove(self.log_path)
+
+    def test_json_settings_supply_the_user_and_password(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.forget_log()
+                command = self.json_command({"user": AUTH_USER, "password": AUTH_PASSWORD})
+                result = self.invoke(
+                    ["-h", "127.0.0.1", "-P", str(server.port), f"--auth-command={command}",
+                     "-e", "select current_user() as who", TEST_DB],
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"{AUTH_USER}@", result.stdout)
+                self.assertNotIn(AUTH_PASSWORD, result.stdout + result.stderr)
+                # THYSQL_* are the values before the JSON, so the user is the environment's, not AUTH_USER.
+                lines = self.log_lines()
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].startswith(f"connect|127.0.0.1|{server.port}|"), lines)
+                os.remove(self.log_path)
+
+    def test_json_port_fixes_a_wrong_port_in_the_connection_file(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.forget_log()
+                self.write_connection(
+                    "local",
+                    f"host = 127.0.0.1\nport = 1\nuser = {ROOT_USER}\n"
+                    f"database = {TEST_DB}\nauth-command = {self.json_command({'port': server.port, 'password': ROOT_PASSWORD})}\n",
+                )
+                result = self.invoke(["-C", "local", "-e", "select 1 as one"])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "one\n1\n")
+                # THYSQL_PORT is the file's port: the command sees the value before the JSON.
+                self.assertEqual(self.log_lines(), ["connect|127.0.0.1|1|root|local"])
+                os.remove(self.log_path)
+                os.remove(os.path.join(self.home, ".config", "thysql", "connections", "local"))
+
+    def test_connection_file_with_json_settings_supplies_port_user_and_password(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.forget_log()
+                command = self.json_command({"port": server.port, "user": ROOT_USER, "password": ROOT_PASSWORD})
+                self.write_connection(
+                    "remote",
+                    f"host = 127.0.0.1\ndatabase = {TEST_DB}\nauth-command = {command}\n",
+                )
+                result = self.invoke(["-C", "remote", "-e", "select current_user() as who"])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("root@", result.stdout)
+                lines = self.log_lines()
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].startswith("connect|127.0.0.1|"), lines)
+                self.assertTrue(lines[0].endswith("|remote"), lines)
+                os.remove(self.log_path)
+                os.remove(os.path.join(self.home, ".config", "thysql", "connections", "remote"))
+
+    def test_command_line_user_wins_over_the_json_user(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                # The JSON user is AUTH_USER. The password is root's, so the connect succeeds only as root.
+                command = self.json_command({"user": AUTH_USER, "password": ROOT_PASSWORD})
+                result = self.invoke(
+                    server.connect_args(ROOT_USER) + [f"--auth-command={command}", "-e", "select current_user() as who", TEST_DB],
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("root@", result.stdout)
+                self.assertNotIn(AUTH_USER, result.stdout)
+                os.remove(self.log_path)
+
+    def test_unknown_json_key_fails_the_connect(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                command = self.json_command({"hostname": "db.example", "password": ROOT_PASSWORD})
+                result = self.invoke(server.connect_args(ROOT_USER) + [f"--auth-command={command}", "-e", "select 1", TEST_DB])
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn('auth command: unknown key "hostname"', result.stderr)
+                self.assertNotIn(ROOT_PASSWORD, result.stdout + result.stderr)
+
+    def test_underscore_key_in_the_json_is_ignored(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                command = self.json_command({"_expires": "2030-01-01T00:00:00Z", "password": ROOT_PASSWORD})
+                result = self.invoke(server.connect_args(ROOT_USER) + [f"--auth-command={command}", "-e", "select 1 as one", TEST_DB])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "one\n1\n")
+                os.remove(self.log_path)
+
+    def test_json_looking_password_line_gets_the_hint_when_the_connect_fails(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                command = self.output_command("{not json\n")
+                result = self.invoke(server.connect_args(ROOT_USER) + [f"--auth-command={command}", "-e", "select 1", TEST_DB])
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("Access denied", result.stdout + result.stderr)
+                self.assertIn('auth command output starts with "{" but is not valid JSON', result.stderr)
+                self.assertIn("it was used as the password", result.stderr)
+                self.assertNotIn(ROOT_PASSWORD, result.stdout + result.stderr)
+                os.remove(self.log_path)
+
+    def test_reconnect_runs_the_command_again_and_keeps_the_database_from_use(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.forget_log()
+                command = self.json_command({"user": ROOT_USER, "password": ROOT_PASSWORD})
+                session = self.interactive(
+                    server.connect_args(ROOT_USER) + [*PLAINTEXT, f"--auth-command={command}", TEST_DB], env={}
+                )
+                session.expect("Welcome to thysql.")
+                first = self.current_connection_id(session, server)
+
+                session.send("use mysql;" + ENTER)
+                session.expect(main_prompt(server, database="mysql"))
+                self.kill_from_another_client(server, first)
+
+                session.send("select database() as db;" + ENTER)
+                text = session.expect("1 row in set")
+                self.assertIn("No connection. Trying to reconnect...", text)
+                self.assertRegex(text, r"\|\s*mysql\s*\|")
+                session.expect(main_prompt(server, database="mysql"))
+                self.finish(session)
+
+                self.assertEqual(
+                    self.log_lines(),
+                    [f"connect|127.0.0.1|{server.port}|root|", f"reconnect|127.0.0.1|{server.port}|root|"],
+                )
+                os.remove(self.log_path)
+
+    def test_tls_ca_from_the_json_turns_tls_on(self):
+        material = tls_material()
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                command = self.json_command({"ssl-ca": material.ca, "password": ROOT_PASSWORD})
+                session = self.interactive(
+                    server.connect_args(ROOT_USER) + [f"--auth-command={command}", TEST_DB], env={}
+                )
+                session.expect("Welcome to thysql.")
+                session.expect(main_prompt(server))
+                session.send("\\s" + ENTER)
+                text = session.expect("Connection:")
+                self.assertRegex(text, r"SSL:\s+Cipher in use is \S+")
                 session.expect(main_prompt(server))
                 self.finish(session)
                 os.remove(self.log_path)
