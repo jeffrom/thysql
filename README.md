@@ -2,6 +2,19 @@
 
 tql -u root -h 127.0.0.1 -p
 
+## install
+
+On macOS, install from this repo's Homebrew cask (`Casks/thysql.rb`):
+
+```sh
+brew tap jeffrom/thysql https://github.com/jeffrom/thysql
+brew install --cask thysql
+```
+
+The binary is ad-hoc signed and not notarized by Apple. After installing, the cask
+removes the `com.apple.quarantine` attribute from it, so Gatekeeper does not block the
+first run. Bash completion is linked into `$(brew --prefix)/etc/bash_completion.d/`.
+
 ## dependencies
 
 <!-- zig 0.17.1 -->
