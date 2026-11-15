@@ -31,7 +31,7 @@ These were settled with the user. Do not revisit them.
 | Shells | bash only for now, through `thysql completion bash`. The subcommand takes a shell name so that zsh and fish can be added later. |
 | Server-backed completion | `thysql complete` connects without interaction, with a short connect timeout. If it would need a password prompt, or the connect fails, it prints no candidates and exits 0. |
 | Precedence | my.cnf files < connection directory `config` files (root to leaf) < connection file < command-line flags. Later sources win. |
-| Auth command output | The first line of stdout is the password. A trailing `\r\n` or `\n` is removed. |
+| Auth command output | The first line of stdout is the password. A trailing `\r\n` or `\n` is removed. Output that is a JSON object can also set connection settings; see [auth-command-json.md](auth-command-json.md). |
 | Auth command reruns | The command runs on every connect: the first connect, every reconnect after a lost connection, and the `connect` client command. Nothing is cached. |
 | Keychain API | Security.framework, called from a small C shim. It is linked only for macOS targets. |
 | Keychain naming | Service `thysql`, account = the connection name (for example `main/ro`). Manage items with `thysql keychain set\|delete\|status <conn>`. |
