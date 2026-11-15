@@ -510,7 +510,7 @@ fn delimiterValue(value: ?[]const u8) Error![]const u8 {
 }
 
 /// As in mysql.cc, an empty value means "not set" and anything but tcp or socket is rejected.
-fn protocolValue(value: ?[]const u8) Error!Protocol {
+pub fn protocolValue(value: ?[]const u8) Error!Protocol {
     const text = try requiredValue(value);
     if (text.len == 0) {
         return .default;
@@ -553,7 +553,7 @@ fn connectTimeoutValue(value: ?[]const u8) Error!u32 {
 }
 
 /// Boolean values for --ssl and --ssl-verify-server-cert. A bare flag means true.
-fn boolValue(value: ?[]const u8) Error!bool {
+pub fn boolValue(value: ?[]const u8) Error!bool {
     const text = value orelse return true;
     const truthy = [_][]const u8{ "1", "on", "true", "yes" };
     const falsy = [_][]const u8{ "0", "off", "false", "no" };
