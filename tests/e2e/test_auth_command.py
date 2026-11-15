@@ -215,8 +215,8 @@ class AuthCommandTests(E2ETestCase):
                 session.expect("Enter password: ")
                 session.send(ROOT_PASSWORD + ENTER)
                 session.expect("Welcome to thysql.")
-                # A -C connection shows its name in the prompt, not user@host.
-                session.expect(f"local/{TEST_DB}> ")
+                # A -C connection shows its name in brackets, not user@host.
+                session.expect(f"[local] {TEST_DB}> ")
                 self.finish(session)
                 # The command was never run, so the log has no connect from it.
                 self.assertFalse(os.path.exists(self.log_path))
