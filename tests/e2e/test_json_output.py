@@ -1,7 +1,8 @@
 """JSON output: --json (ndjson), --result-format=json and ndjson in -e and stdin input.
 
-Covers the value mapping for every type in the `typed` fixture, one array per result
-set, empty results, duplicate column names, bytes that are not UTF-8, and --force.
+Covers the value mapping for every type in the `typed` fixture, ZEROFILL and YEAR 0
+numbers, one array per result set, empty results, duplicate column names, bytes that
+are not UTF-8, and --force.
 The structure is checked with `jq -e`, and exact number text with plain string checks.
 """
 
@@ -164,6 +165,29 @@ class JsonOutputTests(E2ETestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stdout_bytes, '{"s":"caf�"}\n'.encode("utf-8"))
+
+    def test_zerofill_and_year_zero_are_valid_json_numbers(self):
+        # The server sends 00042, 0000 and 0001.5; JSON allows none of those leading zeros.
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                result = self.thysql(
+                    server,
+                    ["--json", "-e", "select id, padded, year_zero, dbl from padded_values order by id"],
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    result.stdout,
+                    '{"id":1,"padded":42,"year_zero":0,"dbl":1.5}\n'
+                    '{"id":2,"padded":0,"year_zero":2000,"dbl":null}\n',
+                )
+                self.assertJq(
+                    result.stdout,
+                    [
+                        {"id": 1, "padded": 42, "year_zero": 0, "dbl": 1.5},
+                        {"id": 2, "padded": 0, "year_zero": 2000, "dbl": None},
+                    ],
+                    slurp=True,
+                )
 
     def test_force_keeps_writing_after_an_error_and_exits_nonzero(self):
         script = "select 1 as a; select * from no_such_table; select 2 as b"

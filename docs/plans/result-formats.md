@@ -57,9 +57,9 @@ Copied 50 rows as csv to the clipboard (1.2 KB).
 | Shapes | `ndjson`: one compact object per row per line. `json`: one array of objects per result set, compact in batch mode and pretty-printed in the REPL. Several result sets in `json` mode make several top-level documents, one after another (jq reads them; strict parsers don't). |
 | Default JSON shape | `ndjson`. `--json` means `--result-format=ndjson`. |
 | NULL | `null` |
-| Integer types, YEAR | JSON number, using the server's text unchanged, so BIGINT UNSIGNED stays exact. |
+| Integer types, YEAR | JSON number, using the server's text so BIGINT UNSIGNED stays exact, with leading zeros dropped (ZEROFILL `00042` is `42`, YEAR `0000` is `0`). Only the zeros before the integer digits go; a sign and a single `0` stay. |
 | DECIMAL / NEWDECIMAL | JSON **string**, so precision survives. |
-| FLOAT, DOUBLE | JSON number. |
+| FLOAT, DOUBLE | JSON number, with the same leading zeros dropped (`00001.5` is `1.5`, `0.5` is unchanged). |
 | JSON columns (245) | Embedded as raw JSON, not as a quoted string. |
 | Binary data (`charsetnr` 63: BLOB, BINARY, VARBINARY, BIT, GEOMETRY) | Standard base64 string, with padding. |
 | Dates, times, ENUM, SET, text | JSON string, escaped (`"`, `\`, control characters as `\uXXXX` or the short forms). |
@@ -75,7 +75,7 @@ Copied 50 rows as csv to the clipboard (1.2 KB).
 | Dialect | RFC 4180 quoting: a field is quoted when it holds `,`, `"`, CR or LF, or has leading or trailing spaces; `"` is doubled. Lines end in `\n`, not CRLF. No BOM. |
 | Header | Column names on the first line. `-N` / `-ss` omit it. Duplicate names are written as they are. |
 | NULL vs empty string | NULL is an empty unquoted field; an empty string is `""` (as PostgreSQL's `COPY ... CSV` does). |
-| Numbers, dates, text | The server's text, quoted only when needed. DECIMAL is not quoted. |
+| Numbers, dates, text | The server's text, quoted only when needed. DECIMAL is not quoted. Leading zeros stay (`00042`), as they are part of the text. |
 | Binary data | Base64, as in JSON. |
 | JSON columns | The JSON text, quoted as needed. |
 | Empty result | Header line only (so the columns are still known), or nothing with `-N`. |

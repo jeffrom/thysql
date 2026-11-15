@@ -67,6 +67,12 @@ class CsvOutputTests(E2ETestCase):
                 result = self.thysql(server, ["--csv", "-e", "select data from blobs where id = 1"])
                 self.assertEqual(result.stdout, "data\nAP8Q\n")
 
+    def test_zerofill_and_year_zero_keep_the_server_text(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                result = self.thysql(server, ["--csv", "-e", "select padded, year_zero, dbl from padded_values where id = 1"])
+                self.assertEqual(result.stdout, "padded,year_zero,dbl\n00042,0000,0001.5\n")
+
     def test_every_type_reads_back_through_python_csv(self):
         expected_rows = [
             ["id", "tiny", "flag", "big", "amount", "ratio", "small", "year_col", "day", "moment",

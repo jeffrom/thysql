@@ -136,6 +136,13 @@ test "writeField writes numbers and decimals unquoted" {
     try expectField(&double, "1.5e10", "1.5e10");
 }
 
+test "writeField keeps the server's leading zeros" {
+    const padded = Mysql.mysqlField("padded", 0, C.MYSQL_TYPE_LONG);
+    try expectField(&padded, "00042", "00042");
+    const year = Mysql.mysqlField("y", 0, C.MYSQL_TYPE_YEAR);
+    try expectField(&year, "0000", "0000");
+}
+
 test "writeField writes binary data as base64 without quotes" {
     const blob = Mysql.mysqlBinaryField("blob", 0, C.MYSQL_TYPE_BLOB);
     try expectField(&blob, "\x00\xff", "AP8=");

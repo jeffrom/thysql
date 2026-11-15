@@ -56,9 +56,29 @@ fn writeAsciiByte(out: *std.Io.Writer, byte: u8) !void {
     }
 }
 
+/// Writes a number's text with the zeros before its integer digits removed, as
+/// ZEROFILL columns and YEAR 0 (`0000`) come back with leading zeros that JSON doesn't
+/// allow. A sign is kept, and a single `0` stays, so `0.5` and `-0` are unchanged.
+fn writeNumber(out: *std.Io.Writer, text: []const u8) !void {
+    var start: usize = 0;
+    if (text.len > 0 and text[0] == '-') {
+        try out.writeByte('-');
+        start = 1;
+    }
+    var end = start;
+    while (end < text.len and std.ascii.isDigit(text[end])) {
+        end += 1;
+    }
+    var first = start;
+    while (first + 1 < end and text[first] == '0') {
+        first += 1;
+    }
+    try out.writeAll(text[first..]);
+}
+
 /// Writes one field value as a JSON value. NULL is `null`; integers and floats
-/// are the server's text unchanged; DECIMAL is a string so its precision survives;
-/// JSON columns are embedded as they are; binary data is base64.
+/// are the server's text, without leading zeros; DECIMAL is a string so its precision
+/// survives; JSON columns are embedded as they are; binary data is base64.
 pub fn writeValue(out: *std.Io.Writer, field: *const C.struct_st_mysql_field, value: ?[]const u8) !void {
     const kind = ResultValue.classify(field, value);
     if (kind == .null) {
@@ -68,7 +88,8 @@ pub fn writeValue(out: *std.Io.Writer, field: *const C.struct_st_mysql_field, va
     const bytes = value.?;
     switch (kind) {
         .null => unreachable,
-        .number, .json => try out.writeAll(bytes),
+        .number => try writeNumber(out, bytes),
+        .json => try out.writeAll(bytes),
         .decimal, .text => try writeString(out, bytes),
         .binary => {
             try out.writeByte('"');
@@ -259,6 +280,22 @@ test "writeValue writes integers and floats as the server's text" {
 test "writeValue keeps BIGINT UNSIGNED max exact" {
     const big = Mysql.mysqlField("big", 0, C.MYSQL_TYPE_LONGLONG);
     try expectValue(&big, "18446744073709551615", "18446744073709551615");
+}
+
+test "writeValue drops leading zeros from ZEROFILL and YEAR 0 numbers" {
+    const padded = Mysql.mysqlField("padded", 0, C.MYSQL_TYPE_LONG);
+    try expectValue(&padded, "00042", "42");
+    try expectValue(&padded, "0000", "0");
+    try expectValue(&padded, "-00042", "-42");
+    try expectValue(&padded, "-0", "-0");
+    const year = Mysql.mysqlField("y", 0, C.MYSQL_TYPE_YEAR);
+    try expectValue(&year, "0000", "0");
+    try expectValue(&year, "0999", "999");
+    const double = Mysql.mysqlField("d", 0, C.MYSQL_TYPE_DOUBLE);
+    try expectValue(&double, "00001.5", "1.5");
+    try expectValue(&double, "0.5", "0.5");
+    try expectValue(&double, "00001.5e3", "1.5e3");
+    try expectValue(&double, "-0.25", "-0.25");
 }
 
 test "writeValue writes DECIMAL as a string" {
