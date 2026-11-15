@@ -221,13 +221,15 @@ pub fn parseAuthOutput(allocator: Allocator, bytes: []const u8, truncated: bool,
         }
     }
 
-    if (text.len == 0) {
-        return fail(context, error.AuthCommandNoPassword, "auth command printed no password\n", .{});
-    }
-    const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    var line = text[0..line_end];
-    if (line[line.len - 1] == '\r') {
+    // A password line is the first line exactly as printed, so spaces in a password are kept.
+    // Only the JSON check above trims.
+    const line_end = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
+    var line = bytes[0..line_end];
+    if (line.len > 0 and line[line.len - 1] == '\r') {
         line = line[0 .. line.len - 1];
+    }
+    if (line.len == 0) {
+        return fail(context, error.AuthCommandNoPassword, "auth command printed no password\n", .{});
     }
     return .{
         .password = .{ .bytes = try allocator.dupeSentinel(u8, line, 0), .allocator = allocator },
@@ -628,6 +630,18 @@ test "auth output: a plain line is the password, without the line ending, and se
     try std.testing.expectEqual(@as(?bool, null), output.settings.ssl);
     try std.testing.expectEqual(@as(?[]const u8, null), output.settings.host);
     try std.testing.expect(output.json_error == null);
+}
+
+test "auth output: a password line keeps its spaces" {
+    var env = testEnv();
+    defer env.deinit();
+    var stderr_buffer: [64]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+    const context: FetchContext = .{ .interactive = false, .stderr = &stderr, .env = &env };
+    var output = try parseAuthOutput(std.testing.allocator, " pw \n", false, context);
+    defer output.deinit();
+    try std.testing.expectEqualStrings(" pw ", output.password.bytes);
+    try std.testing.expectError(error.AuthCommandNoPassword, parseAuthOutput(std.testing.allocator, "\npw\n", false, context));
 }
 
 test "auth output: a line that starts with { but is not JSON is the password, and records why" {
