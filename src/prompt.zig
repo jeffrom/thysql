@@ -246,6 +246,23 @@ pub fn builtinPrompt(allocator: Allocator, facts: ConnectionFacts, color: ?Color
     return out.toOwnedSliceSentinel(0);
 }
 
+/// Writes `text` without its CSI sequences, such as the colour codes of a prompt, so the tee
+/// file gets the plain text. Other bytes, including a lone ESC, are written as they are.
+pub fn writeWithoutCsi(out: *std.Io.Writer, text: []const u8) !void {
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == 0x1b and index + 1 < text.len and text[index + 1] == '[') {
+            // The parameter and intermediate bytes are all below 0x40, and the final byte is 0x40 to 0x7e.
+            var end = index + 2;
+            while (end < text.len and text[end] < 0x40) : (end += 1) {}
+            index = @min(end + 1, text.len);
+            continue;
+        }
+        try out.writeByte(text[index]);
+        index += 1;
+    }
+}
+
 /// The prompt in use. `format` is the one set by --prompt or `prompt`, and
 /// `default_format` is MYSQL_PS1. Both are owned copies. With neither, the REPL
 /// draws its built-in connection prompt.
@@ -435,4 +452,15 @@ test "builtin prompt: colour codes are the 8 ANSI foregrounds and their bright f
     try std.testing.expectEqual(@as(u8, 37), Color.white.code());
     try std.testing.expectEqual(@as(u8, 90), Color.bright_black.code());
     try std.testing.expectEqual(@as(u8, 97), Color.bright_white.code());
+}
+
+test "writeWithoutCsi drops colour codes and keeps the other bytes" {
+    var buffer: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    try writeWithoutCsi(&out, "\x1b[96m[main/ro]\x1b[0m app> ");
+    try std.testing.expectEqualStrings("[main/ro] app> ", out.buffered());
+
+    out = .fixed(&buffer);
+    try writeWithoutCsi(&out, "a\x1b\\b\x1b[1;31;4m\x1b");
+    try std.testing.expectEqualStrings("a\x1b\\b\x1b", out.buffered());
 }

@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const Mysql = @import("mysql.zig");
 const Options = @import("options.zig");
 const Clipboard = @import("clipboard.zig");
+const Prompt = @import("prompt.zig");
 
 const tee_buffer_len = 4096;
 
@@ -95,10 +96,11 @@ pub fn teeWriter(self: *Client) ?*std.Io.Writer {
     return null;
 }
 
-/// Copies one line of typed input to the tee file, with its prompt, as mysql.cc does.
+/// Copies one line of typed input to the tee file, with its prompt, as mysql.cc does. The
+/// prompt is copied without colour codes, so the file has plain text.
 pub fn echoInput(self: *Client, prompt: []const u8, line: []const u8) void {
     const tee = self.teeWriter() orelse return;
-    tee.writeAll(prompt) catch {};
+    Prompt.writeWithoutCsi(tee, prompt) catch {};
     tee.writeAll(line) catch {};
     tee.writeAll("\n") catch {};
 }
@@ -625,4 +627,28 @@ test "mirror writes to the primary writer and appends to the tee file" {
     const contents = try std.Io.Dir.readFileAlloc(.cwd(), io, path, std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(contents);
     try std.testing.expectEqualStrings("old\nrow 1\n", contents);
+}
+
+test "echoInput copies the prompt to the tee file without colour codes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The file is opened relative to the working directory, so use the temp dir's path.
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/echo.txt", .{&tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var primary_buffer: [128]u8 = undefined;
+    var primary: std.Io.Writer = .fixed(&primary_buffer);
+    var client = Client.init(std.testing.allocator, io, &primary, false);
+    defer client.deinit();
+
+    var message_buffer: [128]u8 = undefined;
+    var message: std.Io.Writer = .fixed(&message_buffer);
+    try client.cmdTee(&message, path);
+    client.echoInput("\x1b[31m[main]\x1b[0m app> ", "select 1;");
+    try client.cmdNotee(&message);
+
+    const contents = try std.Io.Dir.readFileAlloc(.cwd(), io, path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("[main] app> select 1;\n", contents);
 }
