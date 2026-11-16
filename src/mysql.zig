@@ -1223,7 +1223,7 @@ pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql
                 try Unicode.printHexValue(out, row[i][0..lengths[i]], std.math.maxInt(usize));
                 try out.print("\n", .{});
             } else {
-                try Unicode.printEscapedValue(out, row[i][0..lengths[i]], std.math.maxInt(usize));
+                try Unicode.printVerticalValue(out, row[i][0..lengths[i]]);
                 try out.print("\n", .{});
             }
         }

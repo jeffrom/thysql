@@ -54,6 +54,15 @@ class BatchTests(E2ETestCase):
                 )
                 self.assertNoRowsFooter(result.stdout)
 
+    def test_backslash_G_prints_newlines_and_tabs_unescaped(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                result = self.run_sql(
+                    server, "select 'a\\nb\\tc\\\\d' as v\\G\n"
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("v: a\nb\tc\\d\n", result.stdout)
+
     def test_bad_query_prints_error_and_exits_nonzero(self):
         for server in self.each_server():
             with self.subTest(server=server.name):

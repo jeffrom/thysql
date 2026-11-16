@@ -64,9 +64,26 @@ pub fn escapedDisplayWidth(value: []const u8) usize {
 }
 
 pub fn printEscapedValue(out: *std.Io.Writer, value: []const u8, max_width: usize) !void {
+    try printEscaped(out, value, max_width, false);
+}
+
+/// Prints a value for vertical output, where each value ends its own line. As in mysql.cc,
+/// newlines, tabs and backslashes are written as they are, so multi-line text such as
+/// SHOW CREATE TABLE reads naturally. Other control bytes and malformed UTF-8 are still
+/// escaped so they cannot drive the terminal.
+pub fn printVerticalValue(out: *std.Io.Writer, value: []const u8) !void {
+    try printEscaped(out, value, std.math.maxInt(usize), true);
+}
+
+fn printEscaped(out: *std.Io.Writer, value: []const u8, max_width: usize, keep_layout: bool) !void {
     var width: usize = 0;
     var i: usize = 0;
     while (i < value.len) {
+        if (keep_layout and (value[i] == '\n' or value[i] == '\t' or value[i] == '\\')) {
+            try out.writeByte(value[i]);
+            i += 1;
+            continue;
+        }
         if (escapedAsciiByteWidth(value[i])) |byte_width| {
             if (width + byte_width > max_width) {
                 return;
@@ -279,6 +296,14 @@ test "escapedDisplayWidth counts escaped control bytes" {
 test "printEscapedValue escapes unsafe bytes" {
     const bytes = [_]u8{ 'a', 0, 'b', '\n', 'c', '\t', 0x1b, '\\' };
     try expectEscaped(&bytes, std.math.maxInt(usize), "a\\0b\\nc\\t\\x1B\\\\");
+}
+
+test "printVerticalValue keeps newlines, tabs and backslashes" {
+    var buffer: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    const bytes = [_]u8{ 'a', '\n', 'b', '\t', '\\', 0, 0x1b, '\r' };
+    try printVerticalValue(&writer, &bytes);
+    try std.testing.expectEqualStrings("a\nb\t\\\\0\\x1B\\r", writer.buffered());
 }
 
 test "printEscapedValue truncates on display width boundary" {
