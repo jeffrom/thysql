@@ -234,9 +234,10 @@ pub fn darkFromColorFgBg(value: ?[]const u8) bool {
     };
 }
 
-/// The choice in effect: `--theme` if given, else the config file's `theme`, else `default`.
-pub fn effective(flag: ?Choice, file: ?Choice) Choice {
-    return flag orelse file orelse .{ .fixed = "default" };
+/// The choice in effect: `--theme` if given, else the connection's `theme`, else the config file's
+/// `theme`, else `default`.
+pub fn effective(flag: ?Choice, connection: ?Choice, file: ?Choice) Choice {
+    return flag orelse connection orelse file orelse .{ .fixed = "default" };
 }
 
 fn sgr(comptime params: []const u8) []const u8 {
@@ -361,12 +362,14 @@ test "COLORFGBG names a light background for 7 and 9-15, and a dark one otherwis
     try std.testing.expect(!darkFromColorFgBg("0; 7 "));
 }
 
-test "the flag wins over the config file, which wins over default" {
+test "the flag wins over the connection, which wins over the config file, which wins over default" {
     const flag_choice: Choice = .{ .fixed = "catppuccin-mocha" };
+    const connection_choice: Choice = .{ .fixed = "catppuccin-frappe" };
     const file_choice: Choice = .{ .fixed = "catppuccin-latte" };
-    try std.testing.expectEqualStrings("catppuccin-mocha", effective(flag_choice, file_choice).fixed);
-    try std.testing.expectEqualStrings("catppuccin-latte", effective(null, file_choice).fixed);
-    try std.testing.expectEqualStrings("default", effective(null, null).fixed);
+    try std.testing.expectEqualStrings("catppuccin-mocha", effective(flag_choice, connection_choice, file_choice).fixed);
+    try std.testing.expectEqualStrings("catppuccin-frappe", effective(null, connection_choice, file_choice).fixed);
+    try std.testing.expectEqualStrings("catppuccin-latte", effective(null, null, file_choice).fixed);
+    try std.testing.expectEqualStrings("default", effective(null, null, null).fixed);
 }
 
 test "completion offers each name and catppuccin" {

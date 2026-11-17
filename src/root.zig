@@ -44,8 +44,10 @@ const Repl = struct {
     connection_color: ?Prompt.Color = null,
     /// Whether the built-in prompt may use colour: stdout is a terminal and NO_COLOR is unset or empty.
     use_color: bool = false,
-    /// The colours of the line editor and of SQL output, from --theme or the config file.
+    /// The colours of the line editor and of SQL output, from --theme, the connection or the config file.
     theme: replete.Theme = Theme.default,
+    /// The line editor that draws with `theme`, once it is set up. `applyTheme` keeps the two in step.
+    readline: ?*Readline.Session = null,
 };
 
 /// What `\C` needs to open another saved connection. runREPL makes one for the session. The
@@ -65,6 +67,15 @@ const ConnectionSwitch = struct {
     selection: Connections.Selection,
     /// The password source of the connection in use. The DB keeps a pointer to it, so it is on the heap.
     supplier: ?*Password.Supplier = null,
+    /// Where a background query is written: the real stdout, not the tee mirror. Colour is off when
+    /// `use_color` is false, and then no query is sent.
+    stdout: *std.Io.Writer,
+    use_color: bool,
+    /// The config file's theme. A connection's theme and `--theme` come before it.
+    file_theme: ?Theme.Choice = null,
+    /// Whether the background is dark. It is asked of the terminal the first time a pair theme needs
+    /// it, and kept for the rest of the process. Null until then.
+    dark_background: ?bool = null,
 
     fn deinit(self: *ConnectionSwitch) void {
         if (self.supplier) |supplier| {
@@ -229,6 +240,7 @@ fn switchConnection(
     if (repl) |session| {
         session.connection = connection_name;
         session.connection_color = switcher.selection.promptColor();
+        applyTheme(switcher, session, Theme.effective(next_options.theme, switcher.selection.theme(), switcher.file_theme));
         try session.syntax.refresh(db);
         try out.print("Connected to \"{s}\".\n", .{connection_name});
         try renderConnectionInfo(out, db);
@@ -239,6 +251,25 @@ fn switchConnection(
 
 fn envValue(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
     return env.get(name);
+}
+
+/// The theme for `choice` on this session's background. A pair picks its side from the background,
+/// which is asked of the terminal only the first time it is needed.
+fn themeFor(switcher: *ConnectionSwitch, choice: Theme.Choice) replete.Theme {
+    if (choice == .pair and switcher.dark_background == null) {
+        switcher.dark_background = if (switcher.use_color and switcher.stdin_is_tty)
+            Theme.detectDark(switcher.io, std.Io.File.stdin().handle, switcher.stdout, envValue(switcher.env, "COLORFGBG"))
+        else
+            true;
+    }
+    return Theme.forChoice(choice, switcher.dark_background orelse true);
+}
+
+/// Makes `choice` the theme of the line editor and of SQL highlighting, from the next draw on.
+/// `\C` calls it after a switch.
+fn applyTheme(switcher: *ConnectionSwitch, repl: *Repl, choice: Theme.Choice) void {
+    repl.theme = themeFor(switcher, choice);
+    if (repl.readline) |readline| readline.setTheme(repl.theme);
 }
 
 /// Writes the --version output for this build.
@@ -1213,6 +1244,8 @@ pub fn runREPL(
         .env = env,
         .stderr = stderr,
         .stdin_is_tty = stdin_is_tty,
+        .stdout = stdout,
+        .use_color = use_color,
         .args = args.items,
         .first = loaded.next,
         .base = loaded.settings,
@@ -1246,18 +1279,13 @@ pub fn runREPL(
         return 0;
     }
 
-    // --theme wins over the config file's theme, and both are resolved once, here.
+    // --theme wins over the connection's theme, which wins over the config file's theme.
     const config = ConfigFile.load(allocator, io, env, stderr) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.ConfigFailed => return 1,
     };
-    const theme_choice = Theme.effective(options.theme, config.theme);
-    // A pair picks its side from the background. The terminal is asked only when colour is on and
-    // stdin is a terminal; otherwise the dark theme is used.
-    const dark_background = if (theme_choice == .pair and use_color and stdin_is_tty)
-        Theme.detectDark(io, stdin.handle, stdout, envValue(env, "COLORFGBG"))
-    else
-        true;
+    switcher.file_theme = config.theme;
+    const theme_choice = Theme.effective(options.theme, switcher.selection.theme(), config.theme);
 
     // The password is fetched on every connect. A prompt is asked once, here, and kept for reconnects.
     const supplier = try newSupplier(&switcher, &options);
@@ -1321,13 +1349,14 @@ pub fn runREPL(
         .connection = options.connection orelse "",
         .connection_color = switcher.selection.promptColor(),
         .use_color = use_color,
-        .theme = Theme.forChoice(theme_choice, dark_background),
+        .theme = themeFor(&switcher, theme_choice),
     };
 
     // The line editor draws on stdout directly, not through the tee Mirror: its redraws are terminal
     // control, and `Client.echoInput` already copies each prompt and line to the tee file in plain text.
     const readline = try Readline.Session.setup(allocator, io, env, stdout, &names, &syntax, repl.theme);
     defer readline.deinit();
+    repl.readline = readline;
     // Names load before the banner, as mysql.cc does at connect.
     try loadNames(&repl, &db, out, true);
     try renderConnectionBanner(out, db.serverName(), db.connectionId(), db.serverVersion(), Mysql.clientInfo());
@@ -1547,4 +1576,41 @@ test {
         @import("theme.zig"),
         @import("unicode.zig"),
     };
+}
+
+test "a pair theme takes the background once, and then keeps the answer" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+    var stdout_buffer: [256]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var switcher: ConnectionSwitch = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .env = &env,
+        .stderr = &stderr,
+        .stdin_is_tty = false,
+        .args = &.{},
+        .first = 1,
+        .base = &.{},
+        .selection = .{ .gpa = allocator, .settings = &.{} },
+        .stdout = &stdout,
+        .use_color = false,
+    };
+
+    // A fixed theme does not need the background, so it is not asked for.
+    const fixed = Theme.parseChoice("catppuccin-latte").?;
+    try std.testing.expectEqualStrings(Theme.find("catppuccin-latte").?.keyword, themeFor(&switcher, fixed).keyword);
+    try std.testing.expectEqual(@as(?bool, null), switcher.dark_background);
+
+    // Without a terminal the background is taken to be dark, and that answer is kept.
+    const pair = Theme.parseChoice("light:catppuccin-latte,dark:catppuccin-mocha").?;
+    try std.testing.expectEqualStrings(Theme.find("catppuccin-mocha").?.keyword, themeFor(&switcher, pair).keyword);
+    try std.testing.expectEqual(@as(?bool, true), switcher.dark_background);
+
+    // The kept answer is used for later pairs, so the terminal is not asked again.
+    switcher.dark_background = false;
+    try std.testing.expectEqualStrings(Theme.find("catppuccin-latte").?.keyword, themeFor(&switcher, pair).keyword);
 }

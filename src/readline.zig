@@ -16,6 +16,7 @@ const SqlLexer = @import("sql/lexer.zig");
 const Syntax = @import("syntax.zig").Syntax;
 const SqlParser = @import("sql/parser.zig");
 const SqlHighlight = @import("sql_highlight.zig");
+const Theme = @import("theme.zig");
 
 /// What `Session.one` read.
 pub const Outcome = union(enum) {
@@ -151,6 +152,12 @@ pub const Session = struct {
         };
         try self.endLine("\n");
         return .{ .line = line };
+    }
+
+    /// Changes the theme of the line editor. The next line drawn, and the completion menu, use it.
+    pub fn setTheme(self: *Session, theme: replete.Theme) void {
+        // replete reads its theme from this config on every draw, and the config outlives the draws.
+        self.config.theme = theme;
     }
 
     /// Adds an accepted statement to the history and appends it to the history file, unless
@@ -1568,4 +1575,25 @@ test "history ignore with no variable keeps everything" {
     var ignore = try Ignore.init(std.testing.allocator, null);
     defer ignore.deinit();
     try std.testing.expect(!ignore.matches("select 'secret'"));
+}
+
+test "setTheme changes the theme the editor draws with" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    var syntax = Syntax.init(allocator, false);
+    defer syntax.deinit();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    const session = try Session.setup(allocator, std.testing.io, &env, &output.writer, &names, &syntax, Theme.default);
+    defer session.deinit();
+    try std.testing.expectEqualStrings(Theme.default.keyword, session.repl.cfg.theme.keyword);
+
+    const mocha = Theme.find("catppuccin-mocha").?;
+    session.setTheme(mocha);
+    try std.testing.expectEqualStrings(mocha.keyword, session.repl.cfg.theme.keyword);
+    try std.testing.expectEqualStrings(mocha.keyword, session.config.theme.keyword);
 }

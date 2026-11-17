@@ -224,6 +224,10 @@ connections/
   file or a `config` file, and a connection's own file overrides its directory's. It is
   not a setting, so it is not a command-line flag and not a my.cnf key. See
   [prompt](#prompt).
+- `theme = name` picks the colour theme while connected to it, the same values as the config
+  file's `theme`. It goes in a connection file or a `config` file, the nearest one wins, and
+  `--theme` still overrides it. `\C` applies the new connection's theme. See
+  [colour themes](#colour-themes).
 
 ```
 # ~/.config/thysql/connections/main/ro
@@ -591,8 +595,8 @@ To set the theme for every session, put it in the config file,
 theme = catppuccin
 ```
 
-`--theme` overrides the file. An unknown key or a bad theme is an error that names the file and
-line.
+The order is `--theme`, then the connection's `theme` (see [connections](#connections)), then
+the file. An unknown key or a bad theme is an error that names the file and line.
 
 ## completion
 

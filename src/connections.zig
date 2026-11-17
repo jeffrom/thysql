@@ -15,6 +15,7 @@ const ConfigFile = @import("config_file.zig");
 const OptionFile = @import("option_file.zig");
 const options = @import("options.zig");
 const prompt = @import("prompt.zig");
+const Theme = @import("theme.zig");
 
 pub const Error = error{ ConnectionFailed, OutOfMemory };
 
@@ -33,11 +34,13 @@ pub const Resolved = struct {
     /// The final name after any `default-conn`, such as "main/ro".
     name: []const u8,
     /// In the order they apply: the root `config`, then each directory's `config` from the root
-    /// down, then the connection file. `default-conn` and `prompt-color` are not among them.
+    /// down, then the connection file. `default-conn`, `prompt-color` and `theme` are not among them.
     settings: []const OptionFile.Setting,
     /// The colour of the prompt's connection tag, from the last `prompt-color` that applies, or
     /// null for no colour.
     prompt_color: ?prompt.Color,
+    /// The last `theme` that applies, or null when none does.
+    theme: ?Theme.Choice,
 
     pub fn deinit(self: *Resolved) void {
         self.arena.deinit();
@@ -47,6 +50,7 @@ pub const Resolved = struct {
 const config_name = "config";
 const default_conn_key = "default-conn";
 const prompt_color_key = "prompt-color";
+const theme_key = "theme";
 const max_file_size = 1024 * 1024;
 const max_hops = 8;
 const max_depth = 8;
@@ -81,7 +85,13 @@ pub fn resolve(
     }, name);
     // The name can point into `name`, which the caller may free, as the line of `\C` is. Copy it into the arena.
     const owned_name = try allocator.dupe(u8, found.name);
-    return .{ .arena = arena, .name = owned_name, .settings = found.settings, .prompt_color = found.prompt_color };
+    return .{
+        .arena = arena,
+        .name = owned_name,
+        .settings = found.settings,
+        .prompt_color = found.prompt_color,
+        .theme = found.theme,
+    };
 }
 
 /// The connection named by -C, if any, and the settings to parse with: the option-file settings
@@ -109,6 +119,12 @@ pub const Selection = struct {
     /// The colour of the prompt's connection tag, or null without -C or without a `prompt-color`.
     pub fn promptColor(self: *const Selection) ?prompt.Color {
         return if (self.resolved) |resolved| resolved.prompt_color else null;
+    }
+
+    /// The connection's `theme`, or null without -C or without one. The caller puts it ahead of the
+    /// config file's theme.
+    pub fn theme(self: *const Selection) ?Theme.Choice {
+        return if (self.resolved) |resolved| resolved.theme else null;
     }
 };
 
@@ -261,6 +277,7 @@ const Found = struct {
     name: []const u8,
     settings: []const OptionFile.Setting,
     prompt_color: ?prompt.Color,
+    theme: ?Theme.Choice,
 };
 
 /// Which kind of file is being parsed. Only a directory's config may hold `default-conn`.
@@ -271,12 +288,15 @@ const Parsed = struct {
     default_conn: ?[]const u8,
     /// The file's `prompt-color`, or null when it has none. The inner null is `none`, which turns the colour off.
     prompt_color: ?(?prompt.Color),
+    /// The file's `theme`, or null when it has none.
+    theme: ?Theme.Choice,
 };
 
-/// The settings of one connection, and the colour its prompt tag takes.
+/// The settings of one connection, and the colour its prompt tag takes and the theme it names.
 const Collected = struct {
     settings: []const OptionFile.Setting,
     prompt_color: ?prompt.Color,
+    theme: ?Theme.Choice,
 };
 
 fn resolveIn(ctx: Context, requested: []const u8) Error!Found {
@@ -300,19 +320,21 @@ fn resolveIn(ctx: Context, requested: []const u8) Error!Found {
         name = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ name, next });
     }
     const collected = try collectSettings(ctx, name);
-    return .{ .name = name, .settings = collected.settings, .prompt_color = collected.prompt_color };
+    return .{ .name = name, .settings = collected.settings, .prompt_color = collected.prompt_color, .theme = collected.theme };
 }
 
 /// The settings of `name`: the root config, the config of each directory on the way down, then the file.
-/// The last `prompt-color` among them wins, so a file's colour overrides its directory's.
+/// The last `prompt-color` and `theme` among them win, so a file's value overrides its directory's.
 fn collectSettings(ctx: Context, name: []const u8) Error!Collected {
     var settings: std.ArrayList(OptionFile.Setting) = .empty;
     var prompt_color: ?prompt.Color = null;
+    var theme: ?Theme.Choice = null;
 
     const root_config = try std.fs.path.join(ctx.allocator, &.{ ctx.root, config_name });
     if (try parseFile(ctx, root_config, .root_config)) |parsed| {
         try settings.appendSlice(ctx.allocator, parsed.settings);
         if (parsed.prompt_color) |choice| prompt_color = choice;
+        if (parsed.theme) |choice| theme = choice;
     }
 
     var dir_path = ctx.root;
@@ -324,6 +346,7 @@ fn collectSettings(ctx: Context, name: []const u8) Error!Collected {
         if (try parseFile(ctx, config_path, .directory_config)) |parsed| {
             try settings.appendSlice(ctx.allocator, parsed.settings);
             if (parsed.prompt_color) |choice| prompt_color = choice;
+            if (parsed.theme) |choice| theme = choice;
         }
     }
 
@@ -331,7 +354,8 @@ fn collectSettings(ctx: Context, name: []const u8) Error!Collected {
     const parsed = (try parseFile(ctx, file_path, .connection)) orelse return notFound(ctx, name);
     try settings.appendSlice(ctx.allocator, parsed.settings);
     if (parsed.prompt_color) |choice| prompt_color = choice;
-    return .{ .settings = try settings.toOwnedSlice(ctx.allocator), .prompt_color = prompt_color };
+    if (parsed.theme) |choice| theme = choice;
+    return .{ .settings = try settings.toOwnedSlice(ctx.allocator), .prompt_color = prompt_color, .theme = theme };
 }
 
 /// Reads and parses one file. Returns null when it does not exist, which is not an error.
@@ -348,6 +372,7 @@ fn parseFile(ctx: Context, path: []const u8, role: FileRole) Error!?Parsed {
     var settings: std.ArrayList(OptionFile.Setting) = .empty;
     var default_conn: ?[]const u8 = null;
     var file_prompt_color: ?(?prompt.Color) = null;
+    var file_theme: ?Theme.Choice = null;
     var line_number: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw_line| {
@@ -384,6 +409,15 @@ fn parseFile(ctx: Context, path: []const u8, role: FileRole) Error!?Parsed {
             continue;
         }
 
+        // The theme is not a connection option either. It is read here, and the nearest one wins.
+        if (OptionFile.sameName(key, theme_key)) {
+            const spec = value orelse return failAt(ctx, path, line_number, "\"{s}\" needs a value", .{key});
+            file_theme = Theme.parseChoice(spec) orelse {
+                return failAt(ctx, path, line_number, "invalid theme \"{s}\"; expected {s}", .{ spec, Theme.valid_names });
+            };
+            continue;
+        }
+
         // Passwords are prompted for by a bare `password`. A value is refused, so no
         // secret is kept in a file that may be shared or committed.
         if (OptionFile.sameName(key, "password")) {
@@ -413,6 +447,7 @@ fn parseFile(ctx: Context, path: []const u8, role: FileRole) Error!?Parsed {
         .settings = try settings.toOwnedSlice(ctx.allocator),
         .default_conn = default_conn,
         .prompt_color = file_prompt_color,
+        .theme = file_theme,
     };
 }
 
@@ -428,7 +463,7 @@ fn parseColor(name: []const u8) ?(?prompt.Color) {
 
 /// A connection key is any connection or output option, or an execution option, as in
 /// options.zig. Help and version are not allowed here, and neither are `connection`, because a
-/// connection cannot name another one, and `theme`, which the config file sets.
+/// connection cannot name another one, and `theme`, which parseFile reads.
 fn findSpec(key: []const u8) ?options.Spec {
     for (options.specs) |spec| {
         if (spec.group != .other and spec.id != .connection and spec.id != .theme and OptionFile.sameName(spec.long, key)) {
@@ -836,10 +871,14 @@ test "help is not a connection key, and default-conn is refused in a connection 
     try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "dc-in-file:1: default-conn is only allowed in a directory's config file") != null);
 }
 
-test "theme is not a connection key, since the config file sets it" {
+test "theme is not a setting, and the nearest file or directory with one wins" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeTestFile(&tmp, "themed", "theme = catppuccin\n");
+    try writeTestFile(&tmp, "config", "theme = catppuccin\nuser = root_user\n");
+    try writeTestFile(&tmp, "main/config", "theme = light:catppuccin-latte,dark:catppuccin-frappe\n");
+    try writeTestFile(&tmp, "main/ro", "user = ro_user\n");
+    try writeTestFile(&tmp, "main/rw", "theme = default\n");
+    try writeTestFile(&tmp, "other", "host = o\n");
     const root = try tmpRoot(std.testing.allocator, &tmp);
     defer std.testing.allocator.free(root);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -847,8 +886,60 @@ test "theme is not a connection key, since the config file sets it" {
     var buffer: [512]u8 = undefined;
     var stderr: std.Io.Writer = .fixed(&buffer);
 
-    try std.testing.expectError(error.ConnectionFailed, resolveIn(testContext(&arena, root, null, &stderr), "themed"));
-    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "themed:1: unknown key \"theme\"") != null);
+    const inherited = try resolveIn(testContext(&arena, root, null, &stderr), "main/ro");
+    try std.testing.expectEqualStrings("catppuccin-frappe", inherited.theme.?.pair.dark);
+    try expectSettings(inherited.settings, &.{
+        .{ .name = "user", .value = "root_user" },
+        .{ .name = "user", .value = "ro_user" },
+    });
+
+    const own = try resolveIn(testContext(&arena, root, null, &stderr), "main/rw");
+    try std.testing.expectEqualStrings("default", own.theme.?.fixed);
+
+    const from_root = try resolveIn(testContext(&arena, root, null, &stderr), "other");
+    try std.testing.expectEqualStrings("catppuccin-mocha", from_root.theme.?.pair.dark);
+}
+
+test "an invalid or bare theme names the file and line" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(&tmp, "purple", "host = a\ntheme = purple\n");
+    try writeTestFile(&tmp, "bare", "host = a\ntheme\n");
+    const root = try tmpRoot(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(root);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [512]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&buffer);
+
+    try std.testing.expectError(error.ConnectionFailed, resolveIn(testContext(&arena, root, null, &stderr), "purple"));
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "purple:2: invalid theme \"purple\"; expected default, catppuccin-latte") != null);
+
+    stderr = .fixed(&buffer);
+    try std.testing.expectError(error.ConnectionFailed, resolveIn(testContext(&arena, root, null, &stderr), "bare"));
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "bare:2: \"theme\" needs a value") != null);
+}
+
+test "select carries the connection's theme, and there is none without -C" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(&tmp, "xdg/thysql/connections/main/config", "theme = catppuccin-latte\n");
+    try writeTestFile(&tmp, "xdg/thysql/connections/main/ro", "host = h\n");
+    const xdg = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/xdg", .{&tmp.sub_path});
+    defer std.testing.allocator.free(xdg);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", xdg);
+    var buffer: [512]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&buffer);
+
+    var selected = try selectName(std.testing.allocator, std.testing.io, &env, &stderr, "main/ro", &.{});
+    defer selected.deinit();
+    try std.testing.expectEqualStrings("catppuccin-latte", selected.theme().?.fixed);
+
+    var plain = try select(std.testing.allocator, std.testing.io, &env, &stderr, &.{"thysql"}, 1, &.{});
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(?Theme.Choice, null), plain.theme());
 }
 
 test "a connection file cannot name another connection" {
