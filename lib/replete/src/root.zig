@@ -3,7 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const display = @import("display.zig");
-const terminal = @import("terminal.zig");
+pub const terminal = @import("terminal.zig");
 const unicode = @import("unicode.zig");
 const history_mod = @import("history.zig");
 

@@ -201,13 +201,37 @@ fn parseSide(part: []const u8) ?Side {
     return null;
 }
 
-/// The theme to draw with for `choice`. A pair uses its dark theme until light and dark are detected.
-pub fn forChoice(choice: Choice) replete.Theme {
+/// The theme to draw with for `choice` on a dark or light background. A pair picks its side.
+pub fn forChoice(choice: Choice, dark: bool) replete.Theme {
     const chosen = switch (choice) {
         .fixed => |fixed| fixed,
-        .pair => |pair| pair.dark,
+        .pair => |pair| if (dark) pair.dark else pair.light,
     };
     return find(chosen).?;
+}
+
+/// How long the terminal has to answer the background query before it is given up.
+pub const background_timeout_ms = 100;
+
+/// Whether the background is dark. The terminal is asked first. If it does not answer, COLORFGBG
+/// is used, and if that is not set or not understood, the background is taken to be dark.
+pub fn detectDark(io: std.Io, in_fd: std.posix.fd_t, out: *std.Io.Writer, colorfgbg: ?[]const u8) bool {
+    if (replete.terminal.queryBackground(io, in_fd, out, background_timeout_ms)) |background| {
+        return replete.terminal.isDark(background);
+    }
+    return darkFromColorFgBg(colorfgbg);
+}
+
+/// Whether a COLORFGBG value, `fg;bg` or `fg;x;bg`, names a dark background. The last field is
+/// the background: 7 and 9-15 are light, and every other value, or no value, is dark.
+pub fn darkFromColorFgBg(value: ?[]const u8) bool {
+    const text = value orelse return true;
+    const last = if (std.mem.lastIndexOfScalar(u8, text, ';')) |semi| text[semi + 1 ..] else text;
+    const background = std.fmt.parseUnsigned(u8, std.mem.trim(u8, last, " \t"), 10) catch return true;
+    return switch (background) {
+        7, 9...15 => false,
+        else => true,
+    };
 }
 
 /// The choice in effect: `--theme` if given, else the config file's `theme`, else `default`.
@@ -315,10 +339,26 @@ test "a bad theme value is null" {
     }
 }
 
-test "a pair resolves to its dark theme" {
-    const theme = forChoice(parseChoice("light:catppuccin-latte,dark:catppuccin-mocha").?);
-    try std.testing.expectEqualStrings("\x1b[1;38;2;203;166;247m", theme.keyword);
-    try std.testing.expectEqualStrings((replete.Theme{}).keyword, forChoice(parseChoice("default").?).keyword);
+test "a pair resolves to the theme for the background" {
+    const pair = parseChoice("light:catppuccin-latte,dark:catppuccin-mocha").?;
+    try std.testing.expectEqualStrings("\x1b[1;38;2;203;166;247m", forChoice(pair, true).keyword);
+    try std.testing.expectEqualStrings(find("catppuccin-latte").?.keyword, forChoice(pair, false).keyword);
+    try std.testing.expectEqualStrings((replete.Theme{}).keyword, forChoice(parseChoice("default").?, false).keyword);
+}
+
+test "COLORFGBG names a light background for 7 and 9-15, and a dark one otherwise" {
+    try std.testing.expect(darkFromColorFgBg(null));
+    try std.testing.expect(darkFromColorFgBg("15;0"));
+    try std.testing.expect(darkFromColorFgBg("0;8"));
+    try std.testing.expect(darkFromColorFgBg("0;6"));
+    try std.testing.expect(darkFromColorFgBg("0;16"));
+    try std.testing.expect(darkFromColorFgBg("0;default"));
+    try std.testing.expect(darkFromColorFgBg("15;0;0"));
+    try std.testing.expect(!darkFromColorFgBg("0;15"));
+    try std.testing.expect(!darkFromColorFgBg("0;7"));
+    try std.testing.expect(!darkFromColorFgBg("0;9"));
+    try std.testing.expect(!darkFromColorFgBg("15;default;7"));
+    try std.testing.expect(!darkFromColorFgBg("0; 7 "));
 }
 
 test "the flag wins over the config file, which wins over default" {

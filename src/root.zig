@@ -1252,6 +1252,12 @@ pub fn runREPL(
         error.ConfigFailed => return 1,
     };
     const theme_choice = Theme.effective(options.theme, config.theme);
+    // A pair picks its side from the background. The terminal is asked only when colour is on and
+    // stdin is a terminal; otherwise the dark theme is used.
+    const dark_background = if (theme_choice == .pair and use_color and stdin_is_tty)
+        Theme.detectDark(io, stdin.handle, stdout, envValue(env, "COLORFGBG"))
+    else
+        true;
 
     // The password is fetched on every connect. A prompt is asked once, here, and kept for reconnects.
     const supplier = try newSupplier(&switcher, &options);
@@ -1315,7 +1321,7 @@ pub fn runREPL(
         .connection = options.connection orelse "",
         .connection_color = switcher.selection.promptColor(),
         .use_color = use_color,
-        .theme = Theme.forChoice(theme_choice),
+        .theme = Theme.forChoice(theme_choice, dark_background),
     };
 
     // The line editor draws on stdout directly, not through the tee Mirror: its redraws are terminal
