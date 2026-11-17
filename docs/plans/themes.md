@@ -136,6 +136,49 @@ Only when the choice is a `pair` and stdin and stdout are terminals and colour i
 - Tests for the parser, `isDark`, and the COLORFGBG fallback (as pure functions taking the
   env value).
 
+## Step 3b: per-connection themes
+
+- Connection files and directory `config` files in the connections tree may set `theme`,
+  with the same values as the general config file. It works like `prompt-color`
+  (`src/connections.zig`): not a setting passed to the server, the nearest file or
+  directory with one wins, and the result is exposed as `Selection.theme()` (`?Theme.Choice`).
+  It is no longer an unknown key there.
+- Precedence: `--theme`, then the connection's theme, then the general config file, then `default`.
+- `\C` (the connection switch in `src/root.zig`, next to where `connection_color` is updated)
+  re-resolves the theme for the new connection, so switching from `prod` to `dev` can change
+  colours. `--theme` still wins over every connection.
+- The background is detected at most once per process: cache the dark/light answer from
+  startup (or detect lazily the first time a pair is in effect) and reuse it on `\C`.
+- The line editor must pick up the new theme without restarting: add a way to change the
+  theme of a running replete editor (e.g. `Repl.setTheme` or a mutable theme the config
+  points at) that the next redraw uses, and update `Repl.theme` in thysql so `SHOW CREATE`
+  output follows too. Keep one function in thysql, e.g. `applyTheme(session, choice)`,
+  that both `\C` and step 4 call.
+- README: mention `theme` next to `prompt-color` in the connections section.
+- Tests: connection theme parsing and inheritance (nearest wins, invalid value names file
+  and line), precedence, and the editor's theme changing at runtime.
+
+## Step 4: live light/dark switching (mode 2031)
+
+Terminals such as Ghostty, kitty and Contour report OS appearance changes:
+
+- Enable with `CSI ? 2031 h` (`\x1b[?2031h`) when the line editor starts, and disable with
+  `CSI ? 2031 l` when it stops and on every exit path (including signals/panics where
+  replete already restores the terminal). Terminals that do not support it ignore it.
+- On a change the terminal sends `CSI ? 997 ; 1 n` (dark) or `CSI ? 997 ; 2 n` (light).
+  replete's key/escape parser must recognise this sequence, never insert it as text, and
+  report it through a new optional callback in replete's config, e.g.
+  `color_scheme: ?struct { context: *anyopaque, changed: *const fn (*anyopaque, dark: bool) void }`.
+  After the callback the editor redraws the current line with the (possibly new) theme.
+- Enable the mode only when a config callback is set; thysql sets it only when the theme in
+  effect is a pair (re-evaluate on `\C`: a connection may move from a fixed theme to a pair).
+- thysql's callback updates the cached dark/light answer and calls the step 3b
+  `applyTheme`. Reports that arrive while a query is running are read the next time the
+  editor reads input, which is fine.
+- Tests: the parser turns both reports into callback calls and leaves the line unchanged;
+  unrelated `CSI ? ... n` sequences are still ignored as before; the enable/disable
+  sequences are written only with a callback set.
+
 ## Out of scope for now
 
-Live switching on OS appearance changes (mode 2031) and user-defined theme files.
+User-defined theme files.
