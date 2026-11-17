@@ -61,7 +61,7 @@ pub const Session = struct {
     /// Sets up the line editor for the interactive client. Lines are read from stdin and
     /// written to `out`. Tab completes the names and keywords that fit the context of the cursor,
     /// from `names`, which the caller keeps loaded. `syntax` holds the sql_mode, which the caller keeps
-    /// up to date. Free the result with `deinit`.
+    /// up to date. `theme` colours the highlighted line and the completion menu. Free the result with `deinit`.
     pub fn setup(
         allocator: Allocator,
         io: std.Io,
@@ -69,6 +69,7 @@ pub const Session = struct {
         out: *std.Io.Writer,
         names: *SqlCompletion.Names,
         syntax: *Syntax,
+        theme: replete.Theme,
     ) !*Session {
         const self = try allocator.create(Session);
         errdefer allocator.destroy(self);
@@ -91,6 +92,7 @@ pub const Session = struct {
             .in = &self.input.interface,
             .out = out,
             .history = if (self.history) |*file| &file.history else null,
+            .theme = theme,
             .completer = .{ .context = &self.completion, .complete = completeWord },
             .highlighter = .{ .context = self, .highlight = highlightLine },
             .hinter = .{ .context = self, .hint = hintLine },

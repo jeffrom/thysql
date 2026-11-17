@@ -54,6 +54,9 @@ pub const Theme = struct {
     delimiter: []const u8 = "\x1b[1m",
     client_command: []const u8 = "\x1b[38;5;125m",
     @"error": []const u8 = "\x1b[4:3m",
+    /// The error style when `undercurl` is false: a straight underline. A theme that colours
+    /// errors sets this too, so the colour holds without curly underlines.
+    error_straight: []const u8 = "\x1b[4m",
     hint: []const u8 = "\x1b[2m",
     diagnostic: []const u8 = "\x1b[38;5;160m",
     /// Whether errors use a curly underline. Terminals without curly underlines
@@ -76,7 +79,7 @@ pub const Theme = struct {
             .function => self.function,
             .delimiter => self.delimiter,
             .client_command => self.client_command,
-            .@"error" => if (self.undercurl) self.@"error" else "\x1b[4m",
+            .@"error" => if (self.undercurl) self.@"error" else self.error_straight,
             .hint => self.hint,
             .diagnostic => self.diagnostic,
         };
@@ -122,6 +125,9 @@ test "error style is a curly underline unless the theme turns it off" {
 
     theme.undercurl = false;
     try std.testing.expectEqualStrings("\x1b[4m", theme.sgr(.@"error"));
+
+    theme.error_straight = "\x1b[4m\x1b[58:2::1:2:3m";
+    try std.testing.expectEqualStrings("\x1b[4m\x1b[58:2::1:2:3m", theme.sgr(.@"error"));
 }
 
 test "styles cover their spans and leave other bytes plain" {

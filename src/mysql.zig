@@ -8,6 +8,7 @@ const Password = @import("password.zig");
 const CsvOutput = @import("csv_output.zig");
 const JsonOutput = @import("json_output.zig");
 const SqlHighlight = @import("sql_highlight.zig");
+const Theme = @import("theme.zig");
 
 const maxTableColumnDisplayWidth: usize = 1024;
 const crServerGoneError: u32 = 2006;
@@ -2338,7 +2339,7 @@ test "vertical output colours the SQL of SHOW CREATE only with a highlighter" {
     const gpa = std.testing.allocator;
     var writer: std.Io.Writer.Allocating = .init(gpa);
     defer writer.deinit();
-    const highlighter: SqlHighlight.Highlighter = .{ .lexer = .{} };
+    const highlighter: SqlHighlight.Highlighter = .{ .lexer = .{}, .theme = Theme.default };
     try render_result_vertical_highlighted(&writer.writer, &result, &highlighter);
     const theme = highlighter.theme;
     const want = try std.fmt.allocPrint(gpa, "*************************** 1. row ***************************\n" ++

@@ -17,9 +17,11 @@ const OptionFile = @import("option_file.zig");
 const Password = @import("password.zig");
 const Prompt = @import("prompt.zig");
 const Readline = @import("readline.zig");
+const replete = @import("replete");
 const SqlCompletion = @import("sql_completion.zig");
 const Syntax = @import("syntax.zig").Syntax;
 const SqlHighlight = @import("sql_highlight.zig");
+const Theme = @import("theme.zig");
 pub const Unicode = @import("unicode.zig");
 
 /// Settings and state that only the interactive client has. Batch input runs without
@@ -41,6 +43,8 @@ const Repl = struct {
     connection_color: ?Prompt.Color = null,
     /// Whether the built-in prompt may use colour: stdout is a terminal and NO_COLOR is unset or empty.
     use_color: bool = false,
+    /// The colours of the line editor and of SQL output. The default theme for now.
+    theme: replete.Theme = Theme.default,
 };
 
 /// What `\C` needs to open another saved connection. runREPL makes one for the session. The
@@ -553,7 +557,7 @@ fn renderResult(
         const out = sink.writer();
         // The DDL of a SHOW CREATE statement is coloured only when it goes straight to a colour
         // terminal: a pager may not pass escape sequences through, and the tee copy has them stripped.
-        const highlighter: SqlHighlight.Highlighter = .{ .lexer = repl.syntax.lexer };
+        const highlighter: SqlHighlight.Highlighter = .{ .lexer = repl.syntax.lexer, .theme = repl.theme };
         const colour = repl.use_color and !sink.isPiped() and SqlHighlight.Highlighter.isShowCreate(sql, repl.syntax.lexer);
         const highlight: ?*const SqlHighlight.Highlighter = if (colour) &highlighter else null;
         const rendered = switch (format) {
@@ -1307,7 +1311,7 @@ pub fn runREPL(
 
     // The line editor draws on stdout directly, not through the tee Mirror: its redraws are terminal
     // control, and `Client.echoInput` already copies each prompt and line to the tee file in plain text.
-    const readline = try Readline.Session.setup(allocator, io, env, stdout, &names, &syntax);
+    const readline = try Readline.Session.setup(allocator, io, env, stdout, &names, &syntax, repl.theme);
     defer readline.deinit();
     // Names load before the banner, as mysql.cc does at connect.
     try loadNames(&repl, &db, out, true);
@@ -1524,6 +1528,7 @@ test {
         @import("sql_completion.zig"),
         @import("sql_highlight.zig"),
         @import("syntax.zig"),
+        @import("theme.zig"),
         @import("unicode.zig"),
     };
 }
