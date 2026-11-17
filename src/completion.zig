@@ -18,6 +18,7 @@ const Mysql = @import("mysql.zig");
 const OptionFile = @import("option_file.zig");
 const Options = @import("options.zig");
 const Password = @import("password.zig");
+const Theme = @import("theme.zig");
 
 pub const directive_nospace: u8 = 1;
 pub const directive_files: u8 = 2;
@@ -36,7 +37,7 @@ const protocol_values = [_][]const u8{ "socket", "tcp" };
 const boolean_values = [_][]const u8{ "0", "1" };
 
 /// What a flag's value is completed from. `none` means the value has no completion.
-pub const ValueKind = enum { none, database, connection, file, dir, protocol, boolean };
+pub const ValueKind = enum { none, database, connection, file, dir, protocol, boolean, theme };
 
 /// A flag as the scanner sees it: whether it takes a value, and what kind of value.
 const Flag = struct {
@@ -107,6 +108,7 @@ fn kindOf(id: Options.Id) ValueKind {
         .database => .database,
         .connection => .connection,
         .protocol => .protocol,
+        .theme => .theme,
         .ssl, .ssl_verify_server_cert => .boolean,
         .ssl_ca, .ssl_cert, .ssl_key, .ssl_crl, .tee, .socket, .auth_command => .file,
         .ssl_capath, .ssl_crlpath => .dir,
@@ -205,6 +207,7 @@ fn valueContext(kind: ValueKind, wrapper: []const u8, typed: []const u8) Context
         .dir => .{ .directive = directive_dirs },
         .protocol => .{ .wrapper = wrapper, .typed = typed, .literals = &protocol_values },
         .boolean => .{ .wrapper = wrapper, .typed = typed, .literals = &boolean_values },
+        .theme => .{ .wrapper = wrapper, .typed = typed, .literals = Theme.completion_names },
     };
 }
 
@@ -524,6 +527,13 @@ test "a lone dash or a dash and letters lists option names" {
     const long = context(&.{ "-u", "root" }, "--ss");
     try std.testing.expect(long.flag_names);
     try std.testing.expectEqualStrings("--ss", long.typed);
+}
+
+test "--theme= completes the theme names and catppuccin" {
+    const theme = context(&.{}, "--theme=cat");
+    try std.testing.expectEqualStrings("--theme=", theme.wrapper);
+    try std.testing.expectEqualStrings("cat", theme.typed);
+    try std.testing.expectEqual(Theme.completion_names.len, theme.literals.len);
 }
 
 test "a long option with = completes its value, with the wrapper" {

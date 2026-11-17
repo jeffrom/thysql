@@ -566,6 +566,33 @@ without `-C`. Any other escaped character is written as is.
 thysql --prompt='[\u|\d|\c]\_' -u root thysql_test
 ```
 
+## colour themes
+
+`--theme` picks the colours of the SQL in the line editor and of `SHOW CREATE` output:
+
+```sh
+thysql --theme=catppuccin-mocha
+thysql --theme=catppuccin        # light:catppuccin-latte,dark:catppuccin-mocha
+thysql --theme=light:catppuccin-latte,dark:catppuccin-mocha
+```
+
+The names are `default`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato` and
+`catppuccin-mocha`. Case does not matter, and `_` is the same as `-`. A pair names a light and a
+dark theme; for now it always uses the dark one. Colour is off when stdout is not a terminal or
+`NO_COLOR` is set, as before.
+
+To set the theme for every session, put it in the config file,
+`$XDG_CONFIG_HOME/thysql/config` or `~/.config/thysql/config`. It takes `key = value` lines and
+`#` comments, and its only key is `theme`:
+
+```ini
+# ~/.config/thysql/config
+theme = catppuccin
+```
+
+`--theme` overrides the file. An unknown key or a bad theme is an error that names the file and
+line.
+
 ## completion
 
 Tab completes SQL keywords, database names, and the table and column names of the

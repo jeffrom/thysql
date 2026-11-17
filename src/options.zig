@@ -7,9 +7,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Batch = @import("batch.zig");
 const OptionFile = @import("option_file.zig");
+const Theme = @import("theme.zig");
 
 pub const Error = error{
     MissingOptionValue,
+    InvalidTheme,
     InvalidPort,
     InvalidDelimiter,
     TooManyDatabases,
@@ -93,6 +95,7 @@ pub const Id = enum {
     tee,
     show_warnings,
     prompt,
+    theme,
     auto_rehash,
     no_auto_rehash,
     skip_auto_rehash,
@@ -163,6 +166,7 @@ pub const specs = [_]Spec{
     .{ .id = .tee, .long = "tee", .arg = .required, .arg_name = "file", .group = .output, .help = "Append all output to this file. Interactive only." },
     .{ .id = .show_warnings, .long = "show-warnings", .group = .output, .help = "Show warnings after every statement." },
     .{ .id = .prompt, .long = "prompt", .arg = .required, .arg_name = "fmt", .group = .output, .help = "Set the interactive prompt. Escapes such as \\u, \\h, and \\d work as in mysql. Defaults to $MYSQL_PS1." },
+    .{ .id = .theme, .long = "theme", .arg = .required, .arg_name = "name", .group = .output, .help = "Colour theme, such as catppuccin-mocha or catppuccin (latte or mocha, by background). Defaults to the config file's theme, then default." },
     .{ .id = .auto_rehash, .long = "auto-rehash", .group = .output, .help = "Load database, table, and column names for completion. This is the default." },
     .{ .id = .no_auto_rehash, .long = "no-auto-rehash", .short = 'A', .group = .output, .help = "Do not load names for completion. Use rehash to load them." },
     .{ .id = .skip_auto_rehash, .long = "skip-auto-rehash", .group = .output, .help = "Same as --no-auto-rehash." },
@@ -266,6 +270,8 @@ pub const Options = struct {
     show_warnings: bool = false,
     /// From --prompt. Null when not given. Used only by the interactive client.
     prompt: ?[]const u8 = null,
+    /// From --theme. Null when not given, and then the config file's theme applies.
+    theme: ?Theme.Choice = null,
     /// Load names for completion when the interactive client connects and changes databases.
     auto_rehash: bool = true,
     /// Reconnect when the server has gone away. The interactive client only, as in mysql.cc.
@@ -529,6 +535,11 @@ fn resultFormatValue(value: ?[]const u8) Error!ResultFormat {
     return std.meta.stringToEnum(ResultFormat, try requiredValue(value)) orelse Error.InvalidResultFormat;
 }
 
+/// A `--theme` value: a theme name, `catppuccin`, or a light and dark pair.
+fn themeValue(value: ?[]const u8) Error!Theme.Choice {
+    return Theme.parseChoice(try requiredValue(value)) orelse Error.InvalidTheme;
+}
+
 /// A byte count with an optional K, M or G suffix, for powers of 1024. The suffix may be lower case.
 fn parseSize(text: []const u8) Error!u64 {
     const last = if (text.len > 0) std.ascii.toUpper(text[text.len - 1]) else 0;
@@ -707,6 +718,8 @@ fn applySetting(allocator: Allocator, options: *Options, setting: OptionFile.Set
     const name = OptionFile.withoutLoose(setting.name);
     const spec = findLong(name) orelse return;
     if (spec.group == .other) return;
+    // The theme is set in the config file only, so option files do not set it.
+    if (spec.id == .theme) return;
 
     if (spec.id == .password) {
         if (setting.value) |password| {
@@ -837,6 +850,7 @@ fn apply(allocator: Allocator, options: *Options, id: Id, value: ?[]const u8) Er
         .tee => options.tee = try requiredValue(value),
         .show_warnings => options.show_warnings = true,
         .prompt => options.prompt = try requiredValue(value),
+        .theme => options.theme = try themeValue(value),
         .auto_rehash => options.auto_rehash = true,
         .no_auto_rehash, .skip_auto_rehash => options.auto_rehash = false,
         .reconnect => options.reconnect = true,
@@ -860,6 +874,7 @@ pub fn renderError(out: *std.Io.Writer, err: Error) !void {
         Error.InvalidConnectTimeout => "Invalid connect timeout. Expected a base-10 unsigned integer of seconds.",
         Error.InvalidBoolValue => "Invalid value for a boolean option. Use 1, 0, on, or off.",
         Error.InvalidResultFormat => "Invalid result format. Expected table, tab, vertical, json, ndjson, or csv.",
+        Error.InvalidTheme => "Invalid theme. Expected " ++ Theme.valid_names ++ ".",
         Error.InvalidSize => "Invalid size. Expected a byte count with an optional K, M, or G suffix.",
         Error.DefaultsOptionMisplaced => "--no-defaults, --defaults-file, --defaults-extra-file, and --print-defaults must be the first arguments, each at most once.",
         Error.OutOfMemory => "Out of memory.",
@@ -1832,6 +1847,31 @@ test "help and version are not read from option files" {
     defer options.deinit(std.testing.allocator);
     try std.testing.expect(!options.show_help);
     try std.testing.expect(!options.show_version);
+}
+
+test "--theme sets the choice, and a bad value is an error" {
+    var env = testEnv();
+    defer env.deinit();
+
+    const flag = [_][]const u8{ "thysql", "--theme=catppuccin" };
+    var options = try parse(std.testing.allocator, &flag, &env);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("catppuccin-mocha", options.theme.?.pair.dark);
+
+    const bad = [_][]const u8{ "thysql", "--theme", "purple" };
+    try std.testing.expectError(Error.InvalidTheme, parse(std.testing.allocator, &bad, &env));
+    const missing = [_][]const u8{ "thysql", "--theme" };
+    try std.testing.expectError(Error.MissingOptionValue, parse(std.testing.allocator, &missing, &env));
+}
+
+test "theme is not read from option files, so it comes only from --theme or the config file" {
+    var env = testEnv();
+    defer env.deinit();
+    const args = [_][]const u8{"thysql"};
+    const settings = [_]OptionFile.Setting{.{ .name = "theme", .value = "catppuccin-mocha" }};
+    var options = try parseWithSettings(std.testing.allocator, &args, 1, &env, &settings);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?Theme.Choice, null), options.theme);
 }
 
 test "every boolean flag can be set from an option file, bare and with a value" {

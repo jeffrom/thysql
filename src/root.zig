@@ -22,6 +22,7 @@ const SqlCompletion = @import("sql_completion.zig");
 const Syntax = @import("syntax.zig").Syntax;
 const SqlHighlight = @import("sql_highlight.zig");
 const Theme = @import("theme.zig");
+const ConfigFile = @import("config_file.zig");
 pub const Unicode = @import("unicode.zig");
 
 /// Settings and state that only the interactive client has. Batch input runs without
@@ -43,7 +44,7 @@ const Repl = struct {
     connection_color: ?Prompt.Color = null,
     /// Whether the built-in prompt may use colour: stdout is a terminal and NO_COLOR is unset or empty.
     use_color: bool = false,
-    /// The colours of the line editor and of SQL output. The default theme for now.
+    /// The colours of the line editor and of SQL output, from --theme or the config file.
     theme: replete.Theme = Theme.default,
 };
 
@@ -1245,6 +1246,13 @@ pub fn runREPL(
         return 0;
     }
 
+    // --theme wins over the config file's theme, and both are resolved once, here.
+    const config = ConfigFile.load(allocator, io, env, stderr) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ConfigFailed => return 1,
+    };
+    const theme_choice = Theme.effective(options.theme, config.theme);
+
     // The password is fetched on every connect. A prompt is asked once, here, and kept for reconnects.
     const supplier = try newSupplier(&switcher, &options);
     switcher.supplier = supplier;
@@ -1307,6 +1315,7 @@ pub fn runREPL(
         .connection = options.connection orelse "",
         .connection_color = switcher.selection.promptColor(),
         .use_color = use_color,
+        .theme = Theme.forChoice(theme_choice),
     };
 
     // The line editor draws on stdout directly, not through the tee Mirror: its redraws are terminal
@@ -1508,6 +1517,7 @@ test {
         @import("client.zig"),
         @import("client_command.zig"),
         @import("completion.zig"),
+        @import("config_file.zig"),
         @import("completion_script.zig"),
         @import("connections.zig"),
         @import("csv_output.zig"),

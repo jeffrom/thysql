@@ -123,14 +123,96 @@ pub const builtins = [_]struct { name: []const u8, theme: replete.Theme }{
 
 /// The built-in theme called `name`, or null. Case does not matter, and `_` is the same as `-`.
 pub fn find(name: []const u8) ?replete.Theme {
+    const canonical = canonicalName(name) orelse return null;
+    for (builtins) |entry| {
+        if (std.mem.eql(u8, entry.name, canonical)) return entry.theme;
+    }
+    return null;
+}
+
+/// The name of the built-in theme that `name` matches, as listed in `builtins`, or null.
+/// Case does not matter, and `_` is the same as `-`.
+pub fn canonicalName(name: []const u8) ?[]const u8 {
     // OptionFile.sameName ignores `_` against `-` but not case, so the name is lower-cased first.
     var lower: [64]u8 = undefined;
     if (name.len > lower.len) return null;
     const folded = std.ascii.lowerString(&lower, name);
     for (builtins) |entry| {
-        if (OptionFile.sameName(entry.name, folded)) return entry.theme;
+        if (OptionFile.sameName(entry.name, folded)) return entry.name;
     }
     return null;
+}
+
+/// The value of the `theme` setting: one theme, or a light and a dark theme, for the background.
+pub const Choice = union(enum) {
+    /// A built-in theme name, as `canonicalName` gives it.
+    fixed: []const u8,
+    pair: struct { light: []const u8, dark: []const u8 },
+};
+
+/// What a `theme` value may be, for error messages.
+pub const valid_names = blk: {
+    var text: []const u8 = "";
+    for (builtins) |entry| text = text ++ entry.name ++ ", ";
+    break :blk text ++ "catppuccin, or light:<name>,dark:<name>";
+};
+
+/// Every name that completion offers for `--theme`: the built-in names and `catppuccin`.
+pub const completion_names = blk: {
+    var names: [builtins.len + 1][]const u8 = undefined;
+    for (builtins, 0..) |entry, i| names[i] = entry.name;
+    names[builtins.len] = "catppuccin";
+    const final = names;
+    break :blk final[0..];
+};
+
+/// Parses a `theme` value: a built-in name, `catppuccin` (the latte and mocha pair), or
+/// `light:<name>,dark:<name>` in either order. Spaces around `,` and `:` are allowed.
+/// Null when the value is not valid.
+pub fn parseChoice(spec: []const u8) ?Choice {
+    const text = std.mem.trim(u8, spec, " \t");
+    if (std.mem.indexOfAny(u8, text, ",:") == null) {
+        if (std.ascii.eqlIgnoreCase(text, "catppuccin")) {
+            return .{ .pair = .{ .light = "catppuccin-latte", .dark = "catppuccin-mocha" } };
+        }
+        return .{ .fixed = canonicalName(text) orelse return null };
+    }
+
+    const comma = std.mem.indexOfScalar(u8, text, ',') orelse return null;
+    if (std.mem.indexOfScalarPos(u8, text, comma + 1, ',') != null) return null;
+    const first = parseSide(text[0..comma]) orelse return null;
+    const second = parseSide(text[comma + 1 ..]) orelse return null;
+    if (first.dark == second.dark) return null;
+    return if (first.dark)
+        .{ .pair = .{ .light = second.name, .dark = first.name } }
+    else
+        .{ .pair = .{ .light = first.name, .dark = second.name } };
+}
+
+/// One half of a `light:` or `dark:` pair.
+const Side = struct { dark: bool, name: []const u8 };
+
+fn parseSide(part: []const u8) ?Side {
+    const colon = std.mem.indexOfScalar(u8, part, ':') orelse return null;
+    const key = std.mem.trim(u8, part[0..colon], " \t");
+    const name = canonicalName(std.mem.trim(u8, part[colon + 1 ..], " \t")) orelse return null;
+    if (std.ascii.eqlIgnoreCase(key, "light")) return .{ .dark = false, .name = name };
+    if (std.ascii.eqlIgnoreCase(key, "dark")) return .{ .dark = true, .name = name };
+    return null;
+}
+
+/// The theme to draw with for `choice`. A pair uses its dark theme until light and dark are detected.
+pub fn forChoice(choice: Choice) replete.Theme {
+    const chosen = switch (choice) {
+        .fixed => |fixed| fixed,
+        .pair => |pair| pair.dark,
+    };
+    return find(chosen).?;
+}
+
+/// The choice in effect: `--theme` if given, else the config file's `theme`, else `default`.
+pub fn effective(flag: ?Choice, file: ?Choice) Choice {
+    return flag orelse file orelse .{ .fixed = "default" };
 }
 
 fn sgr(comptime params: []const u8) []const u8 {
@@ -197,4 +279,57 @@ test "mocha error is a red curly underline, and keeps its colour without undercu
 
     theme.undercurl = false;
     try std.testing.expectEqualStrings("\x1b[4m\x1b[58:2::243:139:168m", theme.sgr(.@"error"));
+}
+
+test "a theme value is a name, catppuccin, or a light and dark pair in either order" {
+    try std.testing.expectEqualStrings("catppuccin-mocha", parseChoice("Catppuccin_Mocha").?.fixed);
+    try std.testing.expectEqualStrings("default", parseChoice(" default ").?.fixed);
+
+    const shorthand = parseChoice("catppuccin").?.pair;
+    try std.testing.expectEqualStrings("catppuccin-latte", shorthand.light);
+    try std.testing.expectEqualStrings("catppuccin-mocha", shorthand.dark);
+
+    const light_first = parseChoice("light:catppuccin-frappe , dark : catppuccin-macchiato").?.pair;
+    try std.testing.expectEqualStrings("catppuccin-frappe", light_first.light);
+    try std.testing.expectEqualStrings("catppuccin-macchiato", light_first.dark);
+
+    const dark_first = parseChoice("dark:catppuccin-mocha,light:catppuccin-latte").?.pair;
+    try std.testing.expectEqualStrings("catppuccin-latte", dark_first.light);
+    try std.testing.expectEqualStrings("catppuccin-mocha", dark_first.dark);
+}
+
+test "a bad theme value is null" {
+    const bad = [_][]const u8{
+        "",
+        "catppuccin-espresso",
+        "catppuccin-",
+        "light:catppuccin-latte",
+        "light:default,light:catppuccin-mocha",
+        "light:default,dark:default,dark:default",
+        "light:default,dark:nope",
+        "default,dark:catppuccin-mocha",
+        "middle:default,dark:catppuccin-mocha",
+    };
+    for (bad) |spec| {
+        try std.testing.expectEqual(@as(?Choice, null), parseChoice(spec));
+    }
+}
+
+test "a pair resolves to its dark theme" {
+    const theme = forChoice(parseChoice("light:catppuccin-latte,dark:catppuccin-mocha").?);
+    try std.testing.expectEqualStrings("\x1b[1;38;2;203;166;247m", theme.keyword);
+    try std.testing.expectEqualStrings((replete.Theme{}).keyword, forChoice(parseChoice("default").?).keyword);
+}
+
+test "the flag wins over the config file, which wins over default" {
+    const flag_choice: Choice = .{ .fixed = "catppuccin-mocha" };
+    const file_choice: Choice = .{ .fixed = "catppuccin-latte" };
+    try std.testing.expectEqualStrings("catppuccin-mocha", effective(flag_choice, file_choice).fixed);
+    try std.testing.expectEqualStrings("catppuccin-latte", effective(null, file_choice).fixed);
+    try std.testing.expectEqualStrings("default", effective(null, null).fixed);
+}
+
+test "completion offers each name and catppuccin" {
+    try std.testing.expectEqual(builtins.len + 1, completion_names.len);
+    try std.testing.expectEqualStrings("catppuccin", completion_names[completion_names.len - 1]);
 }

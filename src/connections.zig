@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ConfigFile = @import("config_file.zig");
 const OptionFile = @import("option_file.zig");
 const options = @import("options.zig");
 const prompt = @import("prompt.zig");
@@ -211,13 +212,8 @@ pub fn listAll(allocator: Allocator, io: std.Io, env: *const std.process.Environ
 /// The connections root: `$XDG_CONFIG_HOME/thysql/connections` when XDG_CONFIG_HOME is set
 /// and non-empty, else `$HOME/.config/thysql/connections`. Null when neither is set.
 pub fn rootDir(allocator: Allocator, env: *const std.process.Environ.Map) Allocator.Error!?[]const u8 {
-    if (nonEmpty(env.get("XDG_CONFIG_HOME"))) |xdg| {
-        return try std.fs.path.join(allocator, &.{ xdg, "thysql", "connections" });
-    }
-    if (nonEmpty(env.get("HOME"))) |home| {
-        return try std.fs.path.join(allocator, &.{ home, ".config", "thysql", "connections" });
-    }
-    return null;
+    const folder = (try ConfigFile.dir(allocator, env)) orelse return null;
+    return try std.fs.path.join(allocator, &.{ folder, "connections" });
 }
 
 /// The `default-conn` of the directory `dir` (relative to the root, "" for the root), or null when it
@@ -431,11 +427,11 @@ fn parseColor(name: []const u8) ?(?prompt.Color) {
 }
 
 /// A connection key is any connection or output option, or an execution option, as in
-/// options.zig. Help and version are not allowed here, and neither is `connection`: a
-/// connection cannot name another one.
+/// options.zig. Help and version are not allowed here, and neither are `connection`, because a
+/// connection cannot name another one, and `theme`, which the config file sets.
 fn findSpec(key: []const u8) ?options.Spec {
     for (options.specs) |spec| {
-        if (spec.group != .other and spec.id != .connection and OptionFile.sameName(spec.long, key)) {
+        if (spec.group != .other and spec.id != .connection and spec.id != .theme and OptionFile.sameName(spec.long, key)) {
             return spec;
         }
     }
@@ -838,6 +834,21 @@ test "help is not a connection key, and default-conn is refused in a connection 
     stderr = .fixed(&buffer);
     try std.testing.expectError(error.ConnectionFailed, resolveIn(testContext(&arena, root, null, &stderr), "dc-in-file"));
     try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "dc-in-file:1: default-conn is only allowed in a directory's config file") != null);
+}
+
+test "theme is not a connection key, since the config file sets it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(&tmp, "themed", "theme = catppuccin\n");
+    const root = try tmpRoot(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(root);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [512]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&buffer);
+
+    try std.testing.expectError(error.ConnectionFailed, resolveIn(testContext(&arena, root, null, &stderr), "themed"));
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "themed:1: unknown key \"theme\"") != null);
 }
 
 test "a connection file cannot name another connection" {
