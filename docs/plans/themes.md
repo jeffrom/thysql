@@ -179,6 +179,46 @@ Terminals such as Ghostty, kitty and Contour report OS appearance changes:
   unrelated `CSI ? ... n` sequences are still ignored as before; the enable/disable
   sequences are written only with a callback set.
 
+## Step 5: the `ansi` theme (terminal palette)
+
+Truecolor cells keep their colour forever, so text already on screen and in scrollback does
+not change when the appearance does. Terminals recolour cells drawn with palette colours
+when their palette changes (e.g. Ghostty `theme = light:Catppuccin Latte,dark:Catppuccin Mocha`),
+so a theme made only of the 16 ANSI colours follows the terminal's own light/dark switch
+everywhere, scrollback included, with no detection by thysql.
+
+- Add a built-in `ansi` theme to `src/theme.zig` (it joins `builtins`, so lookup, errors and
+  completion pick it up). It uses only SGR 30-37 and 90-97 and attributes: never `38;5;N`
+  for N > 15, never `38;2`. Mapping:
+
+| Style | SGR |
+| --- | --- |
+| keyword | `1;35` |
+| keyword_nonreserved | `35` |
+| identifier | plain |
+| quoted_identifier | `33` |
+| string | `32` |
+| number | `91` |
+| comment | `3;90` |
+| operator | `36` |
+| variable | `31` |
+| function | `34` |
+| delimiter | `1;90` |
+| client_command | `95` |
+| error | `\x1b[4:3m\x1b[58:5:1m` (curly underline in palette red) |
+| error_straight | `\x1b[4m\x1b[58:5:1m` |
+| hint | `90` |
+| diagnostic | `31` |
+
+- `ansi` is a fixed theme: no background query and no mode 2031 listening.
+- README (colour themes section): list `ansi`, and explain when to prefer it: if the terminal
+  switches its own theme with the system appearance, `theme = ansi` makes everything on
+  screen and in scrollback follow the switch, using the terminal's palette (with a Catppuccin
+  terminal theme, keywords are Catppuccin's pink rather than mauve). The truecolor pairs
+  only recolour new lines. Give the Ghostty config line as the example.
+- Tests: `find("ansi")` works; no style of `ansi` contains `38;5;` or `38;2;`; the keyword is
+  `\x1b[1;35m`; the error keeps its palette underline colour without undercurl.
+
 ## Out of scope for now
 
 User-defined theme files.
