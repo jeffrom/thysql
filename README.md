@@ -584,7 +584,8 @@ The names are `default`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-ma
 `catppuccin-mocha`. Case does not matter, and `_` is the same as `-`. A pair names a light and a
 dark theme. At startup thysql asks the terminal for its background colour and uses the matching
 side; when the terminal does not answer within 100 ms, it goes by `COLORFGBG`, and otherwise
-picks dark. Colour is off when stdout is not a terminal or `NO_COLOR` is set, as before.
+picks dark. In terminals that report appearance changes (mode 2031, such as Ghostty, kitty and
+Contour), the theme follows the system's light/dark switch while you type. Colour is off when stdout is not a terminal or `NO_COLOR` is set, as before.
 
 To set the theme for every session, put it in the config file,
 `$XDG_CONFIG_HOME/thysql/config` or `~/.config/thysql/config`. It takes `key = value` lines and
