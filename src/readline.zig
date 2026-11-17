@@ -160,6 +160,12 @@ pub const Session = struct {
         self.config.theme = theme;
     }
 
+    /// Sets what is told when the terminal's light or dark appearance changes, or clears it with
+    /// null. While it is set, each line is read with the terminal reporting such changes.
+    pub fn setColorScheme(self: *Session, scheme: ?replete.ColorScheme) void {
+        self.config.color_scheme = scheme;
+    }
+
     /// Adds an accepted statement to the history and appends it to the history file, unless
     /// `ignore` matches it. A file that cannot be written is not an error: the statement is
     /// still in this session's history.
@@ -1596,4 +1602,32 @@ test "setTheme changes the theme the editor draws with" {
     session.setTheme(mocha);
     try std.testing.expectEqualStrings(mocha.keyword, session.repl.cfg.theme.keyword);
     try std.testing.expectEqualStrings(mocha.keyword, session.config.theme.keyword);
+}
+
+test "setColorScheme sets and clears the callback the editor reads" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    var syntax = Syntax.init(allocator, false);
+    defer syntax.deinit();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    const session = try Session.setup(allocator, std.testing.io, &env, &output.writer, &names, &syntax, Theme.default);
+    defer session.deinit();
+    try std.testing.expect(session.config.color_scheme == null);
+
+    const Unused = struct {
+        fn changed(context: *anyopaque, dark: bool) void {
+            _ = context;
+            _ = dark;
+        }
+    };
+    var marker: u8 = 0;
+    session.setColorScheme(.{ .context = &marker, .changed = Unused.changed });
+    try std.testing.expect(session.config.color_scheme != null);
+    session.setColorScheme(null);
+    try std.testing.expect(session.config.color_scheme == null);
 }

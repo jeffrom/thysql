@@ -116,6 +116,18 @@ pub const ReplConfig = struct {
     diagnoser: ?Diagnoser = null,
     /// Optional work done while the input is idle, such as parsing the line for a diagnostic.
     idle: ?Idle = null,
+    /// Optional change of the terminal's light or dark appearance. When set, the editor asks the
+    /// terminal to report changes (mode 2031) while a line is read, and see `ColorScheme`.
+    color_scheme: ?ColorScheme = null,
+};
+
+/// Told when the terminal's appearance changes, from mode 2031. The reports are not text: they
+/// never reach the line. After `changed` runs, the line is drawn again, with whatever theme it set.
+pub const ColorScheme = struct {
+    /// Passed to `changed` as its first argument.
+    context: *anyopaque,
+    /// Called with true for a dark appearance and false for a light one.
+    changed: *const fn (context: *anyopaque, dark: bool) void,
 };
 
 /// Runs work while the user is not typing. `tick` runs once when input has been idle for `delay_ms`,
@@ -259,6 +271,8 @@ pub const Repl = struct {
     rendered_cursor_row: usize,
     quoted_next: bool,
     bracketed_paste_enabled: bool,
+    /// Whether mode 2031 (colour scheme reports) was turned on for the line being read.
+    color_scheme_enabled: bool,
     /// Prompt for the next `readline`; see `setPrompt`.
     prompt: []const u8,
     /// Prompt drawn for the current line; `prompt`, or the fallback when Kitty graphics are unavailable.
@@ -298,6 +312,7 @@ pub const Repl = struct {
             .rendered_cursor_row = 0,
             .quoted_next = false,
             .bracketed_paste_enabled = false,
+            .color_scheme_enabled = false,
             .prompt = cfg.prompt,
             .active_prompt = cfg.prompt,
             .kitty_graphics = null,
@@ -342,6 +357,7 @@ pub const Repl = struct {
             // already redrawn for its last time is past that point.
             if (self.decorated) self.redrawFinal() catch {};
             self.disableBracketedPaste() catch {};
+            self.disableColorScheme() catch {};
             self.cfg.out.flush() catch {};
         }
         try self.editStart();
@@ -412,6 +428,10 @@ pub const Repl = struct {
         if (self.cfg.bracketed_paste) {
             try self.cfg.out.writeAll("\x1b[?2004h");
             self.bracketed_paste_enabled = true;
+        }
+        if (self.cfg.color_scheme != null) {
+            try self.cfg.out.writeAll("\x1b[?2031h");
+            self.color_scheme_enabled = true;
         }
         // Each line may use a different prompt, so its Kitty setup is sent
         // here, once per line, rather than while the line is repainted.
@@ -1493,6 +1513,10 @@ pub const Repl = struct {
         var parameter: usize = 0;
         var hasParameter = false;
         var parsingFirstParameter = true;
+        // The `?` of a private sequence, and the second parameter with how many fields came before it.
+        var private = false;
+        var fields: usize = 0;
+        var second: usize = 0;
 
         // A CSI sequence ends with a byte in the 0x40-0x7e range. Only the
         // first numeric parameter selects an editing action; later parameters
@@ -1501,6 +1525,11 @@ pub const Repl = struct {
         while (sequenceLen < 32) : (sequenceLen += 1) {
             const byte = (try self.takeEscapeByte()) orelse return;
             if (byte >= 0x40 and byte <= 0x7e) {
+                // CSI ? 997 ; 1 n is dark and CSI ? 997 ; 2 n is light (mode 2031).
+                if (private and byte == 'n' and hasParameter and parameter == 997 and fields == 1 and (second == 1 or second == 2)) {
+                    try self.colorSchemeReported(second == 1);
+                    return;
+                }
                 try self.editEscapeFinal(
                     byte,
                     if (hasParameter) parameter else null,
@@ -1508,13 +1537,26 @@ pub const Repl = struct {
                 return;
             }
 
-            if (parsingFirstParameter and byte >= '0' and byte <= '9') {
+            if (sequenceLen == 0 and byte == '?') {
+                private = true;
+            } else if (parsingFirstParameter and byte >= '0' and byte <= '9') {
                 hasParameter = true;
                 if (parameter < 1000) parameter = parameter * 10 + byte - '0';
             } else if (byte == ';') {
                 parsingFirstParameter = false;
+                fields += 1;
+            } else if (fields == 1 and byte >= '0' and byte <= '9') {
+                if (second < 1000) second = second * 10 + byte - '0';
             }
         }
+    }
+
+    /// Handles a mode 2031 report: the callback, if any, changes the theme, and the line is drawn
+    /// again. Without a callback the report is dropped, and it is never inserted into the line.
+    fn colorSchemeReported(self: *Repl, dark: bool) !void {
+        const scheme = self.cfg.color_scheme orelse return;
+        scheme.changed(scheme.context, dark);
+        try self.refreshLine();
     }
 
     fn editEscapeFinal(self: *Repl, final: u8, parameter: ?usize) !void {
@@ -1649,6 +1691,7 @@ pub const Repl = struct {
             self.rendered_cursor_row = bottom_row;
         }
         try self.disableBracketedPaste();
+        try self.disableColorScheme();
         try self.cfg.out.flush();
     }
 
@@ -1656,6 +1699,12 @@ pub const Repl = struct {
         if (!self.bracketed_paste_enabled) return;
         try self.cfg.out.writeAll("\x1b[?2004l");
         self.bracketed_paste_enabled = false;
+    }
+
+    fn disableColorScheme(self: *Repl) !void {
+        if (!self.color_scheme_enabled) return;
+        try self.cfg.out.writeAll("\x1b[?2031l");
+        self.color_scheme_enabled = false;
     }
 
     pub fn debugMode(self: Repl) ReplError!void {
@@ -1901,6 +1950,93 @@ test "bracketed paste inserts newlines and controls without executing them" {
         80,
         "beforefirst\nsecond\x03after",
     );
+}
+
+const SchemeCounter = struct {
+    calls: usize = 0,
+    dark: bool = false,
+
+    fn changed(context: *anyopaque, dark: bool) void {
+        const counter: *SchemeCounter = @ptrCast(@alignCast(context));
+        counter.calls += 1;
+        counter.dark = dark;
+    }
+};
+
+test "colour scheme reports call the callback and never reach the line" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("ab\x1b[?997;2nc\x1b[?997;1n" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var counter: SchemeCounter = .{};
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .color_scheme = .{ .context = &counter, .changed = SchemeCounter.changed },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("abc", try repl.readline());
+    try std.testing.expectEqual(@as(usize, 2), counter.calls);
+    try std.testing.expect(counter.dark);
+}
+
+test "other private reports are still ignored and do not call the colour scheme" {
+    const allocator = std.testing.allocator;
+    var input: Io.Reader = .fixed("x\x1b[?997;3ny\x1b[?25ny" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var counter: SchemeCounter = .{};
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .color_scheme = .{ .context = &counter, .changed = SchemeCounter.changed },
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectEqualStrings("xyy", try repl.readline());
+    try std.testing.expectEqual(@as(usize, 0), counter.calls);
+}
+
+test "mode 2031 is switched on for a line only when a colour scheme is set" {
+    const allocator = std.testing.allocator;
+    var counter: SchemeCounter = .{};
+
+    var input: Io.Reader = .fixed("a" ++ testKeys.enter);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const with: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .color_scheme = .{ .context = &counter, .changed = SchemeCounter.changed },
+    };
+    var repl = try Repl.init(allocator, &with);
+    defer repl.deinit();
+    try std.testing.expectEqualStrings("a", try repl.readline());
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[?2031h") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "\x1b[?2031l"));
+
+    var plain_input: Io.Reader = .fixed("a" ++ testKeys.enter);
+    var plain_output: Io.Writer.Allocating = .init(allocator);
+    defer plain_output.deinit();
+    const without: ReplConfig = .{
+        .prompt = "> ",
+        .in = &plain_input,
+        .out = &plain_output.writer,
+        .columns = 80,
+    };
+    var plain = try Repl.init(allocator, &without);
+    defer plain.deinit();
+    try std.testing.expectEqualStrings("a", try plain.readline());
+    try std.testing.expect(std.mem.indexOf(u8, plain_output.written(), "2031") == null);
 }
 
 test "readline backspace removes the previous character" {

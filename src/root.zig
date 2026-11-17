@@ -76,6 +76,10 @@ const ConnectionSwitch = struct {
     /// Whether the background is dark. It is asked of the terminal the first time a pair theme needs
     /// it, and kept for the rest of the process. Null until then.
     dark_background: ?bool = null,
+    /// The choice in effect, as `applyTheme` last set it. A change of appearance picks its side again.
+    choice: Theme.Choice = .{ .fixed = "default" },
+    /// The REPL that `applyTheme` updates, once the session is set up. Null before that.
+    repl: ?*Repl = null,
 
     fn deinit(self: *ConnectionSwitch) void {
         if (self.supplier) |supplier| {
@@ -265,11 +269,25 @@ fn themeFor(switcher: *ConnectionSwitch, choice: Theme.Choice) replete.Theme {
     return Theme.forChoice(choice, switcher.dark_background orelse true);
 }
 
-/// Makes `choice` the theme of the line editor and of SQL highlighting, from the next draw on.
-/// `\C` calls it after a switch.
+/// Makes `choice` the theme in effect: the theme of the line editor and of SQL highlighting, from
+/// the next draw on. A pair also listens for changes of appearance (mode 2031), when colour is on.
+/// Startup and `\C` both call it.
 fn applyTheme(switcher: *ConnectionSwitch, repl: *Repl, choice: Theme.Choice) void {
+    switcher.choice = choice;
     repl.theme = themeFor(switcher, choice);
-    if (repl.readline) |readline| readline.setTheme(repl.theme);
+    if (repl.readline) |readline| {
+        readline.setTheme(repl.theme);
+        const listen = choice == .pair and switcher.use_color;
+        readline.setColorScheme(if (listen) .{ .context = switcher, .changed = appearanceChanged } else null);
+    }
+}
+
+/// Runs when the terminal reports a change of appearance. The background is now `dark`, and the
+/// theme in effect is picked again, so a pair follows it. The context is the ConnectionSwitch.
+fn appearanceChanged(context: *anyopaque, dark: bool) void {
+    const switcher: *ConnectionSwitch = @ptrCast(@alignCast(context));
+    switcher.dark_background = dark;
+    if (switcher.repl) |repl| applyTheme(switcher, repl, switcher.choice);
 }
 
 /// Writes the --version output for this build.
@@ -1382,6 +1400,10 @@ pub fn runREPL(
         .repl = repl,
         .readline = readline,
     };
+    // The session's REPL is the one in the context, which holds a copy of `repl`. The theme is
+    // applied here, so a pair starts listening for appearance changes.
+    switcher.repl = &context.repl;
+    applyTheme(&switcher, &context.repl, theme_choice);
     while (true) {
         const done = try readOneLine(&context, out, stderr, env);
         if (done) {
@@ -1613,4 +1635,69 @@ test "a pair theme takes the background once, and then keeps the answer" {
     // The kept answer is used for later pairs, so the terminal is not asked again.
     switcher.dark_background = false;
     try std.testing.expectEqualStrings(Theme.find("catppuccin-latte").?.keyword, themeFor(&switcher, pair).keyword);
+}
+
+test "applyTheme listens for appearance changes only for a pair with colour on" {
+    const allocator = std.testing.allocator;
+    var names = SqlCompletion.Names.init(allocator);
+    defer names.deinit();
+    var syntax = Syntax.init(allocator, false);
+    defer syntax.deinit();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const session = try Readline.Session.setup(allocator, std.testing.io, &env, &output.writer, &names, &syntax, Theme.default);
+    defer session.deinit();
+    var prompt_state = try Prompt.State.init(allocator, null, null);
+    defer prompt_state.deinit();
+    var history_ignore = try Readline.Ignore.init(allocator, null);
+    defer history_ignore.deinit();
+    var repl: Repl = .{
+        .names = &names,
+        .prompt = &prompt_state,
+        .history_ignore = &history_ignore,
+        .auto_rehash = false,
+        .reconnect = false,
+        .silent = true,
+        .syntax = &syntax,
+        .readline = session,
+    };
+    var switcher: ConnectionSwitch = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .env = &env,
+        .stderr = &output.writer,
+        .stdin_is_tty = false,
+        .args = &.{},
+        .first = 1,
+        .base = &.{},
+        .selection = .{ .gpa = allocator, .settings = &.{} },
+        .stdout = &output.writer,
+        .use_color = true,
+        .dark_background = true,
+        .repl = &repl,
+    };
+    const pair = Theme.parseChoice("catppuccin").?;
+
+    // A pair listens, and starts on the dark side.
+    applyTheme(&switcher, &repl, pair);
+    try std.testing.expect(session.config.color_scheme != null);
+    try std.testing.expectEqualStrings(Theme.find("catppuccin-mocha").?.keyword, session.config.theme.keyword);
+
+    // A change to light picks the light side and keeps listening.
+    appearanceChanged(&switcher, false);
+    try std.testing.expectEqual(@as(?bool, false), switcher.dark_background);
+    try std.testing.expectEqualStrings(Theme.find("catppuccin-latte").?.keyword, repl.theme.keyword);
+    try std.testing.expectEqualStrings(Theme.find("catppuccin-latte").?.keyword, session.config.theme.keyword);
+    try std.testing.expect(session.config.color_scheme != null);
+
+    // A fixed theme stops listening.
+    applyTheme(&switcher, &repl, .{ .fixed = "catppuccin-mocha" });
+    try std.testing.expect(session.config.color_scheme == null);
+
+    // Without colour, a pair does not listen either.
+    switcher.use_color = false;
+    applyTheme(&switcher, &repl, pair);
+    try std.testing.expect(session.config.color_scheme == null);
 }
