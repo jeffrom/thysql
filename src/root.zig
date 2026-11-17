@@ -19,6 +19,7 @@ const Prompt = @import("prompt.zig");
 const Readline = @import("readline.zig");
 const SqlCompletion = @import("sql_completion.zig");
 const Syntax = @import("syntax.zig").Syntax;
+const SqlHighlight = @import("sql_highlight.zig");
 pub const Unicode = @import("unicode.zig");
 
 /// Settings and state that only the interactive client has. Batch input runs without
@@ -535,6 +536,8 @@ fn replFormat(options: *const Options.Options, query: Batch.Query) Options.Resul
 /// pager. JSON and CSV write the footer to stderr after the rows, so the rows stay clean.
 fn renderResult(
     client: *Client,
+    repl: *const Repl,
+    sql: []const u8,
     result: [*c]C.struct_st_mysql_res,
     format: Options.ResultFormat,
     render_options: Mysql.RenderOptions,
@@ -548,9 +551,14 @@ fn renderResult(
         defer sink.close();
 
         const out = sink.writer();
+        // The DDL of a SHOW CREATE statement is coloured only when it goes straight to a colour
+        // terminal: a pager may not pass escape sequences through, and the tee copy has them stripped.
+        const highlighter: SqlHighlight.Highlighter = .{ .lexer = repl.syntax.lexer };
+        const colour = repl.use_color and !sink.isPiped() and SqlHighlight.Highlighter.isShowCreate(sql, repl.syntax.lexer);
+        const highlight: ?*const SqlHighlight.Highlighter = if (colour) &highlighter else null;
         const rendered = switch (format) {
             .table => Mysql.render_result_timed_with_warnings(out, result, elapsed_ns, warnings),
-            .vertical => Mysql.render_result_vertical_timed_with_warnings(out, result, elapsed_ns, warnings),
+            .vertical => Mysql.render_result_vertical_timed_highlighted(out, result, elapsed_ns, warnings, highlight),
             .tab => renderTabResult(out, result, render_options, elapsed_ns, warnings),
             .json, .ndjson, .csv => Mysql.renderResultAs(out, result, format, render_options),
         };
@@ -636,7 +644,7 @@ fn executeQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.Io.W
                 const kept = client.keepResult(result);
                 defer if (!kept) Mysql.freeResult(result);
                 warnings = db.warningCount();
-                try renderResult(client, result, format, render_options, stderr, elapsed_ns, warnings);
+                try renderResult(client, &context.repl, query.sql, result, format, render_options, stderr, elapsed_ns, warnings);
             },
             .ok => |ok| {
                 warnings = ok.warnings;
@@ -1514,6 +1522,7 @@ test {
         @import("sql/lexer_test.zig"),
         @import("sql/parser.zig"),
         @import("sql_completion.zig"),
+        @import("sql_highlight.zig"),
         @import("syntax.zig"),
         @import("unicode.zig"),
     };

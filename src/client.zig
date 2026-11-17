@@ -338,7 +338,8 @@ pub const Mirror = struct {
             for (0..repeat) |_| {
                 try self.primary.writeAll(bytes);
                 if (self.client.teeWriter()) |tee| {
-                    tee.writeAll(bytes) catch {};
+                    // Colour is for the terminal only, so the tee file gets the text without it.
+                    Prompt.writeWithoutCsi(tee, bytes) catch {};
                 }
                 consumed += bytes.len;
             }

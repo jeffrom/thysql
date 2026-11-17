@@ -7,6 +7,7 @@ const Options = @import("options.zig");
 const Password = @import("password.zig");
 const CsvOutput = @import("csv_output.zig");
 const JsonOutput = @import("json_output.zig");
+const SqlHighlight = @import("sql_highlight.zig");
 
 const maxTableColumnDisplayWidth: usize = 1024;
 const crServerGoneError: u32 = 2006;
@@ -1185,6 +1186,11 @@ pub fn render_result_timed_with_warnings(out: *std.Io.Writer, result: [*c]C.stru
 }
 
 pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res) !void {
+    try render_result_vertical_highlighted(out, result, null);
+}
+
+/// Vertical output where, with `highlight`, the SQL of a SHOW CREATE result is coloured.
+pub fn render_result_vertical_highlighted(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, highlight: ?*const SqlHighlight.Highlighter) !void {
     const numFields: usize = C.mysql_num_fields(result);
 
     if (C.mysql_num_rows(result) == 0) {
@@ -1222,6 +1228,9 @@ pub fn render_result_vertical(out: *std.Io.Writer, result: [*c]C.struct_st_mysql
             } else if (isBinaryField(field)) {
                 try Unicode.printHexValue(out, row[i][0..lengths[i]], std.math.maxInt(usize));
                 try out.print("\n", .{});
+            } else if (highlight != null and SqlHighlight.Highlighter.isSqlColumn(name)) {
+                try highlight.?.write(out, row[i][0..lengths[i]]);
+                try out.print("\n", .{});
             } else {
                 try Unicode.printVerticalValue(out, row[i][0..lengths[i]]);
                 try out.print("\n", .{});
@@ -1238,6 +1247,10 @@ pub fn render_result_vertical_timed(out: *std.Io.Writer, result: [*c]C.struct_st
 }
 
 pub fn render_result_vertical_timed_with_warnings(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96, warnings: u32) !void {
+    try render_result_vertical_timed_highlighted(out, result, elapsed_ns, warnings, null);
+}
+
+pub fn render_result_vertical_timed_highlighted(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, elapsed_ns: i96, warnings: u32, highlight: ?*const SqlHighlight.Highlighter) !void {
     if (C.mysql_num_rows(result) == 0) {
         try out.print("Empty set", .{});
         try renderWarningCount(out, warnings);
@@ -1247,7 +1260,7 @@ pub fn render_result_vertical_timed_with_warnings(out: *std.Io.Writer, result: [
         return;
     }
 
-    try render_result_vertical(out, result);
+    try render_result_vertical_highlighted(out, result, highlight);
     try out.print("\n", .{});
     try render_result_footer(out, result, elapsed_ns, warnings);
 }
@@ -2302,6 +2315,37 @@ test "render SELECT 1 AS one, 'two' AS two vertically" {
         \\
     ;
     try expectRenderedVertical(&result, expect);
+}
+
+test "vertical output colours the SQL of SHOW CREATE only with a highlighter" {
+    var fields = [_]C.struct_st_mysql_field{
+        mysqlField("Table", 1, C.MYSQL_TYPE_VAR_STRING),
+        mysqlField("Create Table", 16, C.MYSQL_TYPE_VAR_STRING),
+    };
+    var row_storage: MysqlRowStorage2 = undefined;
+    initMysqlRowStorage2(&row_storage, "t", "CREATE TABLE `t`");
+    var row = mysqlRow(&row_storage, null);
+    var data = mysqlData(&row, 1, fields.len);
+    var result = mysqlResult(&fields, &data, &row_storage.lengths);
+
+    try expectRenderedVertical(&result,
+        \\*************************** 1. row ***************************
+        \\       Table: t
+        \\Create Table: CREATE TABLE `t`
+        \\
+    );
+
+    const gpa = std.testing.allocator;
+    var writer: std.Io.Writer.Allocating = .init(gpa);
+    defer writer.deinit();
+    const highlighter: SqlHighlight.Highlighter = .{ .lexer = .{} };
+    try render_result_vertical_highlighted(&writer.writer, &result, &highlighter);
+    const theme = highlighter.theme;
+    const want = try std.fmt.allocPrint(gpa, "*************************** 1. row ***************************\n" ++
+        "       Table: t\n" ++
+        "Create Table: {s}CREATE\x1b[0m {s}TABLE\x1b[0m {s}`t`\x1b[0m\n", .{ theme.keyword, theme.keyword, theme.quoted_identifier });
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, writer.written());
 }
 
 test "render SELECT 1 AS one, 'two' AS two vertically with timed footer" {

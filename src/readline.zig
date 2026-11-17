@@ -15,6 +15,7 @@ const SqlKeywords = @import("sql/keywords.zig");
 const SqlLexer = @import("sql/lexer.zig");
 const Syntax = @import("syntax.zig").Syntax;
 const SqlParser = @import("sql/parser.zig");
+const SqlHighlight = @import("sql_highlight.zig");
 
 /// What `Session.one` read.
 pub const Outcome = union(enum) {
@@ -313,30 +314,11 @@ fn appendSpans(
 
     var lexer = SqlLexer.Lexer.init(joined.items, options);
     while (lexer.next()) |tok| {
-        const style = styleOf(tok.kind) orelse continue;
+        const style = SqlHighlight.styleOf(tok.kind) orelse continue;
         if (tok.end <= prefix) continue;
         const start = @max(tok.start, prefix);
         try spans.append(gpa, .{ .start = start - prefix, .len = tok.end - start, .style = style });
     }
-}
-
-/// The style for a token of `kind`. Null for the text that is drawn plain.
-fn styleOf(kind: SqlLexer.Kind) ?replete.Style {
-    return switch (kind) {
-        .reserved_keyword => .keyword,
-        .keyword => .keyword_nonreserved,
-        .function => .function,
-        .identifier => .identifier,
-        .quoted_identifier => .quoted_identifier,
-        .string => .string,
-        .number => .number,
-        .comment, .optimizer_hint, .version_comment_start, .version_comment_end => .comment,
-        .variable, .placeholder => .variable,
-        .operator => .operator,
-        .delimiter => .delimiter,
-        .client_command => .client_command,
-        .whitespace, .dot, .punctuation, .unknown => null,
-    };
 }
 
 /// What tab completion reads. `scratch` holds the strings that candidates point to, such as
