@@ -580,12 +580,29 @@ thysql --theme=catppuccin        # light:catppuccin-latte,dark:catppuccin-mocha
 thysql --theme=light:catppuccin-latte,dark:catppuccin-mocha
 ```
 
-The names are `default`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato` and
-`catppuccin-mocha`. Case does not matter, and `_` is the same as `-`. A pair names a light and a
-dark theme. At startup thysql asks the terminal for its background colour and uses the matching
-side; when the terminal does not answer within 100 ms, it goes by `COLORFGBG`, and otherwise
-picks dark. In terminals that report appearance changes (mode 2031, such as Ghostty, kitty and
-Contour), the theme follows the system's light/dark switch while you type. Colour is off when stdout is not a terminal or `NO_COLOR` is set, as before.
+The names are `default`, `ansi`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`
+and `catppuccin-mocha`. Case does not matter, and `_` is the same as `-`. A pair names a light and
+a dark theme. At startup thysql asks the terminal for its background colour and uses the matching
+side; when the terminal does not answer within 100 ms, it goes by `COLORFGBG`, and otherwise picks
+dark. In terminals that report appearance changes (mode 2031, such as Ghostty, kitty and
+Contour), the theme follows the system's light/dark switch while you type. Colour is off when
+stdout is not a terminal or `NO_COLOR` is set, as before.
+
+`ansi` uses the terminal's own 16 colours instead of fixed ones. If the terminal switches its
+palette with the system appearance, `theme = ansi` makes everything on screen and in scrollback
+follow the switch, since the colours are looked up when drawn. The other themes set their colours
+as RGB, so text already on screen keeps its colours and only new lines pick up a switch. With a
+Catppuccin terminal theme, keywords are Catppuccin's pink rather than mauve. Ghostty example:
+
+```ini
+# ~/.config/ghostty/config
+theme = light:Catppuccin Latte,dark:Catppuccin Mocha
+```
+
+```ini
+# ~/.config/thysql/config
+theme = ansi
+```
 
 To set the theme for every session, put it in the config file,
 `$XDG_CONFIG_HOME/thysql/config` or `~/.config/thysql/config`. It takes `key = value` lines and

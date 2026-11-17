@@ -8,6 +8,28 @@ const OptionFile = @import("option_file.zig");
 /// The default theme: replete's own colours, unchanged.
 pub const default: replete.Theme = .{};
 
+/// The terminal's own 16 ANSI colours, so the terminal's palette decides how they look. Cells
+/// drawn with these follow the palette when the terminal switches light and dark, scrollback
+/// included. Only SGR 30-37, 90-97 and attributes are used, never 256 or truecolour.
+pub const ansi: replete.Theme = .{
+    .keyword = "\x1b[1;35m",
+    .keyword_nonreserved = "\x1b[35m",
+    .identifier = "",
+    .quoted_identifier = "\x1b[33m",
+    .string = "\x1b[32m",
+    .number = "\x1b[91m",
+    .comment = "\x1b[3;90m",
+    .operator = "\x1b[36m",
+    .variable = "\x1b[31m",
+    .function = "\x1b[34m",
+    .delimiter = "\x1b[1;90m",
+    .client_command = "\x1b[95m",
+    .@"error" = "\x1b[4:3m\x1b[58:5:1m",
+    .error_straight = "\x1b[4m\x1b[58:5:1m",
+    .hint = "\x1b[90m",
+    .diagnostic = "\x1b[31m",
+};
+
 /// The colours of one Catppuccin flavour, as 0xRRGGBB.
 pub const Palette = struct {
     flamingo: u24,
@@ -119,6 +141,7 @@ pub const builtins = [_]struct { name: []const u8, theme: replete.Theme }{
     .{ .name = "catppuccin-frappe", .theme = fromPalette(frappe) },
     .{ .name = "catppuccin-macchiato", .theme = fromPalette(macchiato) },
     .{ .name = "catppuccin-mocha", .theme = fromPalette(mocha) },
+    .{ .name = "ansi", .theme = ansi },
 };
 
 /// The built-in theme called `name`, or null. Case does not matter, and `_` is the same as `-`.
@@ -304,6 +327,25 @@ test "mocha error is a red curly underline, and keeps its colour without undercu
 
     theme.undercurl = false;
     try std.testing.expectEqualStrings("\x1b[4m\x1b[58:2::243:139:168m", theme.sgr(.@"error"));
+}
+
+test "ansi is found by name and uses only palette colours and attributes" {
+    const theme = find("ansi").?;
+    try std.testing.expect(find("ANSI") != null);
+    try std.testing.expectEqualStrings("\x1b[1;35m", theme.keyword);
+    for (std.enums.values(replete.Style)) |style| {
+        const sequence = theme.sgr(style);
+        try std.testing.expect(std.mem.indexOf(u8, sequence, "38;5;") == null);
+        try std.testing.expect(std.mem.indexOf(u8, sequence, "38;2") == null);
+    }
+}
+
+test "ansi errors keep their palette underline colour without undercurl" {
+    var theme = find("ansi").?;
+    try std.testing.expectEqualStrings("\x1b[4:3m\x1b[58:5:1m", theme.sgr(.@"error"));
+
+    theme.undercurl = false;
+    try std.testing.expectEqualStrings("\x1b[4m\x1b[58:5:1m", theme.sgr(.@"error"));
 }
 
 test "a theme value is a name, catppuccin, or a light and dark pair in either order" {
