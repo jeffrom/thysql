@@ -108,7 +108,9 @@ class CompletionTests(E2ETestCase):
                 session.expect('unknown table or alias "p"; did you mean "people p"?')
                 # The line is not changed, and Ctrl-C drops it, so the session can end.
                 session.send("\x03")
-                session.expect(main_prompt(server))
+                # Wait for the fresh prompt after the newline. The hint's redraw of the typed line also
+                # starts with the prompt, and a Ctrl-D sent then is lost to the line between edits.
+                session.expect("\n" + main_prompt(server))
                 self.finish(session)
 
     def test_a_correct_alias_completes_columns_with_no_qualifier_message(self):
