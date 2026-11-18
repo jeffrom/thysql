@@ -1,10 +1,10 @@
 cask "thysql" do
   arch arm: "arm64", intel: "x86_64"
 
-  version "0.4.1"
+  version "0.4.2"
   # tools/update_cask.sh fills these in from the release's SHA256SUMS.
-  sha256 arm:   "9dd367dcadffe3ad8f1ef00c593c5e787ad6aefbddb307a6ee752c66474f7e65",
-         intel: "05a31393ad3d8e52d2213f52ca05fc95b9bf22bc98fc0f8787b16a6ffadda7c9"
+  sha256 arm:   "86b8ebca230975d60d1299eb23772896326f809f49978c6a5ee489ddbe35b1da",
+         intel: "0313acde9d85c20db74a1665a862e25d4046f6dc8d9bb2f4fb5fc9168da39be1"
 
   url "https://github.com/jeffrom/thysql/releases/download/v#{version}/thysql-#{version}-darwin-#{arch}.tar.gz"
   name "thysql"
