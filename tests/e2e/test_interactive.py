@@ -20,6 +20,8 @@ from harness import (
 )
 
 ENTER = "\r"
+CTRL_P = "\x10"
+BACKSPACE = "\x7f"
 
 
 def main_prompt(user, server, database=TEST_DB):
@@ -95,6 +97,30 @@ class InteractiveTests(E2ETestCase):
         self.assertEqual(quit_session(session, server, ROOT_USER), 0)
         self.assertTrue(os.path.isfile(histfile), "MYSQL_HISTFILE was not used")
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local")))
+
+    def test_running_an_edited_history_entry_keeps_the_original(self):
+        histfile = os.path.join(self.home, "edit-history")
+        env = {**password_env(ROOT_USER), "MYSQL_HISTFILE": histfile}
+        server = self.each_server()[0]
+        prompt = main_prompt(ROOT_USER, server)
+        session = self.interactive(server.connect_args(ROOT_USER) + [TEST_DB], env=env)
+        session.expect(prompt)
+        session.send("select 41;" + ENTER)
+        session.expect("1 row in set")
+        session.expect(prompt)
+
+        # Recall it, turn it into "select 41+1;", and run that.
+        session.send(CTRL_P + BACKSPACE + "+1;" + ENTER)
+        session.expect(re.compile(r"\|\s*42\s*\|"))
+        session.expect("1 row in set")
+        session.expect(prompt)
+
+        # Two steps back is the original, not a second copy of the edit.
+        session.send(CTRL_P + CTRL_P + ENTER)
+        consumed = session.expect("1 row in set")
+        self.assertRegex(consumed, r"\|\s*41\s*\|")
+        self.assertNotRegex(consumed, r"\|\s*42\s*\|")
+        self.assertEqual(quit_session(session, server, ROOT_USER), 0)
 
     def test_mysql_histignore_keeps_matching_statements_out_of_history(self):
         histfile = os.path.join(self.home, "histignore-history")
