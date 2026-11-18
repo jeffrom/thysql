@@ -109,6 +109,15 @@ pub const History = struct {
         return true;
     }
 
+    /// Puts `line`, which must come from the history's allocator, in place of
+    /// an entry's line and returns the old one. The history owns `line`
+    /// afterwards and the caller owns the result. Does not allocate.
+    pub fn swapLine(self: *History, index: usize, line: []u8) []u8 {
+        const old = self.entries.items[index].line;
+        self.entries.items[index].line = line;
+        return old;
+    }
+
     /// Removes the newest entry. Returns false when the history is empty.
     /// This changes memory only; `FileHistory.removeLast` also updates the file.
     pub fn removeLast(self: *History) bool {

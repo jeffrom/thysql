@@ -283,6 +283,9 @@ pub const Repl = struct {
     history_index: usize,
     saved_line: std.ArrayList(u8),
     saved_line_valid: bool,
+    /// The original text of each history entry edited during the current
+    /// line, restored when the line ends, as readline's revert-all-at-newline.
+    history_originals: std.ArrayList(HistoryOriginal) = .empty,
     last_search: std.ArrayList(u8),
     /// States to restore on undo, oldest first. Cleared for each new line.
     undo: std.ArrayList(UndoEntry),
@@ -330,6 +333,8 @@ pub const Repl = struct {
         self.buf.deinit(self.gpa);
         self.kills.deinit();
         self.saved_line.deinit(self.gpa);
+        self.revertEditedHistory();
+        self.history_originals.deinit(self.gpa);
         self.last_search.deinit(self.gpa);
         self.clearUndo();
         self.undo.deinit(self.gpa);
@@ -352,6 +357,8 @@ pub const Repl = struct {
     /// or edits a line, or until `deinit`. Copy it to keep it longer, or use
     /// `readlineOwned`.
     pub fn readline(self: *Repl) ![]u8 {
+        // Edits to recalled entries last only while this line is edited.
+        defer self.revertEditedHistory();
         errdefer {
             // Only a hint or diagnostic left on screen needs removing. A line that was
             // already redrawn for its last time is past that point.
@@ -379,7 +386,6 @@ pub const Repl = struct {
                     // try self.refreshLine();
                 },
                 ReadEditState.Done => {
-                    try self.saveEditedHistoryEntry();
                     try self.redrawFinal();
                     try self.finishAtBottom();
                     return self.buf.items;
@@ -865,11 +871,34 @@ pub const Repl = struct {
         self.pos = @min(point orelse line.len, line.len);
     }
 
+    /// Keeps the edits to the recalled entry while the user moves through
+    /// history. `revertEditedHistory` restores the original when the line ends.
     fn saveEditedHistoryEntry(self: *Repl) !void {
         const history = self.cfg.history orelse return;
-        if (self.history_index < history.len()) {
-            _ = try history.replace(self.history_index, self.buf.items);
+        if (self.history_index >= history.len()) return;
+        const index = self.history_index;
+        if (std.mem.eql(u8, history.get(index).?.line, self.buf.items)) return;
+
+        const recorded = for (self.history_originals.items) |original| {
+            if (original.index == index) break true;
+        } else false;
+        if (!recorded) try self.history_originals.ensureUnusedCapacity(self.gpa, 1);
+
+        const old = history.swapLine(index, try history.gpa.dupe(u8, self.buf.items));
+        if (recorded) {
+            history.gpa.free(old);
+        } else {
+            self.history_originals.appendAssumeCapacity(.{ .index = index, .line = old });
         }
+    }
+
+    /// Restores every history entry edited during the current line.
+    fn revertEditedHistory(self: *Repl) void {
+        const history = self.cfg.history orelse return;
+        for (self.history_originals.items) |original| {
+            history.gpa.free(history.swapLine(original.index, original.line));
+        }
+        self.history_originals.clearRetainingCapacity();
     }
 
     fn saveUnfinishedLine(self: *Repl) !void {
@@ -1233,6 +1262,12 @@ pub const Repl = struct {
         }
         return if (changed) .yank else .other;
     }
+
+    const HistoryOriginal = struct {
+        index: usize,
+        /// Owned by the history's allocator.
+        line: []u8,
+    };
 
     const SearchOriginal = struct {
         line: []u8,
@@ -2062,8 +2097,10 @@ test "history navigation preserves edits and the unfinished line" {
     _ = try history.add("old", 1);
     _ = try history.add("new", 2);
 
+    // The first line returns to an edited entry; the second to the unfinished line.
     var input: Io.Reader = .fixed(
-        "unfinished" ++ testKeys.ctrl_p ++ "!" ++ testKeys.up ++
+        "unfinished" ++ testKeys.ctrl_p ++ "!" ++ testKeys.up ++ testKeys.ctrl_n ++ testKeys.enter ++
+            "unfinished" ++ testKeys.ctrl_p ++ "!" ++ testKeys.up ++
             testKeys.ctrl_n ++ testKeys.down ++ testKeys.enter,
     );
     var output: Io.Writer.Allocating = .init(allocator);
@@ -2078,8 +2115,67 @@ test "history navigation preserves edits and the unfinished line" {
     var repl = try Repl.init(allocator, &cfg);
     defer repl.deinit();
 
+    try std.testing.expectEqualStrings("new!", try repl.readline());
+    try std.testing.expectEqualStrings("new", history.get(1).?.line);
     try std.testing.expectEqualStrings("unfinished", try repl.readline());
-    try std.testing.expectEqualStrings("new!", history.get(1).?.line);
+    try std.testing.expectEqualStrings("new", history.get(1).?.line);
+}
+
+test "accepting an edited history entry leaves the original in history" {
+    const allocator = std.testing.allocator;
+    var history = History.init(allocator, .{ .deduplication = .consecutive });
+    defer history.deinit();
+    _ = try history.add("select 1", 1);
+    _ = try history.add("select 2", 2);
+
+    // Edit both entries; accept the first edit.
+    var input: Io.Reader = .fixed(
+        testKeys.ctrl_p ++ "0" ++ testKeys.ctrl_p ++ "0" ++ testKeys.enter ++
+            testKeys.ctrl_p ++ testKeys.ctrl_p ++ testKeys.ctrl_p ++ testKeys.enter,
+    );
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .history = &history,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    const line = try repl.readline();
+    try std.testing.expectEqualStrings("select 10", line);
+    try std.testing.expectEqualStrings("select 1", history.get(0).?.line);
+    try std.testing.expectEqualStrings("select 2", history.get(1).?.line);
+    _ = try history.add(line, 3);
+
+    // Three steps back from the new entry reach the original.
+    try std.testing.expectEqualStrings("select 1", try repl.readline());
+}
+
+test "cancelling a line reverts edited history entries" {
+    const allocator = std.testing.allocator;
+    var history = History.init(allocator, .{});
+    defer history.deinit();
+    _ = try history.add("select 1", 1);
+
+    var input: Io.Reader = .fixed(testKeys.ctrl_p ++ "0" ++ testKeys.ctrl_n ++ testKeys.ctrl_c);
+    var output: Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cfg: ReplConfig = .{
+        .prompt = "> ",
+        .in = &input,
+        .out = &output.writer,
+        .columns = 80,
+        .history = &history,
+    };
+    var repl = try Repl.init(allocator, &cfg);
+    defer repl.deinit();
+
+    try std.testing.expectError(ReplError.Cancelled, repl.readline());
+    try std.testing.expectEqualStrings("select 1", history.get(0).?.line);
 }
 
 test "incremental search changes direction and accepts a match" {
@@ -2337,7 +2433,9 @@ test "meta-< and meta-> move to the first history entry and back to the unfinish
     _ = try history.add("old", 1);
     _ = try history.add("new", 2);
 
-    var input: Io.Reader = .fixed("draft\x1b<" ++ "!" ++ "\x1b>" ++ "?" ++ testKeys.enter);
+    // The second line returns to its edited first entry before accepting it.
+    var input: Io.Reader = .fixed("draft\x1b<" ++ "!" ++ "\x1b>" ++ "?" ++ testKeys.enter ++
+        "\x1b<" ++ "!" ++ "\x1b>" ++ "\x1b<" ++ testKeys.enter);
     var output: Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     const cfg: ReplConfig = .{
@@ -2351,7 +2449,9 @@ test "meta-< and meta-> move to the first history entry and back to the unfinish
     defer repl.deinit();
 
     try std.testing.expectEqualStrings("draft?", try repl.readline());
-    try std.testing.expectEqualStrings("old!", history.get(0).?.line);
+    try std.testing.expectEqualStrings("old", history.get(0).?.line);
+    try std.testing.expectEqualStrings("old!", try repl.readline());
+    try std.testing.expectEqualStrings("old", history.get(0).?.line);
 }
 
 test "ctrl-t at the end of the line swaps the last two characters" {
