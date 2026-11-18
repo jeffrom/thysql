@@ -176,13 +176,16 @@ pub const Session = struct {
         }
     }
 
-    /// Checks `line` with the statement it continues, and keeps the first error for `diagnoseLine`
-    /// and the highlighter. The statement that holds the cursor is the one checked.
+    /// Checks `line` with the statement it continues, and keeps the first problem for `diagnoseLine`
+    /// and the highlighter. The statement that holds the cursor is the one checked. A column qualifier
+    /// that names no table or alias comes first, since the syntax error is often just the unfinished
+    /// `f.` at the cursor. Nothing is checked when the syntax checking is off.
     fn analyze(self: *Session, line: []const u8, cursor: usize) !void {
         self.analysis.clear(self.gpa);
         self.analysis.valid = true;
         try self.analysis.line.appendSlice(self.gpa, line);
         self.analysis.cursor = cursor;
+        if (!self.syntax.enabled) return;
 
         const pending: []const u8 = if (self.scanner) |batch| batch.pendingQuery().sql else "";
         const delimiter: []const u8 = if (self.scanner) |batch| batch.delimiterText() else ";";
@@ -194,6 +197,20 @@ pub const Session = struct {
         }
         const prefix = text.items.len;
         try text.appendSlice(self.gpa, line);
+
+        var options = self.syntax.lexer;
+        options.delimiter = delimiter;
+        if (SqlContext.unknownQualifier(text.items, prefix + cursor, options)) |uq| {
+            var message: std.Io.Writer.Allocating = .init(self.gpa);
+            defer message.deinit();
+            try SqlContext.formatUnknownQualifier(&message.writer, uq);
+            self.analysis.message = try message.toOwnedSlice();
+            if (uq.start >= prefix) {
+                self.analysis.start = uq.start - prefix;
+                self.analysis.end = uq.end - prefix;
+            }
+            return;
+        }
 
         const problem = (try self.syntax.firstError(self.gpa, text.items, prefix + cursor, delimiter)) orelse return;
         defer self.gpa.free(problem.message);
@@ -256,7 +273,8 @@ const Analysis = struct {
     valid: bool = false,
     line: std.ArrayList(u8) = .empty,
     cursor: usize = 0,
-    /// Owned. The message the line shows, such as `syntax error: "FROM" is not valid`, or null for none.
+    /// Owned. The message the line shows, such as `syntax error: "FROM" is not valid`, or
+    /// `unknown table or alias "f" ...`, or null for none.
     message: ?[]u8 = null,
     /// The bytes of the line that the error covers, end exclusive. Both are 0 when the error is not in the line.
     start: usize = 0,
@@ -1427,6 +1445,89 @@ test "an idle check of a line that follows a statement in progress reports offse
     try session.analyze(line, line.len);
     try std.testing.expectEqual(@as(usize, 7), session.analysis.start);
     try std.testing.expectEqual(@as(usize, 11), session.analysis.end);
+}
+
+test "an unknown column qualifier is the diagnostic, underlined, ahead of the syntax error" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var session = testSession(allocator, &syntax);
+    defer session.analysis.deinit(allocator);
+    defer session.spans.deinit(allocator);
+    defer session.joined.deinit(allocator);
+
+    // The `f.` at the cursor is also a syntax error, but the qualifier is the more useful message.
+    const line = "select f.id from foo join bar b on f.";
+    try session.analyze(line, line.len);
+    const message = diagnoseLine(&session, line) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("unknown table or alias \"f\"; did you mean \"foo f\"?", message);
+    // Both `f`s are unknown. The one nearest the cursor, after `on `, is the one underlined.
+    const span = session.errorSpan(line) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 35), span.start);
+    try std.testing.expectEqual(@as(usize, 36), span.end);
+    const spans = highlightLine(&session, line);
+    try std.testing.expectEqual(replete.Style.@"error", spans[spans.len - 1].style);
+    try std.testing.expectEqual(@as(usize, 35), spans[spans.len - 1].start);
+    try std.testing.expectEqual(@as(usize, 1), spans[spans.len - 1].len);
+}
+
+test "an unknown qualifier with no table to suggest lists the tables of the statement" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var session = testSession(allocator, &syntax);
+    defer session.analysis.deinit(allocator);
+    defer session.spans.deinit(allocator);
+    defer session.joined.deinit(allocator);
+
+    const line = "SELECT x.a FROM t1 a, t2 b WHERE 1 = 1";
+    try session.analyze(line, line.len);
+    const message = diagnoseLine(&session, line) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("unknown table or alias \"x\" (tables here: t1 a, t2 b)", message);
+}
+
+test "an unknown qualifier in the pending statement is reported, but not underlined in the line" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var scanner: Batch.Scanner = .{};
+    defer scanner.deinit(allocator);
+    try scanner.replacePending(allocator, "select f.id from foo");
+    var session = testSession(allocator, &syntax);
+    session.scanner = &scanner;
+    defer session.analysis.deinit(allocator);
+    defer session.spans.deinit(allocator);
+    defer session.joined.deinit(allocator);
+
+    const line = "where 1 = 1";
+    try session.analyze(line, line.len);
+    const message = diagnoseLine(&session, line) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("unknown table or alias \"f\"; did you mean \"foo f\"?", message);
+    try std.testing.expect(session.errorSpan(line) == null);
+}
+
+test "a qualifier that names an alias has no diagnostic, and nothing is checked with the syntax checking off" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var session = testSession(allocator, &syntax);
+    defer session.analysis.deinit(allocator);
+    defer session.spans.deinit(allocator);
+    defer session.joined.deinit(allocator);
+
+    const line = "select f.id from foo f where f.";
+    try session.analyze(line, line.len);
+    try std.testing.expect(diagnoseLine(&session, line) == null);
+
+    var off = Syntax.init(allocator, false);
+    defer off.deinit();
+    var off_session = testSession(allocator, &off);
+    defer off_session.analysis.deinit(allocator);
+    defer off_session.spans.deinit(allocator);
+    defer off_session.joined.deinit(allocator);
+    const unknown = "select f.id from foo join bar b on f.";
+    try off_session.analyze(unknown, unknown.len);
+    try std.testing.expect(diagnoseLine(&off_session, unknown) == null);
 }
 
 test "a line with no error has no diagnostic and no error style" {

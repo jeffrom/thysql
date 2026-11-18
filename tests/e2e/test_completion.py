@@ -97,3 +97,29 @@ class CompletionTests(E2ETestCase):
                 self.assertRegex(output, r"\|\s*alice\s*\|")
                 session.expect(main_prompt(server))
                 self.finish(session)
+
+    def test_tab_after_an_unknown_qualifier_says_why_nothing_is_offered(self):
+        # `p` names no table or alias: the first `people` has none, so the hint suggests it.
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                session = self.start(server)
+                session.expect(main_prompt(server))
+                session.send("select p.id from people join people q on p." + TAB)
+                session.expect('unknown table or alias "p"; did you mean "people p"?')
+                # The line is not changed, and Ctrl-C drops it, so the session can end.
+                session.send("\x03")
+                session.expect(main_prompt(server))
+                self.finish(session)
+
+    def test_a_correct_alias_completes_columns_with_no_qualifier_message(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                session = self.start(server)
+                session.expect(main_prompt(server))
+                # The alias is declared before the Tab, so `p` is in scope and its columns are offered.
+                session.send("select p.id from people p where p.id = 2 and p.nic" + TAB + " = 'unicode';" + ENTER)
+                output = session.expect("1 row in set")
+                self.assertRegex(output, r"\|\s*2\s*\|")
+                self.assertNotIn("unknown table or alias", output)
+                session.expect(main_prompt(server))
+                self.finish(session)
