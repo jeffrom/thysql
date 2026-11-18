@@ -6,6 +6,9 @@
 //!
 //! The scan is one pass over the lexer's tokens and allocates nothing. Names in the result are
 //! slices of the text, with backticks or double quotes removed.
+//!
+//! `unknownQualifier` is the other check: it finds a column qualifier, such as `f` in `f.id`,
+//! that names no table or alias of its statement, so that the mistake is reported as it is typed.
 
 const std = @import("std");
 const Lexer = @import("lexer.zig").Lexer;
@@ -23,6 +26,9 @@ pub const TableRef = struct {
     schema: ?[]const u8 = null,
     table: []const u8,
     alias: ?[]const u8 = null,
+    /// True for a derived table, `(SELECT ...) name`. `table` is then its alias, and it is not
+    /// the name of a table in the database.
+    derived: bool = false,
 };
 
 /// The tables that the statement names, in the order they are named.
@@ -227,10 +233,18 @@ const RefState = enum {
     qualified,
     /// AS followed a table name, and an alias is expected.
     alias_after_as,
+    /// A `)` closed a parenthesis that opened a table reference, as in `FROM (SELECT ...) x`, and
+    /// an alias may follow it.
+    derived,
+    /// AS followed a derived table, or the row of an INSERT, and an alias is expected.
+    derived_as,
 };
 
 /// How many tokens before the cursor the context keeps, enough for the longest rule.
 const max_prev = 8;
+
+/// How many parentheses that open a table reference can be open at once.
+const max_opened = 8;
 
 /// The state of the scan. It is reset at each statement boundary.
 const State = struct {
@@ -248,6 +262,14 @@ const State = struct {
     ref_index: ?usize = null,
     /// The word at the cursor, which is being completed.
     partial: ?Sig = null,
+    /// How many parentheses are open.
+    depth: usize = 0,
+    /// The depths of the open parentheses that opened a table reference, innermost last.
+    opened: [max_opened]usize = undefined,
+    opened_len: usize = 0,
+    /// Set when a table may be missing from the scope, as with a table function or very deep
+    /// nesting. `unknownQualifier` then reports nothing.
+    unsure: bool = false,
 
     fn reset(self: *State) void {
         self.* = .{};
@@ -292,7 +314,7 @@ const State = struct {
         if (!isWordKind(sig.kind)) return;
         if (sig.is("SELECT")) {
             self.clause = .select;
-        } else if (sig.is("FROM") or sig.is("JOIN")) {
+        } else if (sig.is("FROM") or sig.is("JOIN") or sig.is("STRAIGHT_JOIN")) {
             self.clause = .from;
         } else if (sig.is("UPDATE")) {
             self.clause = if (self.firstIs("UPDATE")) .from else .set;
@@ -324,8 +346,12 @@ const State = struct {
             if (self.from_list) self.ref = .table;
             return;
         }
+        if (sig.isPunct("(")) return self.openParen();
+        if (sig.isPunct(")")) return self.closeParen();
         if (isWordKind(sig.kind)) {
-            if (sig.is("FROM") or sig.is("JOIN") or (sig.is("UPDATE") and self.firstIs("UPDATE"))) {
+            const starts_tables = sig.is("FROM") or sig.is("JOIN") or sig.is("STRAIGHT_JOIN") or
+                (sig.is("UPDATE") and self.firstIs("UPDATE")) or (sig.is("USING") and self.firstIs("DELETE"));
+            if (starts_tables) {
                 self.startTables(true);
                 return;
             }
@@ -333,9 +359,17 @@ const State = struct {
                 self.startTables(false);
                 return;
             }
+            if (self.ref == .table and sig.is("LATERAL")) return;
+            const row_alias = sig.is("AS") and self.ref == .none and self.clause == .values and
+                (self.firstIs("INSERT") or self.firstIs("REPLACE"));
+            if (row_alias) {
+                // The row alias of `VALUES (...) AS new`, which is a name for the row.
+                self.ref = .derived_as;
+                return;
+            }
             if (sig.is("WHERE") or sig.is("GROUP") or sig.is("ORDER") or sig.is("HAVING") or sig.is("LIMIT") or
                 sig.is("SET") or sig.is("VALUES") or sig.is("VALUE") or sig.is("SELECT") or sig.is("ON") or
-                sig.is("USING"))
+                sig.is("USING") or sig.is("WITH"))
             {
                 self.from_list = false;
                 self.ref = .none;
@@ -349,6 +383,8 @@ const State = struct {
                     self.ref_index = self.scope.add(.{ .table = sig.text });
                     self.ref = .name;
                 } else {
+                    // A table function, such as JSON_TABLE, adds a table that is not recorded.
+                    if (sig.kind == .function) self.unsure = true;
                     self.ref = .none;
                 }
             },
@@ -380,12 +416,55 @@ const State = struct {
                 }
             },
             .alias_after_as => self.readAlias(sig),
+            .derived => {
+                if (sig.is("AS")) {
+                    self.ref = .derived_as;
+                } else {
+                    self.readDerivedAlias(sig);
+                }
+            },
+            .derived_as => self.readDerivedAlias(sig),
         }
     }
 
     fn startTables(self: *State, from: bool) void {
         self.ref = .table;
         self.from_list = from;
+    }
+
+    /// An open parenthesis. Where a table is expected it may open a derived table, so its depth
+    /// is kept until the matching close. Elsewhere it ends the table reference.
+    fn openParen(self: *State) void {
+        self.depth += 1;
+        if (self.ref != .table) {
+            self.ref = .none;
+            return;
+        }
+        if (self.opened_len == max_opened) {
+            self.unsure = true;
+            return;
+        }
+        self.opened[self.opened_len] = self.depth;
+        self.opened_len += 1;
+    }
+
+    /// A close parenthesis. When it closes one that opened a table reference, an alias may follow.
+    fn closeParen(self: *State) void {
+        if (self.opened_len > 0 and self.opened[self.opened_len - 1] == self.depth) {
+            self.opened_len -= 1;
+            self.ref = .derived;
+        } else {
+            self.ref = .none;
+        }
+        self.depth -|= 1;
+    }
+
+    /// Adds the derived table named by `sig`, when it is a name, and ends the reference.
+    fn readDerivedAlias(self: *State, sig: Sig) void {
+        if (isNameKind(sig.kind)) {
+            _ = self.scope.add(.{ .table = sig.text, .derived = true });
+        }
+        self.ref = .none;
     }
 
     /// Sets the alias of the table being read, when `sig` can be one, and ends the reference.
@@ -532,6 +611,222 @@ const State = struct {
         return .{ .table = name };
     }
 };
+
+/// A column qualifier that names no table or alias of its statement. See `unknownQualifier`.
+pub const UnknownQualifier = struct {
+    /// Byte offsets of the qualifier in `text`, without quotes, end exclusive.
+    start: usize,
+    end: usize,
+    /// The qualifier as written, without quotes. A slice of `text`.
+    name: []const u8,
+    /// A table of the statement with no alias whose name starts with `name`, ignoring case, as a
+    /// hint: `did you mean "foo f"?`. Null when there is none.
+    suggestion: ?TableRef,
+    /// The tables that the statement names, in order.
+    scope: Scope,
+};
+
+/// The column qualifier of the statement that holds `cursor` that names no table or alias of that
+/// statement and is nearest the cursor, or null. A tie goes to the earlier one. `cursor` is a byte
+/// offset into `text`. `options` are the session's lexer settings. The result refers to `text`.
+///
+/// A qualifier is a name followed by a dot and a column, as `f` in `f.id`, and it can be left
+/// open, as in `f.|`. The whole statement is read, so a table after the cursor counts. Only the
+/// statements that name tables are checked: queries and writes of rows. Nothing is reported when
+/// the scope is empty or full, when the statement has a table function or is nested too deeply,
+/// when the name is a table in a table position (`db.t` after FROM), a schema or function
+/// qualifier (`db.t.col`, `db.f(1)`), `NEW` or `OLD`, a CTE name, or when the cursor is on the name,
+/// since it may still be typed.
+pub fn unknownQualifier(text: []const u8, cursor: usize, options: LexOptions) ?UnknownQualifier {
+    const bounds = statementBounds(text, cursor, options);
+
+    // The first pass reads the scope of the whole statement, since a table may be named after
+    // the qualifier that uses it.
+    var scope_state: State = .{};
+    var lexer = statementLexer(text, options, bounds.start);
+    while (nextSig(&lexer, bounds.end)) |tok| {
+        scope_state.addBefore(Sig.of(tok.kind, text[tok.start..tok.end]));
+    }
+    const first = scope_state.first orelse return null;
+    if (!namesTables(first)) return null;
+    const scope = scope_state.scope;
+    if (scope_state.unsure or scope.len == 0 or scope.len == max_scope) return null;
+    const with_statement = first.is("WITH");
+
+    // The second pass finds the qualifiers, with the table positions known as the scope is read.
+    // The unknown one nearest the cursor is the one being typed, so it is the one reported.
+    var best: ?UnknownQualifier = null;
+    var best_gap: usize = 0;
+    var state: State = .{};
+    lexer = statementLexer(text, options, bounds.start);
+    while (nextSig(&lexer, bounds.end)) |tok| {
+        const sig = Sig.of(tok.kind, text[tok.start..tok.end]);
+        const in_expression = state.ref != .table and !afterDot(state.prevItems());
+        if (isNameKind(tok.kind) and in_expression and isQualifier(text, lexer, bounds.end)) {
+            const inner: usize = if (tok.kind == .quoted_identifier) 1 else 0;
+            const start = tok.start + inner;
+            const end = start + sig.text.len;
+            const typing = start <= cursor and cursor <= end;
+            const known = isKnownQualifier(&scope, sig.text) or
+                (with_statement and definesCte(text, options, bounds, sig.text));
+            if (!typing and !known) {
+                const gap = gapBetween(cursor, start, end);
+                if (best == null or gap < best_gap) {
+                    best = .{
+                        .start = start,
+                        .end = end,
+                        .name = sig.text,
+                        .suggestion = suggestionFor(&scope, sig.text),
+                        .scope = scope,
+                    };
+                    best_gap = gap;
+                }
+            }
+        }
+        state.addBefore(sig);
+    }
+    return best;
+}
+
+/// The number of bytes from `cursor` to the span `start..end`, or 0 when the cursor is in it.
+fn gapBetween(cursor: usize, start: usize, end: usize) usize {
+    if (cursor < start) return start - cursor;
+    if (cursor > end) return cursor - end;
+    return 0;
+}
+
+/// Writes the message for `uq`, without a newline. With a suggestion it reads
+/// `unknown table or alias "f"; did you mean "foo f"?`. Otherwise it lists the tables that the
+/// statement names: `unknown table or alias "f" (tables here: foo, bar b)`.
+pub fn formatUnknownQualifier(writer: *std.Io.Writer, uq: UnknownQualifier) std.Io.Writer.Error!void {
+    try writer.print("unknown table or alias \"{s}\"", .{uq.name});
+    if (uq.suggestion) |ref| {
+        try writer.writeAll("; did you mean \"");
+        try writeQualified(writer, ref);
+        try writer.print(" {s}\"?", .{uq.name});
+        return;
+    }
+    try writer.writeAll(" (tables here: ");
+    for (uq.scope.slice(), 0..) |ref, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writeQualified(writer, ref);
+        if (ref.alias) |alias| try writer.print(" {s}", .{alias});
+    }
+    try writer.writeAll(")");
+}
+
+/// Writes `schema.table`, or just `table` when the reference has no schema.
+fn writeQualified(writer: *std.Io.Writer, ref: TableRef) std.Io.Writer.Error!void {
+    if (ref.schema) |name| try writer.print("{s}.", .{name});
+    try writer.writeAll(ref.table);
+}
+
+/// The bytes of one statement: from just after the delimiter or client command before it, to the
+/// one at or after the cursor, or to the end of the text.
+const Bounds = struct {
+    start: usize,
+    end: usize,
+};
+
+/// The statement that holds `cursor`, found the way `expectAt` splits statements.
+fn statementBounds(text: []const u8, cursor: usize, options: LexOptions) Bounds {
+    var bounds: Bounds = .{ .start = 0, .end = text.len };
+    var lexer = Lexer.init(text, options);
+    while (lexer.next()) |tok| {
+        if (tok.kind != .delimiter and tok.kind != .client_command) continue;
+        if (tok.start >= cursor) {
+            bounds.end = tok.start;
+            break;
+        }
+        bounds.start = tok.end;
+    }
+    return bounds;
+}
+
+/// A lexer that reads the statement that starts at `start`.
+fn statementLexer(text: []const u8, options: LexOptions, start: usize) Lexer {
+    var lexer = Lexer.init(text, options);
+    lexer.pos = start;
+    return lexer;
+}
+
+/// The next token that the context reads before `end`: whitespace, comments, hints and version
+/// comment markers are skipped. Null at `end`.
+fn nextSig(lexer: *Lexer, end: usize) ?Token {
+    while (lexer.next()) |tok| {
+        if (tok.start >= end) return null;
+        switch (tok.kind) {
+            .whitespace, .comment, .optimizer_hint, .version_comment_start, .version_comment_end => continue,
+            else => return tok,
+        }
+    }
+    return null;
+}
+
+/// True for the statements whose table names the scope reads: queries and the writes of rows.
+/// Other statements, such as `CREATE INDEX ... ON db.t`, are not checked.
+fn namesTables(first: Sig) bool {
+    return first.is("SELECT") or first.is("WITH") or first.is("UPDATE") or first.is("DELETE") or
+        first.is("INSERT") or first.is("REPLACE");
+}
+
+/// True when the name that `lexer` has just read is followed by a dot and a column, and that column
+/// is not followed by another dot or a `(`, which would make the name a schema or a function.
+fn isQualifier(text: []const u8, lexer: Lexer, end: usize) bool {
+    var look = lexer;
+    const dot = nextSig(&look, end) orelse return false;
+    if (dot.kind != .dot) return false;
+    const column = nextSig(&look, end) orelse return true;
+    if (!isNameKind(column.kind) and column.kind != .function) return true;
+    const after = nextSig(&look, end) orelse return true;
+    if (after.kind == .dot) return false;
+    return !(after.kind == .punctuation and text[after.start] == '(');
+}
+
+/// True when the tokens before a name end with a dot, so the name is the last part of a qualified name.
+fn afterDot(prev: []const Sig) bool {
+    return prev.len > 0 and prev[prev.len - 1].kind == .dot;
+}
+
+/// True when `name` is a table or an alias of the scope, or `NEW` or `OLD`, which a trigger body
+/// always has. A table name counts even when the table has an alias, which MySQL does not allow,
+/// so that a name that the user may have meant is not reported.
+fn isKnownQualifier(scope: *const Scope, name: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(name, "new") or std.ascii.eqlIgnoreCase(name, "old")) return true;
+    for (scope.slice()) |ref| {
+        if (std.ascii.eqlIgnoreCase(ref.table, name)) return true;
+        if (ref.alias) |alias| {
+            if (std.ascii.eqlIgnoreCase(alias, name)) return true;
+        }
+    }
+    return false;
+}
+
+/// True when the statement `bounds` defines a common table expression called `name`: the name is
+/// followed by `AS` or by a column list.
+fn definesCte(text: []const u8, options: LexOptions, bounds: Bounds, name: []const u8) bool {
+    var lexer = statementLexer(text, options, bounds.start);
+    while (nextSig(&lexer, bounds.end)) |tok| {
+        if (!isNameKind(tok.kind)) continue;
+        if (!std.ascii.eqlIgnoreCase(Sig.of(tok.kind, text[tok.start..tok.end]).text, name)) continue;
+        var look = lexer;
+        const after = nextSig(&look, bounds.end) orelse continue;
+        if (after.kind == .punctuation and text[after.start] == '(') return true;
+        if (Sig.of(after.kind, text[after.start..after.end]).is("AS")) return true;
+    }
+    return false;
+}
+
+/// The table of the scope that a qualifier `name` may have been meant for: one with no alias whose
+/// name starts with `name`, ignoring case. Derived tables are not tables, so they are skipped.
+fn suggestionFor(scope: *const Scope, name: []const u8) ?TableRef {
+    if (name.len == 0) return null;
+    for (scope.slice()) |ref| {
+        if (ref.alias != null or ref.derived or ref.table.len < name.len) continue;
+        if (std.ascii.eqlIgnoreCase(ref.table[0..name.len], name)) return ref;
+    }
+    return null;
+}
 
 /// Writes `expect` as a short line that the tests compare, such as `column[people,app.orders]`.
 fn describe(allocator: std.mem.Allocator, expect: Expect) std.mem.Allocator.Error![]u8 {
@@ -711,4 +1006,174 @@ test "a name that needs quoting is quoted, and reserved words always are" {
     try std.testing.expect(needsQuoting("a-b"));
     try std.testing.expect(needsQuoting("123"));
     try std.testing.expect(needsQuoting("select"));
+}
+
+test "a derived table names its alias, which then counts as a table" {
+    try expectCase("SELECT * FROM (SELECT a FROM t) d WHERE |", "column[t,d]");
+    try expectCase("SELECT d.| FROM (SELECT a FROM t) AS d", "column_of:d");
+}
+
+/// Runs `unknownQualifier` on `case`, where `|` marks the cursor, and compares the message that
+/// `formatUnknownQualifier` writes, or `none` when there is no unknown qualifier.
+fn expectUnknownCase(case: []const u8, want: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const cursor = std.mem.indexOfScalar(u8, case, '|') orelse return error.MissingCursor;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, case[0..cursor]);
+    try text.appendSlice(allocator, case[cursor + 1 ..]);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    if (unknownQualifier(text.items, cursor, .{})) |uq| {
+        try formatUnknownQualifier(&out.writer, uq);
+    } else {
+        try out.writer.writeAll("none");
+    }
+    std.testing.expectEqualStrings(want, out.written()) catch |err| {
+        std.debug.print("case: {s}\n", .{case});
+        return err;
+    };
+}
+
+test "a qualifier that names no table or alias is reported, with a hint for a table" {
+    try expectUnknownCase(
+        "select f.id from foo join bar b on f.id = b.id limit |",
+        "unknown table or alias \"f\"; did you mean \"foo f\"?",
+    );
+    try expectUnknownCase(
+        "select f.id from foo join bar b on x.| limit 1;",
+        "unknown table or alias \"x\" (tables here: foo, bar b)",
+    );
+    try expectUnknownCase(
+        "select f.id from foo join bar b on f.|",
+        "unknown table or alias \"f\"; did you mean \"foo f\"?",
+    );
+    try expectUnknownCase("SELECT z.a FROM t1 a, t2 b|", "unknown table or alias \"z\" (tables here: t1 a, t2 b)");
+    try expectUnknownCase("SELECT `q`.a FROM t|", "unknown table or alias \"q\" (tables here: t)");
+    try expectUnknownCase("SELECT z.a FROM `my tab` x|", "unknown table or alias \"z\" (tables here: my tab x)");
+    try expectUnknownCase("SELECT z.a FROM app.people|", "unknown table or alias \"z\" (tables here: app.people)");
+    try expectUnknownCase("SELECT p.id FROM app.people|", "unknown table or alias \"p\"; did you mean \"app.people p\"?");
+    try expectUnknownCase("select x| from foo where f.id = 1", "unknown table or alias \"f\"; did you mean \"foo f\"?");
+    try expectUnknownCase(
+        "SELECT * FROM t1 a, t2 b WHERE a.id = 1 AND 2 = t3.id|",
+        "unknown table or alias \"t3\" (tables here: t1 a, t2 b)",
+    );
+    try expectUnknownCase("UPDATE t1 SET t1.a = 1 WHERE t2.a = 1|", "unknown table or alias \"t2\" (tables here: t1)");
+}
+
+test "the offsets of a qualifier cover its name, without quotes" {
+    const plain = "select f.id from foo";
+    const plain_uq = unknownQualifier(plain, plain.len, .{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 7), plain_uq.start);
+    try std.testing.expectEqual(@as(usize, 8), plain_uq.end);
+    try std.testing.expectEqualStrings("f", plain[plain_uq.start..plain_uq.end]);
+
+    const quoted = "SELECT `q`.a FROM t";
+    const quoted_uq = unknownQualifier(quoted, quoted.len, .{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 8), quoted_uq.start);
+    try std.testing.expectEqual(@as(usize, 9), quoted_uq.end);
+    try std.testing.expectEqualStrings("q", quoted[quoted_uq.start..quoted_uq.end]);
+}
+
+test "with ANSI_QUOTES a double-quoted qualifier is read without its quotes" {
+    const text = "SELECT \"q\".a FROM t";
+    const uq = unknownQualifier(text, text.len, .{ .ansi_quotes = true }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("q", uq.name);
+}
+
+test "of several unknown qualifiers, the one nearest the cursor is reported" {
+    try expectUnknownCase("SELECT a.x FROM t WHERE b.y = 1 AND |", "unknown table or alias \"b\" (tables here: t)");
+    try expectUnknownCase("SELECT a.x, b.y FROM t|", "unknown table or alias \"b\" (tables here: t)");
+}
+
+test "only the statement that holds the cursor is checked" {
+    try expectUnknownCase("select z.a from t; select a from t|", "none");
+    try expectUnknownCase("select z.a from t|; select a from t", "unknown table or alias \"z\" (tables here: t)");
+}
+
+test "nothing is reported when no table is named, so a qualifier cannot be checked" {
+    try expectUnknownCase("select f.|", "none");
+    try expectUnknownCase("SELECT 1|", "none");
+}
+
+test "text in strings, comments and variables is not a qualifier" {
+    try expectUnknownCase("SELECT 1 FROM t -- f.|", "none");
+    try expectUnknownCase("SELECT 'f.x' FROM t|", "none");
+    try expectUnknownCase("SELECT @v.x FROM t|", "none");
+}
+
+test "a qualifier that names a table or alias is known" {
+    try expectUnknownCase("select f.id from foo f where f.|", "none");
+    try expectUnknownCase("select foo.id from foo f where foo.|", "none");
+    try expectUnknownCase("SELECT t.* FROM t|", "none");
+    try expectUnknownCase("SELECT x.a FROM (SELECT a FROM t) x|", "none");
+    try expectUnknownCase("SELECT d.a FROM foo JOIN (SELECT 1 AS a) AS d ON d.a = foo.a|", "none");
+}
+
+test "a derived table's alias is known, and other names after it are not" {
+    try expectUnknownCase(
+        "SELECT * FROM (SELECT a FROM t) x WHERE x.a = 1 AND y.b = 2|",
+        "unknown table or alias \"y\" (tables here: t, x)",
+    );
+}
+
+test "a qualifier that is a schema or function is not a column qualifier" {
+    try expectUnknownCase("select app.foo.id from app.foo|", "none");
+    try expectUnknownCase("select app.f(1) from foo|", "none");
+    try expectUnknownCase("SELECT db.func(1) FROM t|", "none");
+}
+
+test "a table in a table position is not a qualifier" {
+    try expectUnknownCase("SELECT * FROM t1 a, db.t2 b WHERE a.id = 1|", "none");
+    try expectUnknownCase("SELECT * FROM t1 a STRAIGHT_JOIN db.t2 b ON a.id = b.id|", "none");
+    try expectUnknownCase("DELETE FROM t1 USING db.t2 WHERE t1.a = t2.a|", "none");
+    try expectUnknownCase("INSERT INTO db.t (a) VALUES (1)|", "none");
+    try expectUnknownCase("SELECT * FROM t1 JOIN LATERAL (SELECT 1) AS lat WHERE lat.a = t1.a|", "none");
+}
+
+test "a name that is being typed is not reported" {
+    try expectUnknownCase("SELECT f|.id FROM foo", "none");
+}
+
+test "NEW and OLD are always known, and a CTE name is known" {
+    try expectUnknownCase("UPDATE t SET a = NEW.b WHERE t.id = 1|", "none");
+    try expectUnknownCase("WITH c AS (SELECT 1 AS a) SELECT c.a FROM t|", "none");
+    try expectUnknownCase("WITH c AS (SELECT 1 AS a) SELECT d.a FROM t|", "unknown table or alias \"d\" (tables here: t)");
+}
+
+test "a row alias of INSERT is known" {
+    try expectUnknownCase("INSERT INTO t (a) VALUES (1) AS new ON DUPLICATE KEY UPDATE a = new.a|", "none");
+}
+
+test "a table function makes the scope unsure, so nothing is reported" {
+    try expectUnknownCase(
+        "SELECT jt.a FROM foo, JSON_TABLE('[1]', '$[*]' COLUMNS (a INT PATH '$')) AS jt WHERE jt.a = 1 AND f.b = 2|",
+        "none",
+    );
+}
+
+test "a statement that is not a query or a write of rows is not checked" {
+    try expectUnknownCase("CREATE INDEX i ON db.t (f.a)|", "none");
+    try expectUnknownCase("CALL db.proc(f.x)|", "none");
+}
+
+test "a subquery's tables are in the scope of the whole statement" {
+    try expectUnknownCase("SELECT f.a FROM t WHERE a IN (SELECT b FROM u)|", "unknown table or alias \"f\" (tables here: t, u)");
+}
+
+/// Builds `SELECT z.a FROM t0, t1, ...` with `count` tables, for the scope limit.
+fn manyTables(comptime count: usize) []const u8 {
+    comptime {
+        var text: []const u8 = "SELECT z.a FROM t0";
+        for (1..count) |i| text = text ++ std.fmt.comptimePrint(", t{d}", .{i});
+        return text;
+    }
+}
+
+test "a full scope gives no diagnosis, since a name may be missing from it" {
+    const almost = comptime manyTables(max_scope - 1);
+    try std.testing.expect(unknownQualifier(almost, almost.len, .{}) != null);
+    const full = comptime manyTables(max_scope);
+    try std.testing.expect(unknownQualifier(full, full.len, .{}) == null);
 }
