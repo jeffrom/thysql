@@ -49,6 +49,32 @@ static_assert(static_cast<int>(MYSQL_RULE_USER_VARIABLE) == static_cast<int>(MyS
 static_assert(static_cast<int>(MYSQL_RULE_SYSTEM_VARIABLE) == static_cast<int>(MySQLParser::RuleSystemVariable), "rule id");
 static_assert(static_cast<int>(MYSQL_RULE_SET_SYSTEM_VARIABLE) == static_cast<int>(MySQLParser::RuleSetSystemVariable), "rule id");
 
+static_assert(static_cast<int>(MYSQL_RULE_DELETE_STATEMENT) == static_cast<int>(MySQLParser::RuleDeleteStatement), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_INSERT_STATEMENT) == static_cast<int>(MySQLParser::RuleInsertStatement), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_INSERT_FROM_CONSTRUCTOR) == static_cast<int>(MySQLParser::RuleInsertFromConstructor), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_FIELDS) == static_cast<int>(MySQLParser::RuleFields), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_VALUE_LIST) == static_cast<int>(MySQLParser::RuleValueList), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_VALUES) == static_cast<int>(MySQLParser::RuleValues), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_QUERY_EXPRESSION_BODY) == static_cast<int>(MySQLParser::RuleQueryExpressionBody), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_QUERY_EXPRESSION_PARENS) == static_cast<int>(MySQLParser::RuleQueryExpressionParens), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_QUERY_SPECIFICATION) == static_cast<int>(MySQLParser::RuleQuerySpecification), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_SUBQUERY) == static_cast<int>(MySQLParser::RuleSubquery), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_COMMON_TABLE_EXPRESSION) == static_cast<int>(MySQLParser::RuleCommonTableExpression), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_SELECT_ITEM_LIST) == static_cast<int>(MySQLParser::RuleSelectItemList), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_SELECT_ITEM) == static_cast<int>(MySQLParser::RuleSelectItem), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_SELECT_ALIAS) == static_cast<int>(MySQLParser::RuleSelectAlias), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_SINGLE_TABLE) == static_cast<int>(MySQLParser::RuleSingleTable), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_DERIVED_TABLE) == static_cast<int>(MySQLParser::RuleDerivedTable), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_TABLE_ALIAS) == static_cast<int>(MySQLParser::RuleTableAlias), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_UPDATE_STATEMENT) == static_cast<int>(MySQLParser::RuleUpdateStatement), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_IDENTIFIER) == static_cast<int>(MySQLParser::RuleIdentifier), "rule id");
+
+static_assert(static_cast<int>(MYSQL_TOKEN_MULT_OPERATOR) == static_cast<int>(MySQLLexer::MULT_OPERATOR), "token type");
+static_assert(static_cast<int>(MYSQL_TOKEN_DOT_SYMBOL) == static_cast<int>(MySQLLexer::DOT_SYMBOL), "token type");
+static_assert(static_cast<int>(MYSQL_TOKEN_COMMA_SYMBOL) == static_cast<int>(MySQLLexer::COMMA_SYMBOL), "token type");
+static_assert(static_cast<int>(MYSQL_TOKEN_OPEN_PAR_SYMBOL) == static_cast<int>(MySQLLexer::OPEN_PAR_SYMBOL), "token type");
+static_assert(static_cast<int>(MYSQL_TOKEN_CLOSE_PAR_SYMBOL) == static_cast<int>(MySQLLexer::CLOSE_PAR_SYMBOL), "token type");
+
 static_assert(static_cast<int>(MYSQL_MODE_ANSI_QUOTES) == static_cast<int>(MySQLRecognizerCommon::AnsiQuotes), "sql mode");
 static_assert(static_cast<int>(MYSQL_MODE_HIGH_NOT_PRECEDENCE) == static_cast<int>(MySQLRecognizerCommon::HighNotPrecedence), "sql mode");
 static_assert(static_cast<int>(MYSQL_MODE_PIPES_AS_CONCAT) == static_cast<int>(MySQLRecognizerCommon::PipesAsConcat), "sql mode");
@@ -66,6 +92,10 @@ struct mysql_parser {
 
   std::vector<std::string> candidate_texts;
   std::vector<mysql_candidate> candidates;
+
+  std::vector<mysql_tree_node> nodes;
+  // The generated parser's rule names, copied on the first parse.
+  std::vector<std::string> rule_names;
 };
 
 namespace {
@@ -324,6 +354,83 @@ private:
   std::vector<Entry> entries_;
 };
 
+// Byte range of a token. EOF, and a token that error recovery made up (it has no place in the
+// input), are an empty range: at the end of the input, or at `fallback`.
+std::pair<size_t, size_t> tokenRange(const Token *token, const DecodedText &text, size_t fallback) {
+  if (token == nullptr || token->getStartIndex() == INVALID_INDEX || token->getStopIndex() == INVALID_INDEX)
+    return {fallback, fallback};
+  if (token->getType() == Token::EOF) {
+    size_t end = text.byteAt(text.text.size());
+    return {end, end};
+  }
+  size_t start = text.byteAt(token->getStartIndex());
+  size_t end = std::max(start, text.byteAt(token->getStopIndex() + 1));
+  return {start, end};
+}
+
+// Stores the parse tree under `root` in the parser object, in preorder. The walk keeps its own
+// stack, because expressions can nest deeply enough to overflow the C++ one.
+void storeTree(mysql_parser &parser, tree::ParseTree *root, const DecodedText &text) {
+  parser.nodes.clear();
+  if (root == nullptr)
+    return;
+
+  struct Frame {
+    tree::ParseTree *node;
+    size_t index;
+    size_t child;
+  };
+  std::vector<Frame> stack;
+  size_t last_end = 0; // End of the last token stored, where a made-up token is put.
+
+  auto push = [&](tree::ParseTree *node, size_t parent) {
+    mysql_tree_node out{};
+    out.parent = parent;
+    if (auto *ctx = dynamic_cast<ParserRuleContext *>(node)) {
+      out.rule = static_cast<int>(ctx->getRuleIndex());
+      out.token = 0;
+      auto first = tokenRange(ctx->start, text, last_end);
+      out.start = out.end = first.first;
+      if (ctx->stop != nullptr && ctx->start != nullptr && ctx->stop->getTokenIndex() >= ctx->start->getTokenIndex() &&
+          ctx->stop->getStartIndex() != INVALID_INDEX) {
+        auto last = tokenRange(ctx->stop, text, first.first);
+        out.end = std::max(out.start, last.second);
+      }
+      if (ctx->exception != nullptr)
+        out.flags |= MYSQL_NODE_ERROR;
+    } else if (auto *terminal = dynamic_cast<tree::TerminalNode *>(node)) {
+      Token *token = terminal->getSymbol();
+      out.rule = -1;
+      out.token = token != nullptr ? static_cast<int>(token->getType()) : 0;
+      auto range = tokenRange(token, text, last_end);
+      out.start = range.first;
+      out.end = range.second;
+      last_end = std::max(last_end, out.end);
+      if (dynamic_cast<tree::ErrorNode *>(node) != nullptr)
+        out.flags |= MYSQL_NODE_ERROR;
+      if (token == nullptr || token->getStartIndex() == INVALID_INDEX)
+        out.flags |= MYSQL_NODE_ERROR | MYSQL_NODE_MISSING;
+    } else {
+      return;
+    }
+    parser.nodes.push_back(out);
+    stack.push_back(Frame{node, parser.nodes.size() - 1, 0});
+  };
+
+  push(root, static_cast<size_t>(-1));
+  while (!stack.empty()) {
+    Frame &top = stack.back();
+    if (top.child < top.node->children.size()) {
+      tree::ParseTree *child = top.node->children[top.child++];
+      size_t parent = top.index;
+      push(child, parent);
+      continue;
+    }
+    parser.nodes[top.index].next = parser.nodes.size();
+    stack.pop_back();
+  }
+}
+
 // Configures a lexer or parser with the server version and SQL mode of the parser object.
 template <typename RecognizerType>
 void configure(RecognizerType &recognizer, const mysql_parser &parser) {
@@ -335,7 +442,7 @@ void configure(RecognizerType &recognizer, const mysql_parser &parser) {
 // (fast, and the common case), then LL with error reporting if the first stage failed. The second
 // stage starts over, so the errors it reports are the ones the caller gets. Lexer errors are
 // found while the tokens are read, before either stage, and are reported in both cases.
-void checkInput(mysql_parser &parser, const DecodedText &text) {
+void checkInput(mysql_parser &parser, const DecodedText &text, bool keep_tree) {
   CodePointInput input(text.text);
   MySQLLexer lexer(&input);
   configure(lexer, parser);
@@ -349,14 +456,19 @@ void checkInput(mysql_parser &parser, const DecodedText &text) {
 
   MySQLParser recognizer(&tokens);
   configure(recognizer, parser);
+  if (parser.rule_names.empty())
+    parser.rule_names = recognizer.getRuleNames();
   recognizer.removeErrorListeners();
   recognizer.setErrorHandler(std::make_shared<BailErrorStrategy>());
   recognizer.getInterpreter<atn::ParserATNSimulator>()->setPredictionMode(atn::PredictionMode::SLL);
 
+  parser.nodes.clear();
   bool clean = false;
   try {
-    recognizer.query();
+    tree::ParseTree *root = recognizer.query();
     clean = true;
+    if (keep_tree)
+      storeTree(parser, root, text);
   } catch (const std::exception &) {
     clean = false;
   }
@@ -367,7 +479,9 @@ void checkInput(mysql_parser &parser, const DecodedText &text) {
     recognizer.setErrorHandler(std::make_shared<DefaultErrorStrategy>());
     recognizer.getInterpreter<atn::ParserATNSimulator>()->setPredictionMode(atn::PredictionMode::LL);
     recognizer.addErrorListener(&errors);
-    recognizer.query();
+    tree::ParseTree *root = recognizer.query();
+    if (keep_tree)
+      storeTree(parser, root, text);
   }
 
   errors.storeIn(parser);
@@ -520,20 +634,42 @@ void mysql_parser_set_sql_mode(mysql_parser *parser, unsigned sql_mode_flags) {
     parser->sql_mode = sql_mode_flags;
 }
 
-size_t mysql_parser_check(mysql_parser *parser, const char *sql, size_t len) {
+// Parses `sql` for mysql_parser_check() and mysql_parser_parse().
+static size_t parseInput(mysql_parser *parser, const char *sql, size_t len, bool keep_tree) {
   if (parser == nullptr)
     return 0;
   try {
     DecodedText text = decodeUtf8(sql != nullptr ? sql : "", sql != nullptr ? len : 0);
-    checkInput(*parser, text);
+    checkInput(*parser, text, keep_tree);
     return parser->errors.size();
   } catch (...) {
+    parser->nodes.clear();
     // Something inside the parser failed. Report it as one error over the whole input.
     parser->error_messages.assign(1, "internal parser error");
     parser->errors.assign(1, mysql_parse_error{0, len, 1, 0, nullptr});
     parser->errors[0].message = parser->error_messages[0].c_str();
     return 1;
   }
+}
+
+size_t mysql_parser_check(mysql_parser *parser, const char *sql, size_t len) {
+  return parseInput(parser, sql, len, false);
+}
+
+size_t mysql_parser_parse(mysql_parser *parser, const char *sql, size_t len) {
+  return parseInput(parser, sql, len, true);
+}
+
+size_t mysql_parser_node_count(mysql_parser *parser) { return parser != nullptr ? parser->nodes.size() : 0; }
+
+const mysql_tree_node *mysql_parser_nodes(mysql_parser *parser) {
+  return parser != nullptr && !parser->nodes.empty() ? parser->nodes.data() : nullptr;
+}
+
+const char *mysql_parser_rule_name(mysql_parser *parser, int rule) {
+  if (parser == nullptr || rule < 0 || static_cast<size_t>(rule) >= parser->rule_names.size())
+    return nullptr;
+  return parser->rule_names[static_cast<size_t>(rule)].c_str();
 }
 
 const mysql_parse_error *mysql_parser_error(mysql_parser *parser, size_t index) {

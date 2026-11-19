@@ -665,9 +665,37 @@ The parser is used three ways:
   is checked. The first error is shown below the line, and its text is underlined in
   the line. An error that runs to the end of the text is not shown while you are still
   typing it. A space after it shows it.
-- **After a syntax error from the server.** The server's error comes first. Then the
-  parser's message and a caret under the offending text. The server stays the authority,
-  so a statement the parser rejects is still sent.
+- **After an error from the server.** The server's error comes first. For the errors
+  below, the statement follows, drawn as rustc draws its errors: the place the error
+  is about, labels on the places it relates to, and hints. The server stays the
+  authority, so a statement the parser rejects is still sent.
+
+  ```
+  ERROR 1052 (23000): Column 'id' in field list is ambiguous
+   --> query:1:8
+    |
+  1 | SELECT id, name FROM users u JOIN orders o ON o.user_id = u.id
+    |        ^^            -------      -------- `o` has a column `id`
+    |        |             |
+    |        |             `u` has a column `id`
+    |        ambiguous
+    |
+    = help: qualify it: `u.id` or `o.id`
+  ```
+
+  | Error | Shown |
+  | --- | --- |
+  | 1064 syntax error | the parser's message at the offending text; the `(` that is never closed; how to quote a reserved word used as a name |
+  | 1052 ambiguous column | the column, and each table that has a column of that name |
+  | 1054 unknown column | the column; the table its qualifier names; a select alias used in `WHERE` or `ON`; a column with a similar name |
+  | 1066 duplicate alias | both places the name is used |
+  | 1136 value count | the column list, and the row of `VALUES` that does not match it |
+  | 1146 unknown table | the table, and a table with a similar name |
+  | 1222 `UNION` column count | each `SELECT`'s number of columns |
+  | 1248 derived table alias | the derived table without an alias |
+
+  Similar names come from the names that completion loads, so they need auto-rehash
+  or `rehash`.
 - **Completion.** Tab and the hint take the parser's candidates at the cursor, and the
   names come from the names that completion loads. When the parser gives nothing, the
   lexer's context is used.

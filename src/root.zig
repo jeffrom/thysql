@@ -650,8 +650,9 @@ fn execReplStatement(context: *ReplContext, stdout: *std.Io.Writer, sql: []const
         }
 
         try db.renderLastError(stdout);
-        // The server has the last word, but the parser can say where the syntax error is.
-        if (db.lastErrno() == Syntax.parse_error_code) try context.repl.syntax.renderError(stdout, sql);
+        // The server has the last word, but the statement's parse tree can say where the error is,
+        // and what else in the statement it relates to.
+        try context.repl.syntax.explainError(stdout, sql, db.lastErrno(), db.lastErrorMessage(), context.repl.names, context.repl.use_color);
         if (retried or !canReconnect(db, &context.repl)) {
             return null;
         }
@@ -1592,6 +1593,9 @@ test {
         @import("sql/context.zig"),
         @import("sql/lexer_test.zig"),
         @import("sql/parser.zig"),
+        @import("sql/semantics.zig"),
+        @import("diagnostic.zig"),
+        @import("server_error.zig"),
         @import("sql_completion.zig"),
         @import("sql_highlight.zig"),
         @import("syntax.zig"),

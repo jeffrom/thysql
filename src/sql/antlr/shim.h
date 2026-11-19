@@ -104,6 +104,79 @@ enum mysql_rule {
   MYSQL_RULE_SET_SYSTEM_VARIABLE = 295
 };
 
+/* A node of the parse tree. The nodes are in preorder: a node's children follow it, and its
+ * subtree ends at index `next`, so the first child of node i (if any) is i + 1 and the sibling
+ * after child c is at c's `next`. `start` and `end` are byte offsets into the input (end
+ * exclusive); a rule that matched nothing, or a token that error recovery made up, has an empty
+ * range where it would be. */
+enum mysql_node_flags {
+  /* A token that error recovery skipped or made up, or a rule that recovery left incomplete. */
+  MYSQL_NODE_ERROR = 1 << 0,
+  /* A token that error recovery made up: it is not in the input. Has MYSQL_NODE_ERROR too. */
+  MYSQL_NODE_MISSING = 1 << 1
+};
+
+typedef struct {
+  /* The rule index (one of the MYSQL_RULE_* values, or another rule of the generated parser),
+   * or -1 for a token. */
+  int rule;
+  /* The token type for a token (MYSQL_TOKEN_* or another type of the generated lexer), 0 for a rule. */
+  int token;
+  size_t start;
+  size_t end;
+  /* Index of the parent, or (size_t)-1 for the root. */
+  size_t parent;
+  /* Index of the first node after this node's subtree. */
+  size_t next;
+  unsigned flags;
+} mysql_tree_node;
+
+/* Parses one statement as mysql_parser_check() does, and also keeps its parse tree. Returns the
+ * number of errors, which are readable through mysql_parser_error(). The tree is readable through
+ * mysql_parser_nodes() until the next call that takes `parser`. A statement with errors still has
+ * a tree: the one that error recovery built. */
+size_t mysql_parser_parse(mysql_parser *parser, const char *sql, size_t len);
+size_t mysql_parser_node_count(mysql_parser *parser);
+const mysql_tree_node *mysql_parser_nodes(mysql_parser *parser);
+
+/* The name of a rule, such as "querySpecification", or NULL when there is no such rule or
+ * nothing has been parsed yet. The string stays valid until mysql_parser_free(). */
+const char *mysql_parser_rule_name(mysql_parser *parser, int rule);
+
+/* Rules that the tree's readers look for. Values match parsers::MySQLParser::Rule*; shim.cpp
+ * checks them at compile time. MYSQL_RULE_QUERY, MYSQL_RULE_COLUMN_REF, MYSQL_RULE_TABLE_REF and
+ * MYSQL_RULE_TABLE_WILD above are used as well. */
+enum mysql_tree_rule {
+  MYSQL_RULE_DELETE_STATEMENT = 110,
+  MYSQL_RULE_INSERT_STATEMENT = 116,
+  MYSQL_RULE_INSERT_FROM_CONSTRUCTOR = 118,
+  MYSQL_RULE_FIELDS = 119,
+  MYSQL_RULE_VALUE_LIST = 122,
+  MYSQL_RULE_VALUES = 123,
+  MYSQL_RULE_QUERY_EXPRESSION_BODY = 136,
+  MYSQL_RULE_QUERY_EXPRESSION_PARENS = 137,
+  MYSQL_RULE_QUERY_SPECIFICATION = 139,
+  MYSQL_RULE_SUBQUERY = 140,
+  MYSQL_RULE_COMMON_TABLE_EXPRESSION = 161,
+  MYSQL_RULE_SELECT_ITEM_LIST = 176,
+  MYSQL_RULE_SELECT_ITEM = 177,
+  MYSQL_RULE_SELECT_ALIAS = 178,
+  MYSQL_RULE_SINGLE_TABLE = 187,
+  MYSQL_RULE_DERIVED_TABLE = 189,
+  MYSQL_RULE_TABLE_ALIAS = 199,
+  MYSQL_RULE_UPDATE_STATEMENT = 208,
+  MYSQL_RULE_IDENTIFIER = 564
+};
+
+/* Token types that the tree's readers look for. Values match parsers::MySQLLexer. */
+enum mysql_token {
+  MYSQL_TOKEN_MULT_OPERATOR = 760,
+  MYSQL_TOKEN_DOT_SYMBOL = 772,
+  MYSQL_TOKEN_COMMA_SYMBOL = 773,
+  MYSQL_TOKEN_OPEN_PAR_SYMBOL = 776,
+  MYSQL_TOKEN_CLOSE_PAR_SYMBOL = 777
+};
+
 #ifdef __cplusplus
 }
 #endif

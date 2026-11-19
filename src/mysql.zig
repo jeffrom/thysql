@@ -314,6 +314,12 @@ pub const DB = struct {
         return C.mysql_warning_count(self.conn);
     }
 
+    /// The server's message for the last error, or "" when there is none.
+    pub fn lastErrorMessage(self: *DB) []const u8 {
+        const message = C.mysql_error(self.conn);
+        return if (message == null) "" else std.mem.sliceTo(message, 0);
+    }
+
     pub fn lastErrno(self: *DB) u32 {
         return C.mysql_errno(self.conn);
     }

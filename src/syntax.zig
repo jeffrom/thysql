@@ -13,6 +13,10 @@ const parser_api = @import("sql/parser.zig");
 const Parser = parser_api.Parser;
 const SqlMode = parser_api.SqlMode;
 const SqlLexer = @import("sql/lexer.zig");
+const Semantics = @import("sql/semantics.zig");
+const ServerError = @import("server_error.zig");
+const Diagnostic = @import("diagnostic.zig");
+const Names = @import("sql_completion.zig").Names;
 
 /// The MySQL version the parser uses when the server's version cannot be read: the newest it knows.
 pub const default_version: u32 = 80400;
@@ -164,7 +168,7 @@ pub const Syntax = struct {
     /// The first error in the statement of `text` that holds `cursor`, for the line being typed. Only
     /// that statement is checked. An error that reaches the end of the text is not returned, because
     /// the user is still typing it: an unfinished statement, or a string that is not closed yet. A
-/// space after the text means the user has finished it.
+    /// space after the text means the user has finished it.
     /// Statements end at `delimiter` or at a backslash command, and client commands are not checked.
     /// Returns null when there is nothing to report, or when the parser is off. Free the result with
     /// `allocator`.
@@ -205,26 +209,29 @@ pub const Syntax = struct {
         if (self.parser_handle) |*handle| handle.freeCandidates(list);
     }
 
-    /// Prints the parser's first error for `sql`, which the server has rejected with a syntax error: the
-    /// message, the line of the statement that it is on, and a caret under the offending text. Nothing is
-    /// printed when the parser is off or finds no error, because the server is authoritative.
-    pub fn renderError(self: *Syntax, out: *std.Io.Writer, sql: []const u8) !void {
+    /// Explains the server's error for `sql` under its message: the lines of the statement that the
+    /// error is about, with labels on the places it relates, such as the column that is ambiguous
+    /// and the tables that both have it, and hints. `names` are the server's names, for "did you
+    /// mean" hints. Nothing is printed when the parser is off, or the error is not one that is
+    /// explained (see server_error.zig), because the server's message is enough then.
+    pub fn explainError(self: *Syntax, out: *std.Io.Writer, sql: []const u8, errno: u32, message: []const u8, names: ?*const Names, color: bool) !void {
         const handle = self.parser() orelse return;
-        const errors = try handle.check(sql);
-        defer handle.freeErrors(errors);
-        if (errors.len == 0) return;
+        var tree = try handle.parse(sql);
+        defer tree.deinit(self.allocator);
+        var analysis = try Semantics.analyze(self.allocator, &tree, sql, .{ .ansi_quotes = self.sql_mode.ansi_quotes });
+        defer analysis.deinit();
+        var arena: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena.deinit();
 
-        const first = errors[0];
-        const line_start = if (std.mem.lastIndexOfScalar(u8, sql[0..first.start], '\n')) |newline| newline + 1 else 0;
-        const line_end = std.mem.indexOfScalarPos(u8, sql, first.start, '\n') orelse sql.len;
-        try out.print("parser: {s}\n", .{first.message});
-        try out.print("{s}\n", .{sql[line_start..line_end]});
-        // Columns are counted in code points, as the terminal draws them.
-        const column = codePoints(sql[line_start..first.start]);
-        const width = @max(1, codePoints(sql[first.start..@min(first.end, line_end)]));
-        try out.splatByteAll(' ', column);
-        try out.splatByteAll('^', width);
-        try out.writeAll("\n");
+        const diagnostic = (try ServerError.explain(arena.allocator(), .{
+            .errno = errno,
+            .message = message,
+            .sql = sql,
+            .tree = &tree,
+            .analysis = &analysis,
+            .names = names,
+        })) orelse return;
+        try Diagnostic.renderSnippet(out, sql, "query", diagnostic, .{ .color = color });
     }
 
     fn joinWarmUp(self: *Syntax) void {
@@ -415,28 +422,21 @@ test "a disabled syntax reports nothing" {
     try std.testing.expect((try syntax.firstError(allocator, "SELECT a FROM t FROM x", 22, ";")) == null);
 }
 
-test "a server syntax error is followed by the parser's message and a caret under the text" {
+test "a server syntax error is followed by the statement, with the parser's message under the text" {
     const allocator = std.testing.allocator;
     var syntax = Syntax.init(allocator, true);
     defer syntax.deinit();
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try syntax.renderError(&out.writer, "SELECT a FROM t FROM x");
-    const written = out.written();
-    try std.testing.expect(std.mem.startsWith(u8, written, "parser: \"FROM\" is not valid at this position"));
-    try std.testing.expect(std.mem.endsWith(u8, written, "\nSELECT a FROM t FROM x\n                ^^^^\n"));
-}
-
-test "the caret goes under the line of a multi-line statement that has the error" {
-    const allocator = std.testing.allocator;
-    var syntax = Syntax.init(allocator, true);
-    defer syntax.deinit();
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-
-    try syntax.renderError(&out.writer, "SELECT a\nFROM t FROM x");
-    try std.testing.expect(std.mem.endsWith(u8, out.written(), "\nFROM t FROM x\n       ^^^^\n"));
+    try syntax.explainError(&out.writer, "SELECT a\nFROM t FROM x", Syntax.parse_error_code, "You have an error in your SQL syntax", null, false);
+    try std.testing.expectEqualStrings(
+        \\ --> query:2:8
+        \\  |
+        \\2 | FROM t FROM x
+        \\  |        ^^^^ "FROM" is not valid at this position, expecting SEMICOLON
+        \\
+    , out.written());
 }
 
 test "a valid statement prints nothing, and so does a disabled syntax" {
@@ -445,11 +445,11 @@ test "a valid statement prints nothing, and so does a disabled syntax" {
     defer syntax.deinit();
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try syntax.renderError(&out.writer, "SELECT a FROM t");
+    try syntax.explainError(&out.writer, "SELECT a FROM t", Syntax.parse_error_code, "", null, false);
     try std.testing.expectEqualStrings("", out.written());
 
     var off = Syntax.init(allocator, false);
     defer off.deinit();
-    try off.renderError(&out.writer, "SELECT a FROM t FROM x");
+    try off.explainError(&out.writer, "SELECT a FROM t FROM x", Syntax.parse_error_code, "", null, false);
     try std.testing.expectEqualStrings("", out.written());
 }

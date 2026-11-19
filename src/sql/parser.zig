@@ -58,6 +58,146 @@ pub const Rule = enum(c_int) {
     set_system_variable = c.MYSQL_RULE_SET_SYSTEM_VARIABLE,
 };
 
+/// Rules and tokens of the parse tree that its readers look for. The values are the generated
+/// parser's rule indexes and token types (see the shim's mysql_tree_rule and mysql_token enums);
+/// other rules have other values.
+pub const NodeRule = enum(c_int) {
+    query = c.MYSQL_RULE_QUERY,
+    delete_statement = c.MYSQL_RULE_DELETE_STATEMENT,
+    insert_statement = c.MYSQL_RULE_INSERT_STATEMENT,
+    insert_from_constructor = c.MYSQL_RULE_INSERT_FROM_CONSTRUCTOR,
+    fields = c.MYSQL_RULE_FIELDS,
+    value_list = c.MYSQL_RULE_VALUE_LIST,
+    values = c.MYSQL_RULE_VALUES,
+    query_expression_body = c.MYSQL_RULE_QUERY_EXPRESSION_BODY,
+    query_expression_parens = c.MYSQL_RULE_QUERY_EXPRESSION_PARENS,
+    query_specification = c.MYSQL_RULE_QUERY_SPECIFICATION,
+    subquery = c.MYSQL_RULE_SUBQUERY,
+    common_table_expression = c.MYSQL_RULE_COMMON_TABLE_EXPRESSION,
+    select_item_list = c.MYSQL_RULE_SELECT_ITEM_LIST,
+    select_item = c.MYSQL_RULE_SELECT_ITEM,
+    select_alias = c.MYSQL_RULE_SELECT_ALIAS,
+    single_table = c.MYSQL_RULE_SINGLE_TABLE,
+    derived_table = c.MYSQL_RULE_DERIVED_TABLE,
+    table_alias = c.MYSQL_RULE_TABLE_ALIAS,
+    update_statement = c.MYSQL_RULE_UPDATE_STATEMENT,
+    column_ref = c.MYSQL_RULE_COLUMN_REF,
+    table_wild = c.MYSQL_RULE_TABLE_WILD,
+    table_ref = c.MYSQL_RULE_TABLE_REF,
+    identifier = c.MYSQL_RULE_IDENTIFIER,
+    _,
+};
+
+pub const Token = enum(c_int) {
+    mult_operator = c.MYSQL_TOKEN_MULT_OPERATOR,
+    dot = c.MYSQL_TOKEN_DOT_SYMBOL,
+    comma = c.MYSQL_TOKEN_COMMA_SYMBOL,
+    open_par = c.MYSQL_TOKEN_OPEN_PAR_SYMBOL,
+    close_par = c.MYSQL_TOKEN_CLOSE_PAR_SYMBOL,
+    _,
+};
+
+/// A node of a parse tree: a rule, or a token.
+pub const Node = struct {
+    pub const Kind = union(enum) { rule: NodeRule, token: Token };
+
+    kind: Kind,
+    /// Byte offsets into the input, end exclusive. Empty for a rule that matched nothing, or a
+    /// token that error recovery made up.
+    start: usize,
+    end: usize,
+    /// Index of the parent; null for the root.
+    parent: ?u32,
+    /// Index of the first node after this one's subtree.
+    next: u32,
+    /// Error recovery skipped or made up this token, or left this rule incomplete.
+    recovered: bool,
+    /// Error recovery made up this token: it is not in the input.
+    missing: bool = false,
+
+    pub fn isRule(self: Node, rule: NodeRule) bool {
+        return switch (self.kind) {
+            .rule => |r| r == rule,
+            .token => false,
+        };
+    }
+
+    pub fn isToken(self: Node, token: Token) bool {
+        return switch (self.kind) {
+            .rule => false,
+            .token => |t| t == token,
+        };
+    }
+};
+
+/// A statement's parse tree, with its errors. The nodes are in preorder: node 0 is the root, the
+/// children of node i start at i + 1, and its subtree ends before `nodes[i].next`. Free it with
+/// `deinit`.
+pub const Tree = struct {
+    nodes: []Node,
+    errors: []Error,
+
+    pub fn deinit(self: *Tree, allocator: std.mem.Allocator) void {
+        for (self.errors) |e| allocator.free(e.message);
+        allocator.free(self.errors);
+        allocator.free(self.nodes);
+        self.* = undefined;
+    }
+
+    /// The children of node `index`, in order.
+    pub fn children(self: *const Tree, index: u32) Children {
+        return .{ .tree = self, .at = index + 1, .end = self.nodes[index].next };
+    }
+
+    /// The first child of node `index` that is `rule`.
+    pub fn child(self: *const Tree, index: u32, rule: NodeRule) ?u32 {
+        var it = self.children(index);
+        while (it.next()) |i| {
+            if (self.nodes[i].isRule(rule)) return i;
+        }
+        return null;
+    }
+
+    /// The first node in the subtree of `index` (itself included) that is `rule`, in preorder.
+    pub fn find(self: *const Tree, index: u32, rule: NodeRule) ?u32 {
+        var i = index;
+        while (i < self.nodes[index].next) : (i += 1) {
+            if (self.nodes[i].isRule(rule)) return i;
+        }
+        return null;
+    }
+
+    /// The nearest ancestor of `index` that is `rule`.
+    pub fn ancestor(self: *const Tree, index: u32, rule: NodeRule) ?u32 {
+        var at = self.nodes[index].parent;
+        while (at) |i| : (at = self.nodes[i].parent) {
+            if (self.nodes[i].isRule(rule)) return i;
+        }
+        return null;
+    }
+
+    /// True when error recovery touched the subtree of `index`.
+    pub fn hasRecovery(self: *const Tree, index: u32) bool {
+        for (self.nodes[index..self.nodes[index].next]) |node| {
+            if (node.recovered) return true;
+        }
+        return false;
+    }
+
+    pub const Children = struct {
+        tree: *const Tree,
+        at: u32,
+        end: u32,
+
+        pub fn next(self: *Children) ?u32 {
+            if (self.at >= self.end) return null;
+            const index = self.at;
+            self.at = self.tree.nodes[index].next;
+            return index;
+        }
+    };
+};
+
 /// A completion candidate for the caret.
 pub const Candidate = struct {
     pub const Kind = enum { keyword, rule };
@@ -96,7 +236,11 @@ pub const Parser = struct {
     /// Parses one statement and returns its errors, in input order. An empty slice means the
     /// statement is valid. Free the result with freeErrors().
     pub fn check(self: *Parser, sql: []const u8) error{OutOfMemory}![]Error {
-        const count = c.mysql_parser_check(self.handle, sql.ptr, sql.len);
+        return self.copyErrors(c.mysql_parser_check(self.handle, sql.ptr, sql.len));
+    }
+
+    /// Copies the `count` errors of the last parse.
+    fn copyErrors(self: *Parser, count: usize) error{OutOfMemory}![]Error {
         const out = try self.allocator.alloc(Error, count);
         var done: usize = 0;
         errdefer {
@@ -117,6 +261,39 @@ pub const Parser = struct {
         // The shim reports exactly `count` errors, so every slot is filled.
         std.debug.assert(done == count);
         return out;
+    }
+
+    /// Parses one statement and returns its parse tree, with its errors in input order. A statement
+    /// with errors has the tree that error recovery built. Free the result with `Tree.deinit`.
+    pub fn parse(self: *Parser, sql: []const u8) error{OutOfMemory}!Tree {
+        const error_count = c.mysql_parser_parse(self.handle, sql.ptr, sql.len);
+        const errors = try self.copyErrors(error_count);
+        errdefer self.freeErrors(errors);
+
+        const count = c.mysql_parser_node_count(self.handle);
+        const nodes = try self.allocator.alloc(Node, count);
+        if (count > 0) {
+            const raw = c.mysql_parser_nodes(self.handle)[0..count];
+            for (raw, nodes) |r, *n| {
+                n.* = .{
+                    .kind = if (r.rule >= 0) .{ .rule = @fromBackingInt(@intCast(r.rule)) } else .{ .token = @fromBackingInt(@intCast(r.token)) },
+                    .start = r.start,
+                    .end = r.end,
+                    .parent = if (r.parent == std.math.maxInt(usize)) null else @intCast(r.parent),
+                    .next = @intCast(r.next),
+                    .recovered = (r.flags & c.MYSQL_NODE_ERROR) != 0,
+                    .missing = (r.flags & c.MYSQL_NODE_MISSING) != 0,
+                };
+            }
+        }
+        return .{ .nodes = nodes, .errors = errors };
+    }
+
+    /// The generated parser's name for a rule, such as "querySpecification". Null before the first
+    /// parse, or for a value that is no rule.
+    pub fn ruleName(self: *Parser, rule: NodeRule) ?[]const u8 {
+        const name = c.mysql_parser_rule_name(self.handle, @backingInt(rule)) orelse return null;
+        return std.mem.span(name);
     }
 
     /// Returns the completion candidates for a caret at byte offset `caret`. Free the result
@@ -311,4 +488,79 @@ test "candidates at an empty statement offer statement keywords" {
     const candidates = try parser.candidates("", 0);
     defer parser.freeCandidates(candidates);
     try testing.expect(candidates.len > 0);
+}
+
+fn ruleOf(tree: *const Tree, index: u32) ?NodeRule {
+    return switch (tree.nodes[index].kind) {
+        .rule => |r| r,
+        .token => null,
+    };
+}
+
+test "parse keeps a preorder tree with byte spans" {
+    var parser = try Parser.init(testing.allocator, v84, .{});
+    defer parser.deinit();
+
+    const sql = "SELECT u.id FROM users AS u WHERE u.id = 1";
+    var tree = try parser.parse(sql);
+    defer tree.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try testing.expect(tree.nodes.len > 10);
+    try testing.expectEqual(NodeRule.query, ruleOf(&tree, 0).?);
+    try testing.expectEqual(@as(?u32, null), tree.nodes[0].parent);
+    try testing.expectEqual(@as(u32, @intCast(tree.nodes.len)), tree.nodes[0].next);
+    try testing.expectEqualStrings("query", parser.ruleName(.query).?);
+
+    const spec = tree.find(0, .query_specification).?;
+    try testing.expectEqualStrings(sql, sql[tree.nodes[spec].start..tree.nodes[spec].end]);
+
+    const single = tree.find(0, .single_table).?;
+    try testing.expectEqualStrings("users AS u", sql[tree.nodes[single].start..tree.nodes[single].end]);
+    const alias = tree.child(single, .table_alias).?;
+    try testing.expectEqualStrings("AS u", sql[tree.nodes[alias].start..tree.nodes[alias].end]);
+    try testing.expectEqual(spec, tree.ancestor(single, .query_specification).?);
+
+    // A qualified column: the identifier after the dot has its own span.
+    const column = tree.find(0, .column_ref).?;
+    try testing.expectEqualStrings("u.id", sql[tree.nodes[column].start..tree.nodes[column].end]);
+    var idents: [2][]const u8 = undefined;
+    var n: usize = 0;
+    var i = column;
+    while (i < tree.nodes[column].next) : (i += 1) {
+        if (tree.nodes[i].isRule(.identifier)) {
+            idents[n] = sql[tree.nodes[i].start..tree.nodes[i].end];
+            n += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("u", idents[0]);
+    try testing.expectEqualStrings("id", idents[1]);
+}
+
+test "parse of a statement with errors keeps the recovered tree" {
+    var parser = try Parser.init(testing.allocator, v84, .{});
+    defer parser.deinit();
+
+    const sql = "SELECT a FROM t WHERE (a = 1";
+    var tree = try parser.parse(sql);
+    defer tree.deinit(testing.allocator);
+    try testing.expect(tree.errors.len > 0);
+    try testing.expect(tree.nodes.len > 0);
+    try testing.expect(tree.hasRecovery(0));
+    for (tree.nodes) |node| {
+        try testing.expect(node.start <= node.end);
+        try testing.expect(node.end <= sql.len);
+    }
+}
+
+test "parse spans are byte offsets after multi-byte UTF-8" {
+    var parser = try Parser.init(testing.allocator, v84, .{});
+    defer parser.deinit();
+
+    const sql = "SELECT 'é' AS x FROM `tä`";
+    var tree = try parser.parse(sql);
+    defer tree.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), tree.errors.len);
+    const ref = tree.find(0, .table_ref).?;
+    try testing.expectEqualStrings("`tä`", sql[tree.nodes[ref].start..tree.nodes[ref].end]);
 }
