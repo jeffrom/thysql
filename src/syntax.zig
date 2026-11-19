@@ -17,6 +17,8 @@ const Semantics = @import("sql/semantics.zig");
 const ServerError = @import("server_error.zig");
 const Diagnostic = @import("diagnostic.zig");
 const Names = @import("sql_completion.zig").Names;
+const Plan = @import("plan.zig");
+const PlanLabels = @import("plan_labels.zig");
 
 /// The MySQL version the parser uses when the server's version cannot be read: the newest it knows.
 pub const default_version: u32 = 80400;
@@ -214,7 +216,7 @@ pub const Syntax = struct {
     /// and the tables that both have it, and hints. `names` are the server's names, for "did you
     /// mean" hints. Nothing is printed when the parser is off, or the error is not one that is
     /// explained (see server_error.zig), because the server's message is enough then.
-    pub fn explainError(self: *Syntax, out: *std.Io.Writer, sql: []const u8, errno: u32, message: []const u8, names: ?*const Names, color: bool) !void {
+    pub fn explainError(self: *Syntax, out: *std.Io.Writer, sql: []const u8, errno: u32, message: []const u8, names: ?*const Names, display: Display) !void {
         const handle = self.parser() orelse return;
         var tree = try handle.parse(sql);
         defer tree.deinit(self.allocator);
@@ -231,7 +233,38 @@ pub const Syntax = struct {
             .analysis = &analysis,
             .names = names,
         })) orelse return;
-        try Diagnostic.renderSnippet(out, sql, "query", diagnostic, .{ .color = color });
+        const source = try displaySource(arena.allocator(), &tree, sql, display.width);
+        try Diagnostic.renderSnippet(out, source, "query", diagnostic, .{ .color = display.color });
+    }
+
+    /// True when `sql` may be an EXPLAIN statement, whose result `annotatePlan` can draw. A cheap
+    /// check of the first word, before the result is copied.
+    pub fn mayBeExplain(sql: []const u8) bool {
+        const text = std.mem.trimStart(u8, sql, " \t\r\n(");
+        return std.ascii.startsWithIgnoreCase(text, "EXPLAIN") or std.ascii.startsWithIgnoreCase(text, "DESC");
+    }
+
+    /// Draws the plan that the EXPLAIN statement `sql` gave, with its column names and rows, on
+    /// the statement: see plan_labels.zig. Nothing is printed when the parser is off, the statement
+    /// is no EXPLAIN of a statement (such as DESCRIBE of a table), or no step of the plan can be
+    /// placed on it.
+    pub fn annotatePlan(self: *Syntax, out: *std.Io.Writer, sql: []const u8, columns: []const []const u8, rows: []const []const ?[]const u8, display: Display) !void {
+        const handle = self.parser() orelse return;
+        var tree = try handle.parse(sql);
+        defer tree.deinit(self.allocator);
+        if (tree.errors.len > 0) return;
+        var analysis = try Semantics.analyze(self.allocator, &tree, sql, .{ .ansi_quotes = self.sql_mode.ansi_quotes });
+        defer analysis.deinit();
+        if (analysis.explain == null) return;
+
+        var plan = (try Plan.fromResult(self.allocator, columns, rows)) orelse return;
+        defer plan.deinit();
+        var arena: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena.deinit();
+        const diagnostic = (try PlanLabels.annotate(arena.allocator(), &plan, &analysis, sql)) orelse return;
+        const source = try displaySource(arena.allocator(), &tree, sql, display.width);
+        try out.writeByte('\n');
+        try Diagnostic.render(out, source, "query", diagnostic, .{ .color = display.color });
     }
 
     fn joinWarmUp(self: *Syntax) void {
@@ -241,6 +274,62 @@ pub const Syntax = struct {
         }
     }
 };
+
+/// How diagnostics are drawn.
+pub const Display = struct {
+    color: bool = false,
+    /// The terminal's width. A statement with a longer line is broken at its clauses. 0 for no limit.
+    width: usize = 0,
+};
+
+/// Room that the gutter of a diagnostic takes: ` 12 | `.
+const gutter_width = 6;
+
+/// `sql` as a diagnostic shows it: when a line is wider than `width`, the space before each
+/// clause of the outer statement (FROM, JOIN, WHERE, GROUP BY, ...) becomes a newline. The length
+/// stays the same, so the byte offsets of labels still point at the same text.
+fn displaySource(arena: Allocator, tree: *const parser_api.Tree, sql: []const u8, width: usize) Allocator.Error![]const u8 {
+    if (width == 0) return sql;
+    var widest: usize = 0;
+    var lines = std.mem.splitScalar(u8, sql, '\n');
+    while (lines.next()) |line| widest = @max(widest, codePoints(line));
+    if (widest + gutter_width <= width) return sql;
+
+    const out = try arena.dupe(u8, sql);
+    var depth: usize = 0;
+    var previous: []const u8 = "";
+    for (tree.nodes) |node| {
+        if (node.kind != .token or node.missing or node.start == node.end) continue;
+        if (node.isToken(.open_par)) depth += 1;
+        if (node.isToken(.close_par)) depth -|= 1;
+        const word = sql[node.start..node.end];
+        defer previous = word;
+        if (depth != 0 or node.start == 0 or out[node.start - 1] != ' ') continue;
+        // LEFT(...) is a function.
+        if (node.end < sql.len and sql[node.end] == '(') continue;
+        if (breaksBefore(word, previous)) out[node.start - 1] = '\n';
+    }
+    return out;
+}
+
+/// True when a line of a long statement starts at `word`, which follows `previous`.
+fn breaksBefore(word: []const u8, previous: []const u8) bool {
+    const clauses = [_][]const u8{ "FROM", "WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "UNION", "SET", "VALUES" };
+    for (clauses) |clause| {
+        if (std.ascii.eqlIgnoreCase(word, clause)) return true;
+    }
+    const join_starts = [_][]const u8{ "JOIN", "STRAIGHT_JOIN", "LEFT", "RIGHT", "INNER", "CROSS", "NATURAL" };
+    // The words that a join can start with, unless they continue one: LEFT JOIN, NATURAL LEFT JOIN.
+    const join_words = [_][]const u8{ "LEFT", "RIGHT", "INNER", "CROSS", "OUTER", "NATURAL" };
+    for (join_starts) |start| {
+        if (!std.ascii.eqlIgnoreCase(word, start)) continue;
+        for (join_words) |w| {
+            if (std.ascii.eqlIgnoreCase(previous, w)) return false;
+        }
+        return true;
+    }
+    return false;
+}
 
 /// An error in the statement being typed. The offsets are into the text that was checked.
 pub const Problem = struct {
@@ -429,7 +518,7 @@ test "a server syntax error is followed by the statement, with the parser's mess
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try syntax.explainError(&out.writer, "SELECT a\nFROM t FROM x", Syntax.parse_error_code, "You have an error in your SQL syntax", null, false);
+    try syntax.explainError(&out.writer, "SELECT a\nFROM t FROM x", Syntax.parse_error_code, "You have an error in your SQL syntax", null, .{});
     try std.testing.expectEqualStrings(
         \\ --> query:2:8
         \\  |
@@ -439,17 +528,59 @@ test "a server syntax error is followed by the statement, with the parser's mess
     , out.written());
 }
 
+test "an EXPLAIN result is drawn on its statement, and DESCRIBE of a table is not" {
+    const allocator = std.testing.allocator;
+    var syntax = Syntax.init(allocator, true);
+    defer syntax.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    const plan_text = "-> Table scan on t  (cost=1 rows=3) (actual time=0.01..0.02 rows=3 loops=1)";
+    const sql = "EXPLAIN ANALYZE SELECT * FROM t";
+    try std.testing.expect(Syntax.mayBeExplain(sql));
+    try syntax.annotatePlan(&out.writer, sql, &.{"EXPLAIN"}, &.{&.{plan_text}}, .{});
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "table scan · 3 rows · 0.02 ms") != null);
+
+    out.clearRetainingCapacity();
+    try syntax.annotatePlan(&out.writer, "DESCRIBE t", &.{ "Field", "Type" }, &.{&.{ "id", "int" }}, .{});
+    try std.testing.expectEqualStrings("", out.written());
+    try std.testing.expect(!Syntax.mayBeExplain("SELECT 1"));
+}
+
+test "a long statement is broken at its outer clauses, and keeps its length" {
+    const allocator = std.testing.allocator;
+    var p = try Parser.init(allocator, default_version, .{});
+    defer p.deinit();
+    const sql = "SELECT LEFT(name, 2) FROM users u LEFT JOIN (SELECT 1 AS id FROM t WHERE a = 1) d ON d.id = u.id WHERE u.id > 1 ORDER BY 1";
+    var tree = try p.parse(sql);
+    defer tree.deinit(allocator);
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    try std.testing.expectEqualStrings(sql, try displaySource(arena.allocator(), &tree, sql, 0));
+    try std.testing.expectEqualStrings(sql, try displaySource(arena.allocator(), &tree, sql, 400));
+    const shown = try displaySource(arena.allocator(), &tree, sql, 60);
+    try std.testing.expectEqual(sql.len, shown.len);
+    try std.testing.expectEqualStrings(
+        \\SELECT LEFT(name, 2)
+        \\FROM users u
+        \\LEFT JOIN (SELECT 1 AS id FROM t WHERE a = 1) d ON d.id = u.id
+        \\WHERE u.id > 1
+        \\ORDER BY 1
+    , shown);
+}
+
 test "a valid statement prints nothing, and so does a disabled syntax" {
     const allocator = std.testing.allocator;
     var syntax = Syntax.init(allocator, true);
     defer syntax.deinit();
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try syntax.explainError(&out.writer, "SELECT a FROM t", Syntax.parse_error_code, "", null, false);
+    try syntax.explainError(&out.writer, "SELECT a FROM t", Syntax.parse_error_code, "", null, .{});
     try std.testing.expectEqualStrings("", out.written());
 
     var off = Syntax.init(allocator, false);
     defer off.deinit();
-    try off.explainError(&out.writer, "SELECT a FROM t FROM x", Syntax.parse_error_code, "", null, false);
+    try off.explainError(&out.writer, "SELECT a FROM t FROM x", Syntax.parse_error_code, "", null, .{});
     try std.testing.expectEqualStrings("", out.written());
 }

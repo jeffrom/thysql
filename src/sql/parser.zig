@@ -85,6 +85,16 @@ pub const NodeRule = enum(c_int) {
     table_wild = c.MYSQL_RULE_TABLE_WILD,
     table_ref = c.MYSQL_RULE_TABLE_REF,
     identifier = c.MYSQL_RULE_IDENTIFIER,
+    limit_clause = c.MYSQL_RULE_LIMIT_CLAUSE,
+    simple_limit_clause = c.MYSQL_RULE_SIMPLE_LIMIT_CLAUSE,
+    having_clause = c.MYSQL_RULE_HAVING_CLAUSE,
+    group_by_clause = c.MYSQL_RULE_GROUP_BY_CLAUSE,
+    order_clause = c.MYSQL_RULE_ORDER_CLAUSE,
+    select_option = c.MYSQL_RULE_SELECT_OPTION,
+    where_clause = c.MYSQL_RULE_WHERE_CLAUSE,
+    joined_table = c.MYSQL_RULE_JOINED_TABLE,
+    explain_statement = c.MYSQL_RULE_EXPLAIN_STATEMENT,
+    expr = c.MYSQL_RULE_EXPR,
     _,
 };
 
@@ -94,6 +104,11 @@ pub const Token = enum(c_int) {
     comma = c.MYSQL_TOKEN_COMMA_SYMBOL,
     open_par = c.MYSQL_TOKEN_OPEN_PAR_SYMBOL,
     close_par = c.MYSQL_TOKEN_CLOSE_PAR_SYMBOL,
+    analyze = c.MYSQL_TOKEN_ANALYZE_SYMBOL,
+    and_symbol = c.MYSQL_TOKEN_AND_SYMBOL,
+    distinct = c.MYSQL_TOKEN_DISTINCT_SYMBOL,
+    on_symbol = c.MYSQL_TOKEN_ON_SYMBOL,
+    logical_and = c.MYSQL_TOKEN_LOGICAL_AND_OPERATOR,
     _,
 };
 

@@ -783,6 +783,33 @@ pub fn rewindResult(result: Result) void {
     C.mysql_data_seek(result, 0);
 }
 
+/// A stored result's column names and rows, as text. NULL is null.
+pub const ResultCopy = struct {
+    columns: []const []const u8,
+    rows: []const []const ?[]const u8,
+};
+
+/// Copies a stored result into `arena`. The cursor is back on the first row afterwards, so the
+/// result can still be rendered or kept.
+pub fn copyResult(arena: Allocator, result: Result) Allocator.Error!ResultCopy {
+    const fields = resultFields(result);
+    const columns = try arena.alloc([]const u8, fields.len);
+    for (fields, columns) |field, *column| column.* = try arena.dupe(u8, field.name[0..field.name_length]);
+
+    var rows: std.ArrayList([]const ?[]const u8) = .empty;
+    rewindResult(result);
+    defer rewindResult(result);
+    while (C.mysql_fetch_row(result)) |row| {
+        const lengths = C.mysql_fetch_lengths(result);
+        const values = try arena.alloc(?[]const u8, fields.len);
+        for (values, 0..) |*value, i| {
+            value.* = if (row[i] == null) null else try arena.dupe(u8, row[i][0..lengths[i]]);
+        }
+        try rows.append(arena, values);
+    }
+    return .{ .columns = columns, .rows = rows.items };
+}
+
 /// Sums the field lengths of every row, which is the size `\y` checks against
 /// clipboard-max-bytes. The cursor is back on the first row afterwards.
 pub fn countFieldBytes(result: Result) u64 {

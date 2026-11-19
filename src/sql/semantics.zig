@@ -97,6 +97,32 @@ pub const SelectList = struct {
     body: ?u32,
 };
 
+/// A clause of a block that a plan step can point at.
+pub const ClauseKind = enum { where, on, having, group_by, order_by, limit, distinct };
+
+pub const Clause = struct {
+    kind: ClauseKind,
+    /// The block it belongs to. ORDER BY and LIMIT of a SELECT are outside its querySpecification,
+    /// so they belong to the block around it, which may be none.
+    block: ?u32,
+    span: Span,
+};
+
+/// One condition of a WHERE, ON or HAVING clause: the clause's expression split at its top-level
+/// ANDs. `a = 1 AND (b = 2 OR c = 3)` has two.
+pub const Predicate = struct {
+    clause: ClauseKind,
+    block: ?u32,
+    span: Span,
+};
+
+/// The statement is EXPLAIN (or DESCRIBE) of another one.
+pub const Explain = struct {
+    span: Span,
+    /// EXPLAIN ANALYZE: the statement was run, and the plan has actual rows and times.
+    analyze: bool,
+};
+
 pub const Options = struct {
     /// ANSI_QUOTES: double quotes quote identifiers.
     ansi_quotes: bool = false,
@@ -111,6 +137,32 @@ pub const Analysis = struct {
     aliases: []SelectAlias = &.{},
     ctes: []Cte = &.{},
     select_lists: []SelectList = &.{},
+    clauses: []Clause = &.{},
+    predicates: []Predicate = &.{},
+    explain: ?Explain = null,
+
+    /// Iterates the columns of `predicate`: those inside its span, of its own block (not of a
+    /// subquery inside it).
+    pub fn predicateColumns(self: *const Analysis, predicate: Predicate) PredicateColumns {
+        return .{ .analysis = self, .predicate = predicate };
+    }
+
+    pub const PredicateColumns = struct {
+        analysis: *const Analysis,
+        predicate: Predicate,
+        at: usize = 0,
+
+        pub fn next(self: *PredicateColumns) ?Column {
+            while (self.at < self.analysis.columns.len) {
+                const column = self.analysis.columns[self.at];
+                self.at += 1;
+                if (column.span.start < self.predicate.span.start or column.span.end > self.predicate.span.end) continue;
+                if (!std.meta.eql(column.block, self.predicate.block)) continue;
+                return column;
+            }
+            return null;
+        }
+    };
 
     pub fn deinit(self: *Analysis) void {
         self.arena.deinit();
@@ -170,6 +222,8 @@ pub fn analyze(gpa: Allocator, tree: *const Tree, sql: []const u8, options: Opti
     var aliases: std.ArrayList(SelectAlias) = .empty;
     var ctes: std.ArrayList(Cte) = .empty;
     var select_lists: std.ArrayList(SelectList) = .empty;
+    var clauses: std.ArrayList(Clause) = .empty;
+    var predicates: std.ArrayList(Predicate) = .empty;
 
     var reader: Reader = .{ .arena = arena, .tree = tree, .sql = sql, .options = options };
 
@@ -253,6 +307,44 @@ pub fn analyze(gpa: Allocator, tree: *const Tree, sql: []const u8, options: Opti
                     .item_span = .of(tree.nodes[item]),
                 });
             },
+            .where_clause, .having_clause => {
+                const kind: ClauseKind = if (rule == .where_clause) .where else .having;
+                try clauses.append(arena, .{ .kind = kind, .block = current, .span = .of(node) });
+                if (tree.child(i, .expr)) |expr| try splitConjuncts(arena, tree, expr, kind, current, &predicates);
+            },
+            .joined_table => {
+                // ... JOIN t ON expr: the expr after the ON token.
+                var it = tree.children(i);
+                var after_on = false;
+                while (it.next()) |c| {
+                    if (tree.nodes[c].isToken(.on_symbol)) {
+                        after_on = true;
+                    } else if (after_on and tree.nodes[c].isRule(.expr)) {
+                        try clauses.append(arena, .{ .kind = .on, .block = current, .span = .of(tree.nodes[c]) });
+                        try splitConjuncts(arena, tree, c, .on, current, &predicates);
+                        break;
+                    }
+                }
+            },
+            .group_by_clause => try clauses.append(arena, .{ .kind = .group_by, .block = current, .span = .of(node) }),
+            .order_clause => try clauses.append(arena, .{ .kind = .order_by, .block = current, .span = .of(node) }),
+            .limit_clause, .simple_limit_clause => try clauses.append(arena, .{ .kind = .limit, .block = current, .span = .of(node) }),
+            .select_option => {
+                // selectOption -> querySpecOption -> DISTINCT.
+                for (tree.nodes[i..node.next]) |n| {
+                    if (!n.isToken(.distinct)) continue;
+                    try clauses.append(arena, .{ .kind = .distinct, .block = current, .span = .of(node) });
+                    break;
+                }
+            },
+            .explain_statement => {
+                var analyze_token = false;
+                var it = tree.children(i);
+                while (it.next()) |c| {
+                    if (tree.nodes[c].isToken(.analyze)) analyze_token = true;
+                }
+                result.explain = .{ .span = .of(node), .analyze = analyze_token };
+            },
             .common_table_expression => {
                 const ident = tree.child(i, .identifier) orelse continue;
                 const name = try reader.name(ident);
@@ -268,7 +360,28 @@ pub fn analyze(gpa: Allocator, tree: *const Tree, sql: []const u8, options: Opti
     result.aliases = aliases.items;
     result.ctes = ctes.items;
     result.select_lists = select_lists.items;
+    result.clauses = clauses.items;
+    result.predicates = predicates.items;
     return result;
+}
+
+/// Adds the conditions of `expr` split at its top-level ANDs.
+fn splitConjuncts(arena: Allocator, tree: *const Tree, expr: u32, clause: ClauseKind, block: ?u32, out: *std.ArrayList(Predicate)) Allocator.Error!void {
+    // exprAnd is `expr (AND | &&) expr`.
+    var is_and = false;
+    var it = tree.children(expr);
+    while (it.next()) |c| {
+        if (tree.nodes[c].isToken(.and_symbol) or tree.nodes[c].isToken(.logical_and)) is_and = true;
+    }
+    if (is_and) {
+        var parts = tree.children(expr);
+        while (parts.next()) |c| {
+            if (tree.nodes[c].isRule(.expr)) try splitConjuncts(arena, tree, c, clause, block, out);
+        }
+        return;
+    }
+    if (tree.nodes[expr].start == tree.nodes[expr].end) return;
+    try out.append(arena, .{ .clause = clause, .block = block, .span = .of(tree.nodes[expr]) });
 }
 
 /// The first sibling after node `index` that is `rule`.
@@ -507,6 +620,44 @@ test "select aliases, CTEs, quoted names and select lists" {
     try testing.expectEqual(@as(u32, 2), second.items);
     try testing.expect(first.body != null);
     try testing.expectEqual(first.body, second.body);
+}
+
+test "conditions split at top-level ANDs, clauses, and EXPLAIN" {
+    var p = try parser.Parser.init(testing.allocator, 80400, .{});
+    defer p.deinit();
+    const sql = "EXPLAIN ANALYZE SELECT DISTINCT u.name FROM users u JOIN orders o ON o.user_id = u.id AND o.x > 1 " ++
+        "WHERE o.status = 'open' AND (u.id > 10 OR u.id < 5) AND EXISTS (SELECT 1 FROM t WHERE t.a = u.id) " ++
+        "GROUP BY u.name ORDER BY u.name LIMIT 5";
+    var r = try analyzed(&p, sql);
+    defer r.tree.deinit(testing.allocator);
+    defer r.analysis.deinit();
+    const a = &r.analysis;
+
+    try testing.expect(a.explain.?.analyze);
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer texts.deinit(testing.allocator);
+    for (a.predicates) |pred| {
+        if (pred.block == 0) try texts.append(testing.allocator, spanText(sql, pred.span));
+    }
+    try testing.expectEqual(@as(usize, 5), texts.items.len);
+    try testing.expectEqualStrings("o.user_id = u.id", texts.items[0]);
+    try testing.expectEqualStrings("o.x > 1", texts.items[1]);
+    try testing.expectEqualStrings("o.status = 'open'", texts.items[2]);
+    try testing.expectEqualStrings("(u.id > 10 OR u.id < 5)", texts.items[3]);
+
+    // The EXISTS condition's own columns are the subquery's, not block 0's.
+    var it = a.predicateColumns(a.predicates[4]);
+    try testing.expectEqual(@as(?Column, null), it.next());
+    var it2 = a.predicateColumns(a.predicates[3]);
+    try testing.expectEqualStrings("id", it2.next().?.name);
+
+    var kinds: [8]ClauseKind = undefined;
+    var n: usize = 0;
+    for (a.clauses) |clause| {
+        if (n < kinds.len) kinds[n] = clause.kind;
+        n += 1;
+    }
+    try testing.expectEqualSlices(ClauseKind, &.{ .distinct, .on, .where, .where, .group_by, .order_by, .limit }, kinds[0..n]);
 }
 
 test "UPDATE, DELETE and INSERT name their tables" {

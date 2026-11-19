@@ -24,6 +24,9 @@ const unicode = @import("unicode.zig");
 pub const Severity = enum {
     @"error",
     warning,
+    /// A query plan drawn on its statement. Its primary labels are the costly steps. It has no
+    /// location line, since it is about the whole statement.
+    plan,
 
     fn name(self: Severity) []const u8 {
         return @tagName(self);
@@ -65,7 +68,14 @@ pub const Style = struct {
     fn primary(severity: Severity) []const u8 {
         return switch (severity) {
             .@"error" => "\x1b[1;31m",
-            .warning => "\x1b[1;33m",
+            .warning, .plan => "\x1b[1;33m",
+        };
+    }
+
+    fn header(severity: Severity) []const u8 {
+        return switch (severity) {
+            .plan => "\x1b[1;36m",
+            else => primary(severity),
         };
     }
 
@@ -80,7 +90,7 @@ pub const Style = struct {
 
 /// Writes the header, `error[1052]: message`, then the snippet.
 pub fn render(out: *Writer, source: []const u8, origin: []const u8, diagnostic: Diagnostic, style: Style) Writer.Error!void {
-    try style.begin(out, Style.primary(diagnostic.severity));
+    try style.begin(out, Style.header(diagnostic.severity));
     try out.writeAll(diagnostic.severity.name());
     if (diagnostic.code) |code| try out.print("[{s}]", .{code});
     try style.end(out);
@@ -117,7 +127,9 @@ pub fn renderSnippet(out: *Writer, source: []const u8, origin: []const u8, diagn
     const width = digits(max_line);
 
     // The location of the primary label, or of the first one.
-    if (labels.len > 0) {
+    if (labels.len > 0 and diagnostic.severity == .plan) {
+        try emptyGutter(out, width, style);
+    } else if (labels.len > 0) {
         var main = labels[0];
         for (labels) |label| {
             if (label.primary) {

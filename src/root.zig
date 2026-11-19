@@ -20,6 +20,7 @@ const Readline = @import("readline.zig");
 const replete = @import("replete");
 const SqlCompletion = @import("sql_completion.zig");
 const Syntax = @import("syntax.zig").Syntax;
+const SyntaxDisplay = @import("syntax.zig").Display;
 const SqlHighlight = @import("sql_highlight.zig");
 const Theme = @import("theme.zig");
 const ConfigFile = @import("config_file.zig");
@@ -636,6 +637,21 @@ fn renderTabResult(out: *std.Io.Writer, result: [*c]C.struct_st_mysql_res, rende
     try Mysql.render_result_footer(out, result, elapsed_ns, warnings);
 }
 
+/// How the REPL draws diagnostics: in colour when it may, and as wide as the terminal.
+fn diagnosticDisplay(repl: *const Repl) SyntaxDisplay {
+    return .{ .color = repl.use_color, .width = replete.terminal.columns() };
+}
+
+/// After the result of an EXPLAIN, draws its plan on the statement (see plan_labels.zig).
+fn annotateExplain(context: *ReplContext, stdout: *std.Io.Writer, sql: []const u8, result: Mysql.Result) !void {
+    if (!context.repl.syntax.enabled or !Syntax.mayBeExplain(sql)) return;
+    var arena: std.heap.ArenaAllocator = .init(context.db.allocator);
+    defer arena.deinit();
+    const copy = try Mysql.copyResult(arena.allocator(), result);
+    try context.repl.syntax.annotatePlan(stdout, sql, copy.columns, copy.rows, diagnosticDisplay(&context.repl));
+    try stdout.flush();
+}
+
 /// Runs one statement for the REPL. As in mysql.cc, a lost connection prints the error,
 /// reconnects, and runs the statement once more. Returns null after the error is printed.
 fn execReplStatement(context: *ReplContext, stdout: *std.Io.Writer, sql: []const u8) !?Mysql.ExecResult {
@@ -652,7 +668,7 @@ fn execReplStatement(context: *ReplContext, stdout: *std.Io.Writer, sql: []const
         try db.renderLastError(stdout);
         // The server has the last word, but the statement's parse tree can say where the error is,
         // and what else in the statement it relates to.
-        try context.repl.syntax.explainError(stdout, sql, db.lastErrno(), db.lastErrorMessage(), context.repl.names, context.repl.use_color);
+        try context.repl.syntax.explainError(stdout, sql, db.lastErrno(), db.lastErrorMessage(), context.repl.names, diagnosticDisplay(&context.repl));
         if (retried or !canReconnect(db, &context.repl)) {
             return null;
         }
@@ -700,6 +716,7 @@ fn executeQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.Io.W
                 defer if (!kept) Mysql.freeResult(result);
                 warnings = db.warningCount();
                 try renderResult(client, &context.repl, query.sql, result, format, render_options, stderr, elapsed_ns, warnings);
+                try annotateExplain(context, stdout, query.sql, result);
             },
             .ok => |ok| {
                 warnings = ok.warnings;
@@ -1596,6 +1613,8 @@ test {
         @import("sql/semantics.zig"),
         @import("diagnostic.zig"),
         @import("server_error.zig"),
+        @import("plan.zig"),
+        @import("plan_labels.zig"),
         @import("sql_completion.zig"),
         @import("sql_highlight.zig"),
         @import("syntax.zig"),

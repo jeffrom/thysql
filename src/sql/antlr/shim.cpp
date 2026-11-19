@@ -75,6 +75,22 @@ static_assert(static_cast<int>(MYSQL_TOKEN_COMMA_SYMBOL) == static_cast<int>(MyS
 static_assert(static_cast<int>(MYSQL_TOKEN_OPEN_PAR_SYMBOL) == static_cast<int>(MySQLLexer::OPEN_PAR_SYMBOL), "token type");
 static_assert(static_cast<int>(MYSQL_TOKEN_CLOSE_PAR_SYMBOL) == static_cast<int>(MySQLLexer::CLOSE_PAR_SYMBOL), "token type");
 
+static_assert(static_cast<int>(MYSQL_RULE_LIMIT_CLAUSE) == static_cast<int>(MySQLParser::RuleLimitClause), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_SIMPLE_LIMIT_CLAUSE) == static_cast<int>(MySQLParser::RuleSimpleLimitClause), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_HAVING_CLAUSE) == static_cast<int>(MySQLParser::RuleHavingClause), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_GROUP_BY_CLAUSE) == static_cast<int>(MySQLParser::RuleGroupByClause), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_ORDER_CLAUSE) == static_cast<int>(MySQLParser::RuleOrderClause), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_SELECT_OPTION) == static_cast<int>(MySQLParser::RuleSelectOption), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_WHERE_CLAUSE) == static_cast<int>(MySQLParser::RuleWhereClause), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_JOINED_TABLE) == static_cast<int>(MySQLParser::RuleJoinedTable), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_EXPLAIN_STATEMENT) == static_cast<int>(MySQLParser::RuleExplainStatement), "rule id");
+static_assert(static_cast<int>(MYSQL_RULE_EXPR) == static_cast<int>(MySQLParser::RuleExpr), "rule id");
+static_assert(static_cast<int>(MYSQL_TOKEN_ANALYZE_SYMBOL) == static_cast<int>(MySQLLexer::ANALYZE_SYMBOL), "token type");
+static_assert(static_cast<int>(MYSQL_TOKEN_AND_SYMBOL) == static_cast<int>(MySQLLexer::AND_SYMBOL), "token type");
+static_assert(static_cast<int>(MYSQL_TOKEN_DISTINCT_SYMBOL) == static_cast<int>(MySQLLexer::DISTINCT_SYMBOL), "token type");
+static_assert(static_cast<int>(MYSQL_TOKEN_ON_SYMBOL) == static_cast<int>(MySQLLexer::ON_SYMBOL), "token type");
+static_assert(static_cast<int>(MYSQL_TOKEN_LOGICAL_AND_OPERATOR) == static_cast<int>(MySQLLexer::LOGICAL_AND_OPERATOR), "token type");
+
 static_assert(static_cast<int>(MYSQL_MODE_ANSI_QUOTES) == static_cast<int>(MySQLRecognizerCommon::AnsiQuotes), "sql mode");
 static_assert(static_cast<int>(MYSQL_MODE_HIGH_NOT_PRECEDENCE) == static_cast<int>(MySQLRecognizerCommon::HighNotPrecedence), "sql mode");
 static_assert(static_cast<int>(MYSQL_MODE_PIPES_AS_CONCAT) == static_cast<int>(MySQLRecognizerCommon::PipesAsConcat), "sql mode");

@@ -659,7 +659,7 @@ gets no candidates. A keychain password is read without the fallback prompt.
 
 The interactive client parses SQL with the MySQL Workbench grammar, as ANTLR4 parser,
 for the version and `sql_mode` of the server. Both are read on connect and reconnect.
-The parser is used three ways:
+The parser is used in these ways:
 
 - **As you type.** When input has been idle for 200 ms, the statement under the cursor
   is checked. The first error is shown below the line, and its text is underlined in
@@ -696,11 +696,36 @@ The parser is used three ways:
 
   Similar names come from the names that completion loads, so they need auto-rehash
   or `rehash`.
+- **After an EXPLAIN.** The plan is drawn on the statement, under the server's
+  output: each table access labels the table it reads, a filter labels the
+  conditions it checks, and sorts, grouping and derived tables label their clauses.
+  With `EXPLAIN ANALYZE` the labels have actual rows, loops and times. A `^` marks
+  what to look at: an estimate 10× off or more, a large full scan that a filter
+  throws most of away (or that repeats for each row of another table), and a join on
+  values of different types. Hints suggest an index, or a histogram for an estimate
+  that is off.
+
+  ```
+  plan: EXPLAIN ANALYZE, 3.4 ms in all
+    |
+  1 | EXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'open' ORDER BY created_at
+    |                               ^^^^^^       ^^^^^^^^^^^^^^^ ------------------- sorts 2000 rows
+    |                               |            |
+    |                               |            keeps 2000 of 20k rows (est 20k, 10× off)
+    |                               table scan · 20k rows · 2.3 ms
+    |
+    = help: `orders` is read in full (20k rows) to filter on `status`; an index on `orders(status)` may help
+    = help: the estimate for `status = 'open'` is off; a histogram can correct it: `ANALYZE TABLE orders UPDATE HISTOGRAM ON status`
+  ```
+
+  The traditional table, `FORMAT=TREE`, `FORMAT=JSON` (both of MySQL's versions and
+  MariaDB's) and `EXPLAIN ANALYZE` are read; no other query is sent. A statement with
+  a line wider than the terminal is shown broken at its clauses, here and after errors.
 - **Completion.** Tab and the hint take the parser's candidates at the cursor, and the
   names come from the names that completion loads. When the parser gives nothing, the
   lexer's context is used.
 
-`--no-parser` turns all three off. Highlighting and completion then use the lexer alone.
+`--no-parser` turns all of these off. Highlighting and completion then use the lexer alone.
 The lexer follows `ANSI_QUOTES` and `NO_BACKSLASH_ESCAPES` in both cases.
 
 A MariaDB server is parsed as the nearest MySQL version: 8.0 from MariaDB 10.2, and 5.7
