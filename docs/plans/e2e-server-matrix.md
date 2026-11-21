@@ -62,6 +62,13 @@ Do not weaken precise assertions for the existing targets to accommodate a new o
 
 ## Phase 1: selectable targets with unchanged baseline behavior
 
+**Status: implemented.** `THYSQL_E2E_SERVERS` selects `mysql`, `mariadb`, or
+both; unset retains the original pair. Selection errors are reported before
+Docker is checked. Kept containers carry a fingerprint of the target image,
+password environment variable, startup flags, and TLS mount source; stale
+containers are removed and recreated. The cross-server switch class skips
+with a reason unless both baseline targets are selected.
+
 Replace the two hardcoded `_start_one` calls with target definitions for the
 existing MySQL and MariaDB images. Add `THYSQL_E2E_SERVERS=mysql,mariadb` selection;
 unset means the existing pair. Reject empty, unknown, or duplicate entries with
@@ -85,6 +92,25 @@ Acceptance:
 - Invalid selection fails before Docker resources are created.
 - Existing keep/reseed behavior works, and stale configuration is detected.
 - Interrupted or partially failed setup leaves no disposable resources behind.
+
+Validation run for phase 1:
+
+- `python3 -m py_compile tests/e2e/harness.py tests/e2e/run.py tests/e2e/test_switch_connection.py` — passed.
+- Direct `selected_targets` checks — default order, each single target, and empty, trailing-empty, duplicate, and unknown values — passed.
+- `THYSQL_E2E_SERVERS=unknown python3 tests/e2e/run.py /usr/bin/python3` — exited 2 with the selection error before Docker access.
+- `zig build e2e` — passed against MySQL 8.4 and MariaDB 11.4: 245 tests, 0 failures, 118.252 seconds.
+- `THYSQL_E2E_SERVERS=mysql python3 tests/e2e/run.py zig-out/bin/thysql` — passed: 234 tests, one expected switch-class skip, 64.783 seconds.
+- `THYSQL_E2E_SERVERS=mariadb python3 tests/e2e/run.py zig-out/bin/thysql` — passed: 234 tests, one expected switch-class skip, 63.647 seconds.
+- Two consecutive `THYSQL_E2E_KEEP=1 THYSQL_E2E_SERVERS=mysql python3 tests/e2e/run.py zig-out/bin/thysql -k test_fixture_values_round_trip` runs — each passed the focused test, confirming kept-container reuse and fixture reseeding. The temporary container was removed after validation.
+- `git diff --check` — passed.
+
+Parent review also fault-injected a stale fingerprint against a real kept
+MySQL container and verified that its container ID changed. A bootstrap failure
+after actual container startup removed its container and temporary TLS files.
+Selection semantics and setup-failure cleanup passed independent mock checks.
+Readiness timeout and process interruption were not fault-injected. No `zig
+build test` was run because this phase changes only the Python E2E harness and
+documentation.
 
 ## Phase 2: capabilities and fixture boundaries
 

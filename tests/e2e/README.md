@@ -1,9 +1,9 @@
 # thysql end-to-end tests
 
 These tests run the built `thysql` binary against real servers: MySQL 8.4 and
-MariaDB 11.4, each in a Docker container. Each test case runs against both
-servers. The runner is Python 3 standard library only, so there is nothing to
-install.
+MariaDB 11.4, each in a Docker container. By default each test case runs
+against both servers. Set `THYSQL_E2E_SERVERS` to select one or both targets.
+The runner is Python 3 standard library only, so there is nothing to install.
 
 ## Running
 
@@ -13,9 +13,17 @@ Requirements: Docker (the daemon must be running), Python 3, and jq (the JSON te
 zig build e2e                 # builds, installs, then runs the whole suite
 zig build e2e -- -k select    # only tests whose names match "select"
 python3 tests/e2e/run.py ./zig-out/bin/thysql -v   # run the runner directly
+THYSQL_E2E_SERVERS=mysql zig build e2e             # select one target
+THYSQL_E2E_SERVERS=mariadb zig build e2e           # select the other target
 ```
 
-The runner starts both containers on random host ports bound to 127.0.0.1
+`THYSQL_E2E_SERVERS` accepts comma-separated target IDs: `mysql`, `mariadb`, or
+`mysql,mariadb`. Unset means both baseline targets. Empty, duplicate, and
+unknown entries fail before Docker is contacted. Tests that require both
+servers, including the connection-switch suite, report a unittest skip when
+only one is selected.
+
+The runner starts the selected containers on random host ports bound to 127.0.0.1
 (`-p 127.0.0.1::3306`), waits until each one answers queries, seeds fixtures,
 runs the suite, and removes the containers. Cleanup also happens when a test
 fails or you press Ctrl-C.
@@ -26,9 +34,11 @@ fails or you press Ctrl-C.
 THYSQL_E2E_KEEP=1 zig build e2e
 ```
 
-With `THYSQL_E2E_KEEP=1` the containers are named `thysql-e2e-<server>-keep`,
-are reused on the next run (started if stopped), and are not removed. Fixtures
-are re-seeded on each run. Remove them when you are done:
+With `THYSQL_E2E_KEEP=1` the containers are named `thysql-e2e-<target>-keep`,
+are reused on the next run (started if stopped), and are not removed. The
+harness checks their image, startup flags, and TLS mount configuration before
+reuse, removing and recreating stale containers. Fixtures are re-seeded on each
+run. Remove them when you are done:
 
 ```sh
 docker rm -f -v $(docker ps -aq --filter label=thysql-e2e=1)

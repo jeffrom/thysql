@@ -17,6 +17,8 @@ read or written.
 import contextlib
 import dataclasses
 import fcntl
+import hashlib
+import json
 import os
 import pty
 import re
@@ -54,6 +56,7 @@ KEYCHAIN_PASSWORD = "e2e-keychain-pw"
 
 # Where the TLS material is mounted inside each server container.
 TLS_MOUNT = "/etc/thysql-tls"
+CONFIG_LABEL = f"{LABEL}-config"
 # Kept containers reference their TLS directory by path, so with
 # THYSQL_E2E_KEEP=1 the directory is fixed and only generated when missing.
 TLS_KEEP_DIR = os.path.join(tempfile.gettempdir(), "thysql-e2e-tls-keep")
@@ -245,6 +248,43 @@ _TLS = None  # TlsMaterial for this run
 _TLS_DIRS = []  # temporary TLS directories created in this process, for cleanup
 
 
+@dataclasses.dataclass(frozen=True)
+class Target:
+    name: str
+    image: str
+    client: str
+    password_var: str
+
+
+TARGETS = {
+    "mysql": Target("mysql", "mysql:8.4", "mysql", "MYSQL_ROOT_PASSWORD"),
+    "mariadb": Target("mariadb", "mariadb:11.4", "mariadb", "MARIADB_ROOT_PASSWORD"),
+}
+
+
+def selected_targets(value=None):
+    """Return selected target definitions, validating before Docker is touched."""
+    if value is None:
+        value = os.environ.get("THYSQL_E2E_SERVERS")
+    if value is None:
+        names = list(TARGETS)
+    else:
+        names = value.split(",")
+        if not value or any(not name.strip() for name in names):
+            raise ValueError("THYSQL_E2E_SERVERS must be a comma-separated list of target IDs")
+        names = [name.strip() for name in names]
+
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate E2E server target(s): {', '.join(duplicates)}")
+
+    unknown = [name for name in names if name not in TARGETS]
+    if unknown:
+        raise ValueError(f"unknown E2E server target(s): {', '.join(unknown)}; choose from {', '.join(TARGETS)}")
+
+    return [TARGETS[name] for name in names]
+
+
 def keep_containers():
     return os.environ.get("THYSQL_E2E_KEEP") == "1"
 
@@ -348,6 +388,25 @@ def _mounts_tls(container, tls_dir):
     return False
 
 
+def _configuration_fingerprint(target, tls):
+    config = {
+        "image": target.image,
+        "password_var": target.password_var,
+        "startup_args": _tls_server_args(),
+        "tls_mount_source": os.path.realpath(tls.directory),
+        "tls_mount_target": TLS_MOUNT,
+    }
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+
+
+def _container_fingerprint(container):
+    result = docker(
+        ["inspect", "-f", f"{{{{index .Config.Labels \"{CONFIG_LABEL}\"}}}}", container],
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 def _tls_server_args():
     """mysqld/mariadbd options that point the server at the mounted certificates."""
     return [
@@ -376,26 +435,34 @@ def tls_material():
     return _TLS
 
 
-def _start_one(name, image, client, password_var, tls):
-    container = _container_name(name)
+def _start_one(target, tls):
+    container = _container_name(target.name)
+    fingerprint = _configuration_fingerprint(target, tls)
     exists = docker(["container", "inspect", container], check=False).returncode == 0
-    if exists and not _mounts_tls(container, tls.directory):
-        # A kept container from a run with other TLS material. Its mount cannot change.
+    if exists and (
+        _container_fingerprint(container) != fingerprint
+        or not _mounts_tls(container, tls.directory)
+    ):
+        # A kept container's image, flags, and mounts cannot be changed in place.
         docker(["rm", "-f", "-v", container])
         exists = False
     if exists:
         docker(["start", container])
     else:
-        run_args = ["run", "-d", "--name", container, "--label", f"{LABEL}=1"]
-        run_args += ["-e", password_var]  # value comes from _docker_env()
+        run_args = [
+            "run", "-d", "--name", container,
+            "--label", f"{LABEL}=1",
+            "--label", f"{CONFIG_LABEL}={fingerprint}",
+        ]
+        run_args += ["-e", target.password_var]  # value comes from _docker_env()
         run_args += ["-v", f"{tls.directory}:{TLS_MOUNT}:ro"]
-        run_args += ["-p", "127.0.0.1::3306", image, *_tls_server_args()]
-        docker(run_args, env={**_docker_env(), password_var: ROOT_PASSWORD})
+        run_args += ["-p", "127.0.0.1::3306", target.image, *_tls_server_args()]
+        docker(run_args, env={**_docker_env(), target.password_var: ROOT_PASSWORD})
     _STARTED.append(container)
     server = Server(
-        name=name,
-        image=image,
-        client=client,
+        name=target.name,
+        image=target.image,
+        client=target.client,
         container=container,
         port=_host_port(container),
     )
@@ -404,14 +471,13 @@ def _start_one(name, image, client, password_var, tls):
     return server
 
 
-def start_servers():
-    """Starts both servers and seeds fixtures. Safe to call once per run."""
+def start_servers(targets=None):
+    """Starts selected servers and seeds fixtures. Safe to call once per run."""
     global _TLS
+    targets = selected_targets() if targets is None else targets
     _TLS = _prepare_tls()
-    _SERVERS.extend([
-        _start_one("mysql", "mysql:8.4", "mysql", "MYSQL_ROOT_PASSWORD", _TLS),
-        _start_one("mariadb", "mariadb:11.4", "mariadb", "MARIADB_ROOT_PASSWORD", _TLS),
-    ])
+    for target in targets:
+        _SERVERS.append(_start_one(target, _TLS))
 
 
 def stop_servers():
@@ -429,11 +495,11 @@ def stop_servers():
 
 
 @contextlib.contextmanager
-def running_servers():
+def running_servers(targets=None):
     """Starts the containers and always removes them, even on failure or Ctrl-C."""
     try:
         check_docker()
-        start_servers()
+        start_servers(targets)
         yield servers()
     finally:
         stop_servers()

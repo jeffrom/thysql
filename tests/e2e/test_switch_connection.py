@@ -8,6 +8,7 @@ come from an auth command, so no MYSQL_PWD is needed. The command logs
 
 import os
 import re
+import unittest
 
 from harness import ROOT_PASSWORD, ROOT_USER, TEST_DB, E2ETestCase, password_env, run_thysql, servers
 
@@ -23,6 +24,15 @@ def table_connection_id(text):
 
 
 class SwitchConnectionTests(E2ETestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        available = {server.name for server in servers()}
+        required = {"mysql", "mariadb"}
+        if not required.issubset(available):
+            missing = ", ".join(sorted(required - available))
+            raise unittest.SkipTest(f"requires both mysql and mariadb targets; missing: {missing}")
+
     def setUp(self):
         super().setUp()
         by_name = {server.name: server for server in servers()}

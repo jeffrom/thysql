@@ -4,9 +4,9 @@
 Usage: python3 tests/e2e/run.py PATH/TO/thysql [unittest options]
        zig build e2e -- -k select        (the build step passes the binary path)
 
-Starts MySQL 8.4 and MariaDB 11.4 in Docker, runs every test_*.py in this
-directory against both servers, then removes the containers. Set
-THYSQL_E2E_KEEP=1 to keep and reuse the containers between runs.
+Starts the selected MySQL-compatible targets in Docker, runs every test_*.py
+in this directory, then removes the containers. Set THYSQL_E2E_SERVERS to a
+comma-separated list (default: mysql,mariadb) or THYSQL_E2E_KEEP=1 to reuse.
 """
 
 import os
@@ -30,12 +30,18 @@ def main(argv):
         sys.stderr.write(f"thysql binary not found or not executable: {binary}\n")
         return 2
 
+    try:
+        targets = harness.selected_targets()
+    except ValueError as err:
+        sys.stderr.write(f"invalid E2E server selection: {err}\n")
+        return 2
+
     # Turn SIGTERM into a normal exit so the containers are still removed.
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
 
     harness.BINARY = binary
     try:
-        with harness.running_servers():
+        with harness.running_servers(targets):
             program = unittest.main(
                 module=None,
                 exit=False,
