@@ -1,14 +1,16 @@
 # thysql end-to-end tests
 
 These tests run the built `thysql` binary against real servers: MySQL 8.4,
-MariaDB 11.4, and Percona Server 8.4.11-12, each in a Docker container. By
-default each test case runs against the original MySQL and MariaDB pair. Set
-`THYSQL_E2E_SERVERS` to select one or more targets.
+MariaDB 11.4, Percona Server 8.4.11-12, and an unsharded Vitess 25.0 test
+environment, each in Docker. By default each test case runs against the
+original MySQL and MariaDB pair. Set `THYSQL_E2E_SERVERS` to select targets.
 The runner is Python 3 standard library only, so there is nothing to install.
 
 ## Running
 
-Requirements: Docker (the daemon must be running), Python 3, and jq (the JSON tests use `jq -e`).
+Requirements: Docker (the daemon must be running), Python 3, OpenSSL, and jq
+(the JSON tests use `jq -e`). The first Vitess image build also needs network
+access to fetch the pinned source and Go dependencies.
 
 ```sh
 zig build e2e                 # builds, installs, then runs the whole suite
@@ -17,17 +19,18 @@ python3 tests/e2e/run.py ./zig-out/bin/thysql -v   # run the runner directly
 THYSQL_E2E_SERVERS=mysql zig build e2e             # MySQL 8.4 only
 THYSQL_E2E_SERVERS=mariadb zig build e2e           # MariaDB 11.4 only
 THYSQL_E2E_SERVERS=percona python3 tests/e2e/run.py ./zig-out/bin/thysql
+THYSQL_E2E_SERVERS=vitess python3 tests/e2e/run.py ./zig-out/bin/thysql
 ```
 
 `THYSQL_E2E_SERVERS` accepts comma-separated target IDs: `mysql`, `mariadb`,
-and `percona`; for example, `mysql,mariadb`. Unset means the original baseline
-pair (`mysql,mariadb`). Empty, duplicate, and unknown entries fail before
-Docker is contacted. Tests that require both
+`percona`, and `vitess`; for example, `mysql,mariadb`. Unset means the original
+baseline pair (`mysql,mariadb`). Empty, duplicate, and unknown entries fail
+before Docker is contacted. Tests that require both
 servers, including the connection-switch suite, report a unittest skip when
 only one is selected.
 
 The runner starts the selected containers on random host ports bound to 127.0.0.1
-(`-p 127.0.0.1::3306`), waits until each one answers queries, seeds fixtures,
+(for example, `-p 127.0.0.1::3306`), waits until each one answers queries, seeds fixtures,
 runs the suite, and removes the containers. Startup output identifies each
 target's configured image, observed `SELECT VERSION()` result, family, and
 capabilities. Cleanup also happens when a test fails or you press Ctrl-C.
@@ -124,6 +127,35 @@ profile, the `MYSQL_ROOT_PASSWORD` initialization variable, and the image's
 bundled `mysql` client. The tag provides both linux/amd64 and linux/arm64
 images; no emulation is needed on ARM64 Docker hosts. Client TLS uses the same
 server certificate flags as the MySQL target.
+
+Vitess runs the pinned `vitess/vttestserver` base image at digest
+`sha256:82e96c43027f338593ad09447cb4433228a8cd69ced3d8d5583a2fe79892a34d`.
+The image reports VTCombo `25.0.0-SNAPSHOT` at revision
+`93926dba3020bedc0817b18933b5132fa59d3f1d-dirty`. The adapter builds a custom
+VTCombo launcher from the matching source commit to register Vitess native
+static authentication, enable VTGate's TLS listener, and enable its KILL
+statement handling. The build is pinned to the same source revision and Go
+1.27.4 builder digest in `tests/e2e/vitess/Dockerfile`; target selection builds
+the local image through Docker’s build cache on every run, so launcher edits
+are picked up. Kept-container fingerprints include the built image ID and
+runtime configuration. To build it manually:
+
+```sh
+docker build --platform linux/amd64 \
+  -f tests/e2e/vitess/Dockerfile \
+  -t thysql-vitess-e2e:25.0.0-93926dba-e2 \
+  tests/e2e/vitess
+```
+
+The vttestserver starts a single unsharded `thysql_test` keyspace and publishes
+VTGate's MySQL listener to localhost. Fixture data and static test credentials
+are prepared by the adapter; application tests connect only through VTGate.
+On ARM64 Docker hosts, this pinned image runs as linux/amd64 under Docker's
+explicit platform emulation; its Go builder cross-compiles from the host
+architecture. TLS assertions use thysql’s negotiated client cipher from
+`status`, which verifies the client-to-VTGate connection. Phase 4’s exact
+coverage and skips are recorded in
+[`docs/plans/e2e-server-matrix.md`](../../docs/plans/e2e-server-matrix.md).
 
 The e2e audit covers multi-result statements, column metadata, login failures
 and password users, TLS cipher inspection, connection killing/reconnect, and

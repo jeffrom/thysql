@@ -60,6 +60,7 @@ CONFIG_LABEL = f"{LABEL}-config"
 # Kept containers reference their TLS directory by path, so with
 # THYSQL_E2E_KEEP=1 the directory is fixed and only generated when missing.
 TLS_KEEP_DIR = os.path.join(tempfile.gettempdir(), "thysql-e2e-tls-keep")
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 
 _ANSI = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07)")
 
@@ -263,6 +264,9 @@ class Server:
     capabilities: frozenset
     timeout_profile: "TimeoutProfile"
     version: str
+    adapter: str = "mysql"
+    internal_port: int = 3306
+    status_user: str = ROOT_USER
 
     def connect_args(self, user=ROOT_USER):
         """Args that point thysql at this server, without a password."""
@@ -300,6 +304,7 @@ class Target:
     password_var: str
     capabilities: frozenset
     timeout_profile: TimeoutProfile
+    adapter: str = "mysql"
 
 
 BASE_CAPABILITIES = frozenset({
@@ -307,6 +312,11 @@ BASE_CAPABILITIES = frozenset({
     "stored_routines",
     "connection_kill",
     "tls_inspection",
+    "tls_verification",
+    "sql_warnings",
+    "mysql_error_text",
+    "latin1_wire_bytes",
+    "status_runtime_fields",
     "extended_type_metadata",
     "typed_output",
     "geometry",
@@ -333,6 +343,15 @@ TARGETS = {
     "percona": Target(
         "percona", "mysql", "percona/percona-server:8.4.11-12", "mysql",
         "MYSQL_ROOT_PASSWORD", BASE_CAPABILITIES, MYSQL_TIMEOUT,
+    ),
+    "vitess": Target(
+        "vitess", "vitess",
+        "thysql-vitess-e2e:25.0.0-93926dba-e2",
+        "mysql", "", frozenset({
+            "multi_statements", "tls_verification", "json", "typed_output",
+            "extended_type_metadata", "geometry", "zerofill",
+        }),
+        MYSQL_TIMEOUT, "vitess",
     ),
 }
 
@@ -408,8 +427,8 @@ def _container_name(label):
     return f"{LABEL}-{label}-{suffix}"
 
 
-def _host_port(container):
-    out = docker(["port", container, "3306/tcp"]).stdout.strip().splitlines()
+def _host_port(container, internal_port=3306):
+    out = docker(["port", container, f"{internal_port}/tcp"]).stdout.strip().splitlines()
     if not out:
         raise RuntimeError(f"no published port for {container}")
     return int(out[0].rsplit(":", 1)[1])
@@ -445,7 +464,7 @@ def run_server_sql(server, sql, args=(), *, check=True):
         [
             "exec", "-i", "-e", "MYSQL_PWD",
             server.container,
-            server.client, "-h127.0.0.1", "-uroot", *args,
+            server.client, "-h127.0.0.1", f"-P{server.internal_port}", "-uroot", *args,
         ],
         check=check,
         stdin=sql,
@@ -486,13 +505,15 @@ def _mounts_tls(container, tls_dir):
     return False
 
 
-def _configuration_fingerprint(target, tls):
+def _configuration_fingerprint(target, tls, *, runtime_config=None):
     config = {
         "image": target.image,
+        "adapter": target.adapter,
         "password_var": target.password_var,
         "startup_args": _tls_server_args(),
         "tls_mount_source": os.path.realpath(tls.directory),
         "tls_mount_target": TLS_MOUNT,
+        "runtime_config": runtime_config,
     }
     return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
 
@@ -534,52 +555,227 @@ def tls_material():
 
 
 def _start_one(target, tls):
-    container = _container_name(target.name)
-    fingerprint = _configuration_fingerprint(target, tls)
-    exists = docker(["container", "inspect", container], check=False).returncode == 0
-    if exists and (
-        _container_fingerprint(container) != fingerprint
-        or not _mounts_tls(container, tls.directory)
-    ):
-        # A kept container's image, flags, and mounts cannot be changed in place.
-        docker(["rm", "-f", "-v", container])
-        exists = False
-    if exists:
-        docker(["start", container])
-    else:
-        run_args = [
-            "run", "-d", "--name", container,
-            "--label", f"{LABEL}=1",
-            "--label", f"{CONFIG_LABEL}={fingerprint}",
-        ]
-        run_args += ["-e", target.password_var]  # value comes from _docker_env()
-        run_args += ["-v", f"{tls.directory}:{TLS_MOUNT}:ro"]
-        run_args += ["-p", "127.0.0.1::3306", target.image, *_tls_server_args()]
-        docker(run_args, env={**_docker_env(), target.password_var: ROOT_PASSWORD})
-    _STARTED.append(container)
-    server = Server(
-        name=target.name,
-        image=target.image,
-        client=target.client,
-        container=container,
-        port=_host_port(container),
-        family=target.family,
-        capabilities=target.capabilities,
-        timeout_profile=target.timeout_profile,
-        version="",
+    if target.adapter == "vitess":
+        return VITESS_ADAPTER.start(target, tls)
+
+    return MYSQL_ADAPTER.start(target, tls)
+
+
+class DockerAdapter:
+    """Provisioning boundary for one Docker-backed MySQL-protocol target."""
+
+    def start(self, target, tls):
+        raise NotImplementedError
+
+    def wait_ready(self, server):
+        _wait_ready(server)
+
+    def seed(self, server):
+        _seed_fixtures(server)
+
+    def provision_identities(self, server):
+        _provision_identities(server)
+
+
+class MySQLContainerAdapter(DockerAdapter):
+    def start(self, target, tls):
+        return self._start(target, tls)
+
+    def _start(self, target, tls):
+        container = _container_name(target.name)
+        fingerprint = _configuration_fingerprint(target, tls)
+        exists = docker(["container", "inspect", container], check=False).returncode == 0
+        if exists and (
+            _container_fingerprint(container) != fingerprint
+            or not _mounts_tls(container, tls.directory)
+        ):
+            # A kept container's image, flags, and mounts cannot be changed in place.
+            docker(["rm", "-f", "-v", container])
+            exists = False
+        _STARTED.append(container)
+        if exists:
+            docker(["start", container])
+        else:
+            run_args = [
+                "run", "-d", "--name", container,
+                "--label", f"{LABEL}=1",
+                "--label", f"{CONFIG_LABEL}={fingerprint}",
+            ]
+            run_args += ["-e", target.password_var]  # value comes from _docker_env()
+            run_args += ["-v", f"{tls.directory}:{TLS_MOUNT}:ro"]
+            run_args += ["-p", "127.0.0.1::3306", target.image, *_tls_server_args()]
+            docker(run_args, env={**_docker_env(), target.password_var: ROOT_PASSWORD})
+        server = Server(
+            name=target.name,
+            image=target.image,
+            client=target.client,
+            container=container,
+            port=_host_port(container),
+            family=target.family,
+            capabilities=target.capabilities,
+            timeout_profile=target.timeout_profile,
+            version="",
+            adapter=target.adapter,
+            status_user="vt_dba" if target.adapter == "vitess" else ROOT_USER,
+        )
+        self.wait_ready(server)
+        server.version = run_server_sql(
+            server, "SELECT VERSION();", args=["--batch", "--skip-column-names"]
+        ).stdout.strip()
+        self.report(server)
+        self.seed(server)
+        self.provision_identities(server)
+        return server
+
+    @staticmethod
+    def report(server):
+        print(
+            f"E2E target {server.name}: image={server.image} version={server.version} "
+            f"family={server.family} capabilities={','.join(sorted(server.capabilities))}",
+            flush=True,
+        )
+
+
+class VitessAdapter(DockerAdapter):
+    """Owns the vttestserver process and all VTGate-facing bootstrap work."""
+
+    port = 33577
+    keyspace = TEST_DB
+
+    def ensure_image(self, target):
+        # Docker's build cache is cheap and notices launcher/Dockerfile edits.
+        docker([
+            "build", "--platform", "linux/amd64", "-f",
+            os.path.join(ROOT, "tests/e2e/vitess/Dockerfile"),
+            "-t", target.image, os.path.join(ROOT, "tests/e2e/vitess"),
+        ])
+        return docker(["image", "inspect", "-f", "{{.Id}}", target.image]).stdout.strip()
+
+    def start(self, target, tls):
+        image_id = self.ensure_image(target)
+        auth_path = os.path.join(tls.directory, "vitess-users.json")
+        with open(auth_path, "w") as handle:
+            json.dump(self.users(), handle)
+        os.chmod(auth_path, 0o644)
+
+        container = _container_name(target.name)
+        fingerprint = _configuration_fingerprint(target, tls, runtime_config={
+            "image_id": image_id,
+            "keyspace": self.keyspace,
+            "port": self.port,
+            "users": self.users(),
+        })
+        exists = docker(["container", "inspect", container], check=False).returncode == 0
+        if exists and (
+            _container_fingerprint(container) != fingerprint
+            or not _mounts_tls(container, tls.directory)
+        ):
+            docker(["rm", "-f", "-v", container])
+            exists = False
+
+        _STARTED.append(container)
+        if exists:
+            docker(["start", container])
+        else:
+            run_args = [
+                "run", "-d", "--platform", "linux/amd64", "--name", container,
+                "--label", f"{LABEL}=1",
+                "--label", f"{CONFIG_LABEL}={fingerprint}",
+                "-e", "PORT=33574",
+                "-e", f"KEYSPACES={self.keyspace}",
+                "-e", "NUM_SHARDS=1",
+                "-e", "MYSQL_BIND_HOST=0.0.0.0",
+                "-e", "VTCOMBO_BIND_HOST=0.0.0.0",
+                "-e", "THYSQL_VITESS_AUTH_FILE=/etc/thysql-tls/vitess-users.json",
+                "-v", f"{tls.directory}:{TLS_MOUNT}:ro",
+                "-p", f"127.0.0.1::{self.port}",
+                target.image,
+            ]
+            docker(run_args)
+
+        server = Server(
+            name=target.name,
+            image=target.image,
+            client=target.client,
+            container=container,
+            port=_host_port(container, self.port),
+            family=target.family,
+            capabilities=target.capabilities,
+            timeout_profile=target.timeout_profile,
+            version="",
+            adapter=target.adapter,
+            internal_port=self.port,
+            status_user="vt_dba",
+        )
+        self.wait_ready(server)
+        server.version = run_server_sql(
+            server, "SELECT VERSION();", args=["--batch", "--skip-column-names"]
+        ).stdout.strip()
+        MySQLContainerAdapter.report(server)
+        self.seed(server)
+        return server
+
+    @staticmethod
+    def users():
+        return {
+            ROOT_USER: [{"Password": ROOT_PASSWORD, "UserData": ROOT_USER}],
+            PW_USER: [{"Password": PW_PASSWORD, "UserData": PW_USER}],
+            NOPW_USER: [{"Password": "", "UserData": NOPW_USER}],
+            AUTH_USER: [{"Password": AUTH_PASSWORD, "UserData": AUTH_USER}],
+        }
+
+    def wait_ready(self, server):
+        deadline = time.monotonic() + READY_TIMEOUT
+        last_error = ""
+        while time.monotonic() < deadline:
+            result = run_server_sql(
+                server,
+                "SELECT 1;",
+                args=["--batch", "--skip-column-names", f"--database={self.keyspace}"],
+                check=False,
+            )
+            if result.returncode == 0:
+                return
+            last_error = result.stderr.strip()
+            time.sleep(1)
+
+        logs = docker(["logs", "--tail", "50", server.container], check=False)
+        raise RuntimeError(
+            f"{server.name} VTGate did not become ready for keyspace {self.keyspace}: {last_error}\n"
+            f"last server log lines:\n{(logs.stdout + logs.stderr).strip()}"
+        )
+
+    def seed(self, server):
+        # The keyspace already exists. Keep the common table fixtures and
+        # select that keyspace, but database lifecycle belongs to vttestserver.
+        tables = ("people", "blobs", "latin_text", "portable_values", "typed", "padded_values")
+        reset = "\n".join(f"DROP TABLE IF EXISTS {table};" for table in tables)
+        _run_vitess_sql(server, reset)
+
+        sql = COMMON_FIXTURE_SQL.replace(f"DROP DATABASE IF EXISTS {TEST_DB};\n", "")
+        sql = sql.replace(f"CREATE DATABASE {TEST_DB} CHARACTER SET utf8mb4;\n", "")
+        _run_vitess_sql(server, sql)
+
+        for required, fixture_sql in FIXTURE_GROUPS.values():
+            if required.issubset(server.capabilities):
+                _run_vitess_sql(server, fixture_sql)
+
+
+def _run_vitess_sql(server, sql, *, check=True):
+    return docker(
+        [
+            "exec", "-i", "-e", "MYSQL_PWD", server.container,
+            server.client, "-h127.0.0.1", f"-P{server.internal_port}", "-uroot",
+            f"--database={TEST_DB}",
+        ],
+        check=check,
+        stdin=sql,
+        env=_docker_env(),
     )
-    _wait_ready(server)
-    server.version = run_server_sql(
-        server, "SELECT VERSION();", args=["--batch", "--skip-column-names"]
-    ).stdout.strip()
-    print(
-        f"E2E target {server.name}: image={server.image} version={server.version} "
-        f"family={server.family} capabilities={','.join(sorted(server.capabilities))}",
-        flush=True,
-    )
-    _seed_fixtures(server)
-    _provision_identities(server)
-    return server
+
+
+MYSQL_ADAPTER = MySQLContainerAdapter()
+VITESS_ADAPTER = VitessAdapter()
 
 
 def start_servers(targets=None):
@@ -596,6 +792,7 @@ def stop_servers():
     _SERVERS.clear()
     _TLS = None
     if keep_containers():
+        _STARTED.clear()
         return
     for container in _STARTED:
         docker(["rm", "-f", "-v", container], check=False)
@@ -778,6 +975,17 @@ class E2ETestCase(unittest.TestCase):
         """Skip the current target subtest with a visible capability reason."""
         if capability not in server.capabilities:
             self.skipTest(f"{server.name} does not support capability '{capability}'")
+
+    def assert_missing_table_error(self, server, result, line):
+        prefix = rf"(?m)^ERROR 1146 \(42S02\) at line {line}: "
+        self.assertRegex(result.stderr, prefix)
+        self.assertIn("missing_table", result.stderr)
+        self.assertIn("doesn't exist", result.stderr)
+        if "mysql_error_text" in server.capabilities:
+            self.assertRegex(
+                result.stderr,
+                prefix + r"Table '[^']*missing_table' doesn't exist$",
+            )
 
     def interactive(self, args, **kwargs):
         session = Interactive(args, home=self.home, **kwargs)

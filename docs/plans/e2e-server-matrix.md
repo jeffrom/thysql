@@ -108,7 +108,9 @@ Parent review also fault-injected a stale fingerprint against a real kept
 MySQL container and verified that its container ID changed. A bootstrap failure
 after actual container startup removed its container and temporary TLS files.
 Selection semantics and setup-failure cleanup passed independent mock checks.
-Readiness timeout and process interruption were not fault-injected. No `zig
+A later parent review sent SIGTERM and SIGINT during registered container
+startup; both removed the actual container and temporary TLS directory.
+Readiness timeout was not fault-injected. No `zig
 build test` was run because this phase changes only the Python E2E harness and
 documentation.
 
@@ -226,6 +228,91 @@ Acceptance:
 - The README contains tested local commands for the new targets.
 
 ## Phase 4: unsharded Vitess
+
+**Status: implemented.** The opt-in `vitess` target runs one unsharded
+`thysql_test` keyspace through VTGate. It uses the official vttestserver image
+as its pinned base plus a small custom VTCombo launcher. The launcher is built
+from Vitess commit `93926dba3020bedc0817b18933b5132fa59d3f1d`, which matches the
+image's reported `25.0.0-SNAPSHOT` revision, and registers Vitess's native
+static authentication provider before running the upstream VTCombo CLI. The
+image overrides the VTCombo binary that vttestserver starts, changes its
+forced `mysql-auth-server-impl=none` to `static`, enables the documented KILL
+statement option, and configures VTGate's TLS certificate and key. No auth
+proxy or backend SQL route is used for client assertions.
+
+The base is pinned as
+`vitess/vttestserver@sha256:82e96c43027f338593ad09447cb4433228a8cd69ced3d8d5583a2fe79892a34d`;
+it reports `vtcombo 25.0.0-SNAPSHOT`, Git revision
+`93926dba3020bedc0817b18933b5132fa59d3f1d-dirty`, built with Go 1.27.4 for
+linux/amd64. The launcher build pins
+`golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea`.
+The builder runs on the host architecture and cross-compiles the launcher.
+On ARM64 Docker hosts the runtime uses explicit linux/amd64 emulation.
+The image is built automatically when `vitess` is selected, or
+manually with the README command.
+
+The adapter creates a static credential file for the throwaway root, password,
+no-password, and auth-command users; readiness and fixture seeding query the
+published VTGate MySQL listener at `PORT + 3` in the `thysql_test` keyspace.
+The common and optional typed/geometry/`ZEROFILL` fixtures load through VTGate.
+Client TLS is between thysql and VTGate; thysql's status command reports the
+negotiated client cipher, strict verification with the generated CA succeeds,
+and the wrong CA fails. The target has a separate `vitess` family and declares
+only capabilities verified against this setup.
+
+The final full Vitess-selected run executed 236 tests with 0 failures and 21
+visible skips (57.923 seconds). Typed CSV/JSON output, geometry metadata, and
+`ZEROFILL` were enabled after their fixtures and four focused output tests
+passed through VTGate. Correct and incorrect password tests, query/batch/
+interactive paths, completion, multi-statement scripts, and CA verification
+passed. The skips are limited to:
+
+- `connection_kill` (5 cases): with `--allow-kill-statement`, `KILL
+  CONNECTION_ID()` returned `ERROR 1094 (HY000): Unknown thread id`; the VTGate
+  client ID and the kill target are not interchangeable in this configuration.
+- `query_timeout` (2 cases): these assert a timeout interrupting a streamed
+  result; Vitess documents that its query timeout mechanisms do not affect
+  streaming queries.
+- `stored_routines` (4 cases): Vitess does not support `CREATE PROCEDURE`
+  through VTGate; delimiter-only coverage still runs.
+- `sql_warnings` (4 cases): `CAST('x' AS SIGNED)` produced no warning through
+  VTGate, so server warning output cannot satisfy these warning assertions.
+- `status_runtime_fields` (2 cases): VTGate's client status output omits the
+  uptime and thread-count fields asserted by these checks.
+- `latin1_wire_bytes` (2 cases): VTGate returns the Latin1 fixture as UTF-8,
+  so byte-preservation assertions specific to direct MySQL are not applicable.
+- One MariaDB-only JSON behavior case and one cross-server switch class that
+  requires the baseline pair.
+
+Validation:
+
+- `docker build --platform linux/amd64 -f tests/e2e/vitess/Dockerfile -t
+  thysql-vitess-e2e:25.0.0-93926dba-e2 tests/e2e/vitess` — passed.
+- `THYSQL_E2E_SERVERS=vitess python3 tests/e2e/run.py zig-out/bin/thysql -k
+  every_type -k zerofill` — passed: 4 tests.
+- `THYSQL_E2E_SERVERS=vitess python3 tests/e2e/run.py zig-out/bin/thysql` —
+  passed: 236 tests, 0 failures, 21 expected skips, 57.923 seconds. TLS cipher
+  checks use thysql's client status output; all TLS tests ran and passed.
+- `THYSQL_E2E_SERVERS=mysql,mariadb python3 tests/e2e/run.py
+  zig-out/bin/thysql` — passed: 247 tests, 0 failures, 1 expected MariaDB-only
+  skip, 115.846 seconds.
+- Python compilation, `gofmt`, target registry/default tuple checks, and
+  `git diff --check` passed.
+
+Parent review independently passed the final Vitess run (236 tests, 21 skips,
+58.478 seconds), all 16 TLS/socket-related tests on Vitess, and two consecutive
+kept-container runs with portable output tests. Both runs reused the same
+container ID and reseeded successfully. Image builds use Docker caching on
+every selection so launcher edits take effect; kept-container fingerprints
+include the built image ID, keyspace, listener port, and fixture identities.
+Owned tables are reset before reseeding. Containers are registered for cleanup
+before Docker startup, covering interruption during the create/start call.
+The final 11 TLS tests also passed against both baseline servers.
+
+The pinned image is a Vitess 25.0 development snapshot despite the older
+vttestserver documentation path used during initial research; the actual image
+metadata was checked and this plan records the runtime version. The local ARM64
+run used explicit amd64 emulation. The exact baseline pair remains the default.
 
 Use the documented `vttestserver` test environment, pinned to a verified image
 or reproducible build. Start with one unsharded keyspace. Expose **VTGate's

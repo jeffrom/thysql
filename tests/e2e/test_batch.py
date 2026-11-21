@@ -70,10 +70,7 @@ class BatchTests(E2ETestCase):
                 self.assertEqual(result.returncode, 1)
                 # Batch errors go to stderr, with the statement's line number.
                 self.assertNotIn("ERROR", result.stdout)
-                self.assertRegex(
-                    result.stderr,
-                    r"(?m)^ERROR 1146 \(42S02\) at line 1: Table '[^']*missing_table' doesn't exist$",
-                )
+                self.assert_missing_table_error(server, result, 1)
 
     def test_use_database_then_select_database(self):
         for server in self.each_server():

@@ -158,6 +158,7 @@ class JsonOutputTests(E2ETestCase):
         # latin1 é is the single byte 0xE9, which is not valid UTF-8 on its own.
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "latin1_wire_bytes")
                 result = self.thysql(
                     server,
                     ["--json", "-e", "set names latin1; select s from latin_text"],

@@ -68,13 +68,14 @@ class ClientCommandTests(E2ETestCase):
                     text = self.run_line(session, server, word)
                     self.assertRegex(text, r"Connection id:\s+\d+")
                     self.assertRegex(text, rf"Current database:\s+{TEST_DB}\b")
-                    self.assertRegex(text, rf"Current user:\s+{ROOT_USER}@")
+                    self.assertRegex(text, rf"Current user:\s+{server.status_user}@")
                     self.assertRegex(text, r"SSL:\s+(Not in use|Cipher in use is )")
                     self.assertRegex(text, r"Server version:\s+\S+")
                     self.assertRegex(text, r"Protocol version:\s+10\b")
                     self.assertRegex(text, r"Connection:\s+127\.0\.0\.1 via TCP/IP")
                     self.assertRegex(text, r"Server characterset:\s+\S+")
                     self.assertRegex(text, rf"TCP port:\s+{server.port}\b")
+                    self.require_capability(server, "status_runtime_fields")
                     self.assertRegex(text, r"Uptime:\s+.*sec")
                     self.assertRegex(text, r"Threads: \d+")
                     self.assertRegex(text, r"Current pager:\s+stdout")
@@ -194,6 +195,7 @@ class ClientCommandTests(E2ETestCase):
         for server in self.each_server():
             for word in ["warnings", "\\W"]:
                 with self.subTest(server=server.name, command=word):
+                    self.require_capability(server, "sql_warnings")
                     session = self.start(server)
                     text = self.run_line(session, server, word)
                     self.assertIn("Show warnings enabled.", text)
@@ -211,6 +213,7 @@ class ClientCommandTests(E2ETestCase):
     def test_show_warnings_flag_is_on_from_the_start(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "sql_warnings")
                 session = self.start(server, extra=["--show-warnings"])
                 text = self.run_line(session, server, "select cast('x' as signed);")
                 self.assertRegex(text, r"Warning \(Code \d+\): ")
@@ -245,6 +248,7 @@ class BatchClientCommandTests(E2ETestCase):
         for server in self.each_server():
             with self.subTest(server=server.name):
                 result = self.run_batch(server, "select cast('x' as signed);\n", extra=["--show-warnings"])
+                self.require_capability(server, "sql_warnings")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertRegex(result.stdout, r"(?m)^Warning \(Code \d+\): ")
 

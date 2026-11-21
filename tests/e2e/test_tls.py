@@ -1,29 +1,26 @@
-"""TLS and socket options, against MySQL 8.4 and MariaDB 11.4.
+"""TLS and socket options against each selected MySQL protocol endpoint.
 
-The servers present a certificate signed by a throwaway CA (see
-`harness.tls_material`). `Ssl_cipher` reports the cipher of the current
-connection, so an empty value means the connection is plaintext.
-
-Socket tests cover error handling only. A host-side client cannot reach a
-server through a Unix socket in a bind-mounted directory on Docker Desktop
-for macOS: the socket file appears on the host but refuses connections.
+Client status reports libmariadb's negotiated cipher for the actual connection.
+This also works with gateways whose SQL status describes a backend connection.
+Socket tests cover error handling only; Docker Desktop bind mounts cannot
+bridge a live Unix socket from a container to a macOS client.
 """
 
 import os
 
 from harness import ROOT_USER, TEST_DB, E2ETestCase, password_env, run_thysql, tls_material
 
-SSL_CIPHER = "SHOW STATUS LIKE 'Ssl_cipher'"
-CIPHER_VALUE = r"Ssl_cipher\t(\S+)"
-PLAINTEXT = r"Ssl_cipher\t\n"
+TLS_STATUS = "status;\n"
+CIPHER_VALUE = r"SSL:\s+Cipher in use is (\S+)"
+PLAINTEXT = r"SSL:\s+Not in use"
 
 
 class TlsTests(E2ETestCase):
-    def tls_run(self, server, extra, query=SSL_CIPHER):
+    def tls_run(self, server, extra):
         """Runs thysql against `server` with TLS options `extra`, as root."""
-        self.require_capability(server, "tls_inspection")
-        args = server.connect_args(ROOT_USER) + extra + ["-e", query]
-        return run_thysql(args, env=password_env(ROOT_USER))
+        self.require_capability(server, "tls_verification")
+        args = server.connect_args(ROOT_USER) + extra
+        return run_thysql(args, stdin=TLS_STATUS, env=password_env(ROOT_USER))
 
     def test_default_connection_uses_tls_when_offered(self):
         for server in self.each_server():
@@ -122,7 +119,7 @@ class TlsTests(E2ETestCase):
                     "--ssl-cipher=ECDHE-RSA-AES128-GCM-SHA256",
                 ])
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertRegex(result.stdout, r"Ssl_cipher\tECDHE-RSA-AES128-GCM-SHA256\n")
+                self.assertRegex(result.stdout, r"SSL:\s+Cipher in use is ECDHE-RSA-AES128-GCM-SHA256(?:,|\s|$)")
 
 
 class SocketTests(E2ETestCase):

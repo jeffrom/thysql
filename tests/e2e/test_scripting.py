@@ -164,10 +164,7 @@ class ScriptingTests(E2ETestCase):
                 result = self.thysql(server, [], stdin=script)
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(result.stdout, "ok\n1\n")
-                self.assertRegex(
-                    result.stderr,
-                    r"(?m)^ERROR 1146 \(42S02\) at line 3: Table '[^']*missing_table' doesn't exist$",
-                )
+                self.assert_missing_table_error(server, result, 3)
 
     def test_multiline_statement_reports_its_first_line(self):
         script = "select 1;\nselect\n  *\nfrom missing_table;\n"
@@ -183,10 +180,7 @@ class ScriptingTests(E2ETestCase):
                 result = self.thysql(server, ["-e", "select * from missing_table"])
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(result.stdout, "")
-                self.assertRegex(
-                    result.stderr,
-                    r"(?m)^ERROR 1146 \(42S02\) at line 1: Table '[^']*missing_table' doesn't exist$",
-                )
+                self.assert_missing_table_error(server, result, 1)
 
     def test_without_force_the_first_error_stops_the_run(self):
         script = "select * from missing_table;\nselect 2 as two;\n"
