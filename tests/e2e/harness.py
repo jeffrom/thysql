@@ -2,8 +2,8 @@
 
 Python 3 standard library only. The module holds three things:
 
-- Docker lifecycle: start a MySQL 8.4 and a MariaDB 11.4 container on random
-  host ports, seed fixtures, and remove the containers afterwards. Each server
+- Docker lifecycle: start selected MySQL-compatible containers on random host
+  ports, seed fixtures, and remove the containers afterwards. Each server
   also gets throwaway TLS certificates (see `tls_material()`).
 - Non-interactive runs: run the thysql binary with args, stdin, and env, and
   get back stdout, stderr, and the exit code.
@@ -262,6 +262,7 @@ class Server:
     family: str
     capabilities: frozenset
     timeout_profile: "TimeoutProfile"
+    version: str
 
     def connect_args(self, user=ROOT_USER):
         """Args that point thysql at this server, without a password."""
@@ -329,7 +330,13 @@ TARGETS = {
         "mariadb", "mariadb", "mariadb:11.4", "mariadb", "MARIADB_ROOT_PASSWORD",
         MARIADB_CAPABILITIES, MARIADB_TIMEOUT,
     ),
+    "percona": Target(
+        "percona", "mysql", "percona/percona-server:8.4.11-12", "mysql",
+        "MYSQL_ROOT_PASSWORD", BASE_CAPABILITIES, MYSQL_TIMEOUT,
+    ),
 }
+
+DEFAULT_TARGETS = ("mysql", "mariadb")
 
 
 def selected_targets(value=None):
@@ -337,7 +344,7 @@ def selected_targets(value=None):
     if value is None:
         value = os.environ.get("THYSQL_E2E_SERVERS")
     if value is None:
-        names = list(TARGETS)
+        names = list(DEFAULT_TARGETS)
     else:
         names = value.split(",")
         if not value or any(not name.strip() for name in names):
@@ -559,8 +566,17 @@ def _start_one(target, tls):
         family=target.family,
         capabilities=target.capabilities,
         timeout_profile=target.timeout_profile,
+        version="",
     )
     _wait_ready(server)
+    server.version = run_server_sql(
+        server, "SELECT VERSION();", args=["--batch", "--skip-column-names"]
+    ).stdout.strip()
+    print(
+        f"E2E target {server.name}: image={server.image} version={server.version} "
+        f"family={server.family} capabilities={','.join(sorted(server.capabilities))}",
+        flush=True,
+    )
     _seed_fixtures(server)
     _provision_identities(server)
     return server

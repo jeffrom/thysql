@@ -1,8 +1,9 @@
 # thysql end-to-end tests
 
-These tests run the built `thysql` binary against real servers: MySQL 8.4 and
-MariaDB 11.4, each in a Docker container. By default each test case runs
-against both servers. Set `THYSQL_E2E_SERVERS` to select one or both targets.
+These tests run the built `thysql` binary against real servers: MySQL 8.4,
+MariaDB 11.4, and Percona Server 8.4.11-12, each in a Docker container. By
+default each test case runs against the original MySQL and MariaDB pair. Set
+`THYSQL_E2E_SERVERS` to select one or more targets.
 The runner is Python 3 standard library only, so there is nothing to install.
 
 ## Running
@@ -13,20 +14,23 @@ Requirements: Docker (the daemon must be running), Python 3, and jq (the JSON te
 zig build e2e                 # builds, installs, then runs the whole suite
 zig build e2e -- -k select    # only tests whose names match "select"
 python3 tests/e2e/run.py ./zig-out/bin/thysql -v   # run the runner directly
-THYSQL_E2E_SERVERS=mysql zig build e2e             # select one target
-THYSQL_E2E_SERVERS=mariadb zig build e2e           # select the other target
+THYSQL_E2E_SERVERS=mysql zig build e2e             # MySQL 8.4 only
+THYSQL_E2E_SERVERS=mariadb zig build e2e           # MariaDB 11.4 only
+THYSQL_E2E_SERVERS=percona python3 tests/e2e/run.py ./zig-out/bin/thysql
 ```
 
-`THYSQL_E2E_SERVERS` accepts comma-separated target IDs: `mysql`, `mariadb`, or
-`mysql,mariadb`. Unset means both baseline targets. Empty, duplicate, and
-unknown entries fail before Docker is contacted. Tests that require both
+`THYSQL_E2E_SERVERS` accepts comma-separated target IDs: `mysql`, `mariadb`,
+and `percona`; for example, `mysql,mariadb`. Unset means the original baseline
+pair (`mysql,mariadb`). Empty, duplicate, and unknown entries fail before
+Docker is contacted. Tests that require both
 servers, including the connection-switch suite, report a unittest skip when
 only one is selected.
 
 The runner starts the selected containers on random host ports bound to 127.0.0.1
 (`-p 127.0.0.1::3306`), waits until each one answers queries, seeds fixtures,
-runs the suite, and removes the containers. Cleanup also happens when a test
-fails or you press Ctrl-C.
+runs the suite, and removes the containers. Startup output identifies each
+target's configured image, observed `SELECT VERSION()` result, family, and
+capabilities. Cleanup also happens when a test fails or you press Ctrl-C.
 
 ### Keeping containers between runs
 
@@ -114,6 +118,12 @@ controls optional fixture groups and `E2ETestCase.require_capability` records an
 individual skip with the target ID and missing capability. The baseline targets
 currently declare `geometry`, `zerofill`, `extended_type_metadata`, and the
 other exercised protocol behaviors.
+
+Percona uses `percona/percona-server:8.4.11-12`, the MySQL-family timeout
+profile, the `MYSQL_ROOT_PASSWORD` initialization variable, and the image's
+bundled `mysql` client. The tag provides both linux/amd64 and linux/arm64
+images; no emulation is needed on ARM64 Docker hosts. Client TLS uses the same
+server certificate flags as the MySQL target.
 
 The e2e audit covers multi-result statements, column metadata, login failures
 and password users, TLS cipher inspection, connection killing/reconnect, and

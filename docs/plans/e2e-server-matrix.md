@@ -180,21 +180,49 @@ passed all 34 affected tests against both baseline servers after review fixes.
 
 ## Phase 3: Percona Server and additional versions
 
-Add a pinned Percona Server target using the MySQL-family provisioning path.
-Verify its bundled client, root-password environment variable, TLS flags,
-architecture support, and readiness behavior against the selected image.
-Use it to expose assumptions that incorrectly equate target ID with family.
+**Status: implemented.** The selectable `percona` target uses the MySQL-family
+provisioning and timeout profile, `MYSQL_ROOT_PASSWORD`, and the image's
+bundled `mysql` client. The pinned image is
+`percona/percona-server:8.4.11-12`. Startup reports the target, configured
+image, observed `SELECT VERSION()` result, family, and capabilities. The
+existing target definition keeps server family separate from target ID, so
+shared tests need no Percona-specific branches.
 
-Support adding a second version as another target definition without adding
-conditionals to generic test bodies. Select supported versions deliberately;
-do not expand to every historical release. Record the actual server version
-in run output, alongside the configured image reference.
+Image verification: `docker manifest inspect percona/percona-server:8.4.11-12`
+found linux/amd64 and linux/arm64/v8 manifests. The local Docker engine reports
+`linux/aarch64`; the image pull completed and the container ran natively. The
+official image quickstart documents the tag and states that ARM64 can use the
+same tag; the explicit `-arm64` form is also available. The official image
+configuration documents `MYSQL_ROOT_PASSWORD`. The image's `mysql` client
+successfully ran the TLS startup flags and readiness query.
+
+Validation run for phase 3:
+
+- `python3 -m py_compile tests/e2e/harness.py tests/e2e/run.py` — passed.
+- Direct target selection checks — passed: unset and `mysql,mariadb` retain
+  baseline order; `percona` resolves to the MySQL family.
+- `THYSQL_E2E_SERVERS=percona python3 tests/e2e/run.py zig-out/bin/thysql` —
+  passed against `percona/percona-server:8.4.11-12`, observed server version
+  `8.4.11-12`: 236 tests, 0 failures, 2 expected skips (MariaDB-only JSON text
+  behavior and the cross-server switch class, which requires both baseline
+  targets), 67.280 seconds. Both batch and interactive timeout tests, TLS,
+  stored routines, identity setup, and JSON/CSV output passed.
+- `git diff --check` — passed.
+
+Parent review added `DEFAULT_TARGETS = ("mysql", "mariadb")` and verified the
+exact default list, not just its first two entries. New registry entries remain
+opt-in. Explicit Percona selection and its MySQL timeout profile also passed
+independent checks.
+
+The baseline pair was not rerun because the change adds a selectable target
+and startup reporting; it does not alter baseline target definitions or
+shared test assertions. No application/build code changed.
 
 Acceptance:
 
 - Percona runs the applicable suite independently with no MariaDB timeout SQL.
-- Adding another MySQL-family version requires configuration and only justified
-  compatibility exceptions.
+- The MySQL-family target/profile split supports another pinned version as a
+  target definition without branching generic test bodies.
 - The README contains tested local commands for the new targets.
 
 ## Phase 4: unsharded Vitess
