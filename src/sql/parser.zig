@@ -388,6 +388,12 @@ test "valid statements parse without errors" {
     for (statements) |sql| try expectValid(sql);
 }
 
+test "quoted hex literals accept uppercase prefixes" {
+    try expectValid("SELECT X'6772617068'");
+    try expectValid("SELECT CONVERT(X'6772617068' USING utf8mb4)");
+    try expectValid("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = CONVERT(X'6772617068' USING utf8mb4)");
+}
+
 test "syntax errors have byte offsets and messages" {
     var parser = try Parser.init(testing.allocator, v84, .{});
     defer parser.deinit();

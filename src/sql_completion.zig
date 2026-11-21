@@ -144,6 +144,22 @@ pub const Names = struct {
         return null;
     }
 
+    /// Resolves a Vitess target such as `graph@replica` to its listed schema. An
+    /// actual database with that full name takes precedence over a routing suffix.
+    fn resolveCurrentDatabase(self: *Names) Allocator.Error!void {
+        const current = self.database orelse return;
+        if (self.findDatabase(current) != null) return;
+
+        const at = std.mem.lastIndexOfScalar(u8, current, '@') orelse return;
+        const target = current[at + 1 ..];
+        for ([_][]const u8{ "primary", "replica", "rdonly", "master" }) |tablet_type| {
+            if (!std.ascii.eqlIgnoreCase(target, tablet_type)) continue;
+            const schema = self.findDatabase(current[0..at]) orelse return;
+            try self.setDatabase(schema);
+            return;
+        }
+    }
+
     /// True when the tables and routines of `schema` are listed, or were asked for.
     pub fn isLoaded(self: *const Names, schema: []const u8) bool {
         for (self.loaded.items) |name| {
@@ -235,11 +251,16 @@ pub const Names = struct {
             }
         }
 
+        try self.resolveCurrentDatabase();
+
         if (self.database) |current| {
             try self.markLoaded(current);
             try self.loadTablesAndRoutines(db, current);
-            const columns_sql = "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS " ++
-                "WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION";
+            const literal = try schemaLiteral(self.allocator, current);
+            defer self.allocator.free(literal);
+            const columns_sql = try std.fmt.allocPrint(self.allocator, "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS " ++
+                "WHERE TABLE_SCHEMA = {s} ORDER BY TABLE_NAME, ORDINAL_POSITION", .{literal});
+            defer self.allocator.free(columns_sql);
             if (try db.rowsCopy(self.allocator, columns_sql)) |rows| {
                 defer Mysql.freeRowsCopy(self.allocator, rows);
                 for (rows) |row| {
@@ -336,6 +357,35 @@ test "an unqualified table is looked up in the current database" {
     try std.testing.expect(names.findTable(null, "people") != null);
     try names.setDatabase("");
     try std.testing.expect(names.findTable(null, "people") == null);
+}
+
+test "Vitess tablet targets resolve to listed schemas for table and column completion" {
+    var names = Names.init(std.testing.allocator);
+    defer names.deinit();
+    try names.addDatabase("graph");
+    try names.addTable("graph", "people");
+    try names.addColumn("graph", "people", "id");
+
+    for ([_][]const u8{ "graph@replica", "graph@primary", "graph@rdonly", "graph@master" }) |target| {
+        try names.setDatabase(target);
+        try names.resolveCurrentDatabase();
+        try std.testing.expectEqualStrings("graph", names.database.?);
+        const table = names.findTable(null, "people").?;
+        try std.testing.expectEqualStrings("id", table.columns.items[0]);
+    }
+}
+
+test "schema resolution preserves real database names and unknown targets" {
+    var names = Names.init(std.testing.allocator);
+    defer names.deinit();
+    try names.addDatabase("graph");
+    try names.addDatabase("graph@replica");
+
+    for ([_][]const u8{ "graph", "graph@replica", "graph@custom", "missing@primary", "@replica" }) |name| {
+        try names.setDatabase(name);
+        try names.resolveCurrentDatabase();
+        try std.testing.expectEqualStrings(name, names.database.?);
+    }
 }
 
 test "clear empties the names so they can be loaded again" {
