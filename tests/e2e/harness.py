@@ -63,7 +63,7 @@ TLS_KEEP_DIR = os.path.join(tempfile.gettempdir(), "thysql-e2e-tls-keep")
 
 _ANSI = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07)")
 
-SEED_SQL = f"""
+COMMON_FIXTURE_SQL = f"""
 SET NAMES utf8mb4;
 DROP DATABASE IF EXISTS {TEST_DB};
 CREATE DATABASE {TEST_DB} CHARACTER SET utf8mb4;
@@ -80,6 +80,28 @@ INSERT INTO people VALUES
   (3, 'bob', CONCAT('tab', CHAR(9), 'here'), CONCAT('line1', CHAR(10), 'line2'));
 CREATE TABLE blobs (id INT PRIMARY KEY, data VARBINARY(16));
 INSERT INTO blobs VALUES (1, X'00FF10');
+CREATE TABLE latin_text (id INT PRIMARY KEY, s VARCHAR(20) CHARACTER SET latin1);
+INSERT INTO latin_text VALUES (1, X'636166E9');
+CREATE TABLE portable_values (
+  id INT PRIMARY KEY,
+  big BIGINT UNSIGNED,
+  amount DECIMAL(10,2),
+  day DATE,
+  moment DATETIME,
+  clock TIME,
+  doc JSON,
+  bits BIT(8),
+  data VARBINARY(16),
+  body TEXT
+);
+INSERT INTO portable_values VALUES
+  (1, 18446744073709551615, 12.30, '2026-11-14', '2026-11-14 10:00:00',
+   '10:20:30', '{{"a": 1}}', b'10000001', X'00FF10', '東京 ✓'),
+  (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+"""
+
+TYPED_FIXTURE_SQL = f"""
+USE {TEST_DB};
 CREATE TABLE typed (
   id BIGINT PRIMARY KEY,
   tiny TINYINT,
@@ -109,8 +131,10 @@ INSERT INTO typed VALUES
    NULL, NULL, NULL, NULL),
   (3, 0, 0, 0, 0.00, 0, 0, 1999, '1970-01-01', '1970-01-01 00:00:00', '00:00:00', 'red', '',
    '[]', b'00000000', X'', ST_GeomFromText('POINT(0 0)'), '');
-CREATE TABLE latin_text (id INT PRIMARY KEY, s VARCHAR(20) CHARACTER SET latin1);
-INSERT INTO latin_text VALUES (1, X'636166E9');
+"""
+
+PADDED_FIXTURE_SQL = f"""
+USE {TEST_DB};
 CREATE TABLE padded_values (
   id INT PRIMARY KEY,
   padded INT(5) UNSIGNED ZEROFILL,
@@ -118,12 +142,20 @@ CREATE TABLE padded_values (
   dbl DOUBLE(6,1) UNSIGNED ZEROFILL
 );
 INSERT INTO padded_values VALUES (1, 42, 0, 1.5), (2, 0, 2000, NULL);
+"""
+
+IDENTITY_SQL = f"""
 DROP USER IF EXISTS '{PW_USER}'@'%', '{NOPW_USER}'@'%', '{AUTH_USER}'@'%';
 CREATE USER '{PW_USER}'@'%' IDENTIFIED BY '{PW_PASSWORD}';
 CREATE USER '{NOPW_USER}'@'%';
 CREATE USER '{AUTH_USER}'@'%' IDENTIFIED BY '{AUTH_PASSWORD}';
 GRANT SELECT ON {TEST_DB}.* TO '{PW_USER}'@'%', '{NOPW_USER}'@'%', '{AUTH_USER}'@'%';
 """
+
+FIXTURE_GROUPS = {
+    "typed_output": (frozenset({"geometry", "extended_type_metadata"}), TYPED_FIXTURE_SQL),
+    "padded_numeric": (frozenset({"zerofill"}), PADDED_FIXTURE_SQL),
+}
 
 
 SERVER_EXT = """subjectAltName=DNS:localhost,IP:127.0.0.1
@@ -227,6 +259,9 @@ class Server:
     client: str  # the bundled client binary inside the image
     container: str
     port: int
+    family: str
+    capabilities: frozenset
+    timeout_profile: "TimeoutProfile"
 
     def connect_args(self, user=ROOT_USER):
         """Args that point thysql at this server, without a password."""
@@ -249,16 +284,51 @@ _TLS_DIRS = []  # temporary TLS directories created in this process, for cleanup
 
 
 @dataclasses.dataclass(frozen=True)
+class TimeoutProfile:
+    setup_sql: str
+    error_code: int
+    sqlstate: str
+
+
+@dataclasses.dataclass(frozen=True)
 class Target:
     name: str
+    family: str
     image: str
     client: str
     password_var: str
+    capabilities: frozenset
+    timeout_profile: TimeoutProfile
+
+
+BASE_CAPABILITIES = frozenset({
+    "multi_statements",
+    "stored_routines",
+    "connection_kill",
+    "tls_inspection",
+    "extended_type_metadata",
+    "typed_output",
+    "geometry",
+    "zerofill",
+    "json",
+    "sql_identity_admin",
+    "query_timeout",
+})
+MARIADB_CAPABILITIES = BASE_CAPABILITIES | {"mariadb_json_text"}
+
+MYSQL_TIMEOUT = TimeoutProfile("set session max_execution_time = 100;", 3024, "HY000")
+MARIADB_TIMEOUT = TimeoutProfile("set session max_statement_time = 0.1;", 1969, "70100")
 
 
 TARGETS = {
-    "mysql": Target("mysql", "mysql:8.4", "mysql", "MYSQL_ROOT_PASSWORD"),
-    "mariadb": Target("mariadb", "mariadb:11.4", "mariadb", "MARIADB_ROOT_PASSWORD"),
+    "mysql": Target(
+        "mysql", "mysql", "mysql:8.4", "mysql", "MYSQL_ROOT_PASSWORD",
+        BASE_CAPABILITIES, MYSQL_TIMEOUT,
+    ),
+    "mariadb": Target(
+        "mariadb", "mariadb", "mariadb:11.4", "mariadb", "MARIADB_ROOT_PASSWORD",
+        MARIADB_CAPABILITIES, MARIADB_TIMEOUT,
+    ),
 }
 
 
@@ -362,16 +432,37 @@ def _wait_ready(server):
     )
 
 
-def _seed(server):
-    docker(
+def run_server_sql(server, sql, args=(), *, check=True):
+    """Runs SQL through the server image's client as root and returns its result."""
+    return docker(
         [
             "exec", "-i", "-e", "MYSQL_PWD",
             server.container,
-            server.client, "-h127.0.0.1", "-uroot",
+            server.client, "-h127.0.0.1", "-uroot", *args,
         ],
-        stdin=SEED_SQL,
+        check=check,
+        stdin=sql,
         env=_docker_env(),
     )
+
+
+def _run_admin_sql(server, sql):
+    run_server_sql(server, sql)
+
+
+def _seed_fixtures(server):
+    _run_admin_sql(server, COMMON_FIXTURE_SQL)
+
+    for required, sql in FIXTURE_GROUPS.values():
+        if required.issubset(server.capabilities):
+            _run_admin_sql(server, sql)
+
+
+def _provision_identities(server):
+    if "sql_identity_admin" not in server.capabilities:
+        return
+
+    _run_admin_sql(server, IDENTITY_SQL)
 
 
 def _mounts_tls(container, tls_dir):
@@ -465,9 +556,13 @@ def _start_one(target, tls):
         client=target.client,
         container=container,
         port=_host_port(container),
+        family=target.family,
+        capabilities=target.capabilities,
+        timeout_profile=target.timeout_profile,
     )
     _wait_ready(server)
-    _seed(server)
+    _seed_fixtures(server)
+    _provision_identities(server)
     return server
 
 
@@ -652,8 +747,8 @@ class Interactive:
 class E2ETestCase(unittest.TestCase):
     """Base class for thysql e2e tests.
 
-    Each test gets its own HOME directory. Use `self.each_server()` with
-    `subTest` so every case runs against MySQL 8.4 and MariaDB 11.4.
+    Each test gets its own HOME directory. Use `self.each_server()` with a
+    per-target `subTest`; `require_capability()` records unsupported cases.
     """
 
     def setUp(self):
@@ -662,6 +757,11 @@ class E2ETestCase(unittest.TestCase):
 
     def each_server(self):
         return servers()
+
+    def require_capability(self, server, capability):
+        """Skip the current target subtest with a visible capability reason."""
+        if capability not in server.capabilities:
+            self.skipTest(f"{server.name} does not support capability '{capability}'")
 
     def interactive(self, args, **kwargs):
         session = Interactive(args, home=self.home, **kwargs)

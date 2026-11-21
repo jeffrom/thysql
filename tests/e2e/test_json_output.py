@@ -72,6 +72,7 @@ class JsonOutputTests(E2ETestCase):
     def test_every_type_maps_to_its_json_value(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "typed_output")
                 result = self.thysql(server, ["--json", "-e", "select * from typed order by id"])
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, "")
@@ -168,6 +169,7 @@ class JsonOutputTests(E2ETestCase):
         # The server sends 00042, 0000 and 0001.5; JSON allows none of those leading zeros.
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "zerofill")
                 result = self.thysql(
                     server,
                     ["--json", "-e", "select id, padded, year_zero, dbl from padded_values order by id"],
@@ -191,9 +193,8 @@ class JsonOutputTests(E2ETestCase):
         # MariaDB's JSON is LONGTEXT with a CHECK constraint. With the check off for
         # the session, text that isn't JSON can be stored, and it must not be embedded.
         for server in self.each_server():
-            if server.name != "mariadb":
-                continue
             with self.subTest(server=server.name):
+                self.require_capability(server, "mariadb_json_text")
                 setup = self.thysql(
                     server,
                     [],

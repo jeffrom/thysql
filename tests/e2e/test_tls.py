@@ -21,6 +21,7 @@ PLAINTEXT = r"Ssl_cipher\t\n"
 class TlsTests(E2ETestCase):
     def tls_run(self, server, extra, query=SSL_CIPHER):
         """Runs thysql against `server` with TLS options `extra`, as root."""
+        self.require_capability(server, "tls_inspection")
         args = server.connect_args(ROOT_USER) + extra + ["-e", query]
         return run_thysql(args, env=password_env(ROOT_USER))
 

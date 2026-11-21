@@ -2,13 +2,7 @@
 
 import re
 
-from harness import ROOT_USER, TEST_DB, E2ETestCase, password_env, run_thysql
-
-
-def timeout_settings(server):
-    if server.name == "mysql":
-        return "set session max_execution_time = 100;", 3024, "HY000"
-    return "set session max_statement_time = 0.1;", 1969, "70100"
+from harness import ROOT_USER, TEST_DB, E2ETestCase, password_env, run_server_sql, run_thysql
 
 
 # SLEEP alone can return a value when interrupted. Evaluating it for table rows
@@ -21,18 +15,31 @@ class QueryTimeoutTests(E2ETestCase):
     def test_query_timeout_in_batch_reports_error_and_exits_nonzero(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
-                setup, error_code, sqlstate = timeout_settings(server)
+                self.require_capability(server, "query_timeout")
+                profile = server.timeout_profile
                 result = run_thysql(
                     server.connect_args(ROOT_USER) + [TEST_DB],
-                    stdin=setup + "\n" + SLOW_QUERY + "\nselect 'after_timeout';\n",
+                    stdin=profile.setup_sql + "\n" + SLOW_QUERY + "\nselect 'after_timeout';\n",
                     env=password_env(ROOT_USER),
                     timeout=10,
                 )
                 output = result.stdout + result.stderr
 
+                probe = run_server_sql(
+                    server,
+                    profile.setup_sql + "\n" + SLOW_QUERY + "\n",
+                    args=["--batch", "--skip-column-names", "--quick", TEST_DB],
+                    check=False,
+                )
+                self.assertNotEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+                self.assertTrue(
+                    probe.stdout.splitlines() and probe.stdout.splitlines()[0].startswith("1\t"),
+                    f"timeout did not interrupt after the first streamed row: {probe.stdout}{probe.stderr}",
+                )
+
                 self.assertRegex(
                     result.stderr,
-                    rf"(?m)^ERROR {error_code} \({sqlstate}\) at line 2: .*exceeded",
+                    rf"(?m)^ERROR {profile.error_code} \({profile.sqlstate}\) at line 2: .*exceeded",
                     output,
                 )
                 self.assertEqual(result.returncode, 1, output)
@@ -41,20 +48,21 @@ class QueryTimeoutTests(E2ETestCase):
     def test_query_timeout_in_interactive_session_reports_error_and_recovers(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
-                setup, error_code, sqlstate = timeout_settings(server)
+                self.require_capability(server, "query_timeout")
+                profile = server.timeout_profile
                 prompt = f"root@127.0.0.1:{server.port}/{TEST_DB}> "
                 session = self.interactive(
                     server.connect_args(ROOT_USER) + [TEST_DB],
                     env=password_env(ROOT_USER),
                 )
                 session.expect(prompt)
-                session.send(setup + "\r")
+                session.send(profile.setup_sql + "\r")
                 session.expect("Query OK")
                 session.expect(prompt)
 
                 session.send(SLOW_QUERY + "\r")
                 text = session.expect(
-                    re.compile(rf"ERROR {error_code} \({sqlstate}\): [^\n]*exceeded[^\n]*\n"),
+                    re.compile(rf"ERROR {profile.error_code} \({profile.sqlstate}\): [^\n]*exceeded[^\n]*\n"),
                     timeout=5,
                 )
                 self.assertNotIn("Empty set", text)

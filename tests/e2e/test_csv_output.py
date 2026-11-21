@@ -70,6 +70,7 @@ class CsvOutputTests(E2ETestCase):
     def test_zerofill_and_year_zero_keep_the_server_text(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "zerofill")
                 result = self.thysql(server, ["--csv", "-e", "select padded, year_zero, dbl from padded_values where id = 1"])
                 self.assertEqual(result.stdout, "padded,year_zero,dbl\n00042,0000,0001.5\n")
 
@@ -87,6 +88,7 @@ class CsvOutputTests(E2ETestCase):
         ]
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "typed_output")
                 result = self.thysql(server, ["--csv", "-e", "select * from typed order by id"])
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 read = subprocess.run(

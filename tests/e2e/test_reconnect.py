@@ -62,6 +62,7 @@ class ReconnectTests(E2ETestCase):
     def test_statement_after_a_kill_reconnects_and_runs_once_more(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "connection_kill")
                 session = self.start(server, extra_args=PLAINTEXT)
                 session.expect("Welcome to thysql.")
                 first = self.current_connection_id(session, server)
@@ -80,6 +81,7 @@ class ReconnectTests(E2ETestCase):
     def test_skip_reconnect_reports_the_error_and_keeps_going(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "connection_kill")
                 session = self.start(server, extra_args=[*PLAINTEXT, "--skip-reconnect"])
                 session.expect("Welcome to thysql.")
                 first = self.current_connection_id(session, server)

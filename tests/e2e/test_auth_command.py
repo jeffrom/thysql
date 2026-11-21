@@ -240,6 +240,7 @@ class AuthCommandTests(E2ETestCase):
     def test_reconnect_runs_the_command_and_uses_a_changed_password(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "connection_kill")
                 self.set_password(AUTH_PASSWORD)
                 session = self.start(server, [*PLAINTEXT, f"--auth-command={self.script}"], user=AUTH_USER)
                 session.expect("Welcome to thysql.")
@@ -281,6 +282,7 @@ class AuthCommandTests(E2ETestCase):
     def test_failing_command_on_reconnect_reports_and_the_session_goes_on(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "connection_kill")
                 session = self.start(server, [*PLAINTEXT, f"--auth-command={self.script}"])
                 session.expect("Welcome to thysql.")
                 first = self.current_connection_id(session, server)
@@ -429,6 +431,7 @@ class AuthCommandTests(E2ETestCase):
     def test_reconnect_runs_the_command_again_and_keeps_the_database_from_use(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "connection_kill")
                 self.forget_log()
                 command = self.json_command({"user": ROOT_USER, "password": ROOT_PASSWORD})
                 session = self.interactive(

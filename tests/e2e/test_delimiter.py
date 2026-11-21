@@ -64,6 +64,7 @@ class DelimiterTests(E2ETestCase):
     def test_delimiter_script_on_stdin_defines_procedure_and_trigger(self):
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "stored_routines")
                 result = self.thysql(server, [], stdin=SETUP_SQL)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stdout, SETUP_OUTPUT)
@@ -73,6 +74,7 @@ class DelimiterTests(E2ETestCase):
         path = self.write_file("setup.sql", SETUP_SQL)
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "stored_routines")
                 result = self.thysql(server, [], stdin=f"source {path}\n")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stdout, SETUP_OUTPUT)
@@ -81,6 +83,7 @@ class DelimiterTests(E2ETestCase):
         path = self.write_file("setup_alias.sql", SETUP_SQL)
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "stored_routines")
                 result = self.thysql(server, [], stdin=f"\\. {path}\n")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stdout, SETUP_OUTPUT)
@@ -89,6 +92,7 @@ class DelimiterTests(E2ETestCase):
         path = self.write_file("setup_repl.sql", SETUP_SQL)
         for server in self.each_server():
             with self.subTest(server=server.name):
+                self.require_capability(server, "stored_routines")
                 session = self.interactive(
                     server.connect_args(ROOT_USER) + [TEST_DB],
                     env=password_env(ROOT_USER),

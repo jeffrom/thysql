@@ -114,6 +114,16 @@ documentation.
 
 ## Phase 2: capabilities and fixture boundaries
 
+**Status: implemented.** Targets now declare a family, an explicit capability
+set, and a timeout behavior profile. Common portable fixtures are seeded
+separately from optional extended-type/geometry and `ZEROFILL` groups; identity
+provisioning runs through a separate function from fixture loading. Tests for
+optional behavior report a skip subtest naming the target and capability.
+MariaDB's invalid-JSON-text case is explicitly limited by the
+`mariadb_json_text` capability. Timeout assertions use the target profile, and
+a bundled-client streaming probe confirms that each timeout interrupts after
+the first row has arrived.
+
 Audit assumptions throughout `tests/e2e`, not just the files listed above.
 Identify SQL administration, stored routines, multi-statements, metadata
 queries, authentication, type metadata, TLS inspection, and error contracts.
@@ -142,6 +152,31 @@ Acceptance:
 - Specialized fixture incompatibility cannot prevent common tests from starting.
 - Every skip identifies the target and unsupported capability.
 - Setup failures and failures of supported behavior remain nonzero exits.
+
+Validation run for phase 2:
+
+- `python3 -m py_compile tests/e2e/harness.py tests/e2e/test_query_timeout.py tests/e2e/test_json_output.py tests/e2e/test_csv_output.py tests/e2e/test_reconnect.py tests/e2e/test_auth_command.py` — passed.
+- Direct fixture-boundary checks with mocked SQL execution — passed: a target with no optional capabilities receives common fixtures only; a target with geometry and extended metadata receives the typed group but not `ZEROFILL`; identity SQL is invoked separately.
+- Direct `unittest` capability-skip probe — passed: an unsupported subtest is skipped with both target ID and capability in its reason.
+- `python3 tests/e2e/run.py zig-out/bin/thysql -k query_timeout -v` — passed against MySQL 8.4 and MariaDB 11.4: both timeout tests passed, and the server-client streaming probe saw row 1 before each profile's expected timeout error.
+- `zig build e2e` — passed against MySQL 8.4 and MariaDB 11.4: 245 tests, 0 failures, 1 expected skip (`mysql` lacks the MariaDB-only `mariadb_json_text` capability), 115.538 seconds.
+- `git diff --check` — passed.
+
+The first full run exposed that thysql's batch renderer buffers incomplete
+results, so asserting a partial rendered row there did not test server-side
+streaming. The check now uses each image's bundled client with `--quick`; the
+focused run and full suite passed with that direct protocol check.
+
+Parent review added portable JSON/CSV checks for BIGINT, DECIMAL, date/time,
+JSON, BIT, binary, Unicode, and NULL independently of the geometry fixture.
+Those checks passed on both baseline servers and an actual MySQL target with
+optional capabilities removed; the latter contained neither `typed` nor
+`padded_values`. A synthetic reporting probe verified that unsupported cases
+skip, supported failures fail, and subsequent targets still execute. Procedure
+and trigger tests now require `stored_routines`; TLS status checks require
+`tls_inspection`. The applicable baseline assertions remain unchanged.
+`python3 tests/e2e/run.py zig-out/bin/thysql -k delimiter -k tls -k portable`
+passed all 34 affected tests against both baseline servers after review fixes.
 
 ## Phase 3: Percona Server and additional versions
 

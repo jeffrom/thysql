@@ -88,19 +88,40 @@ with SIGKILL, the same filter finds any leftovers.
   fresh `self.home`, and `self.interactive(...)` returns an `Interactive` whose
   session is closed in cleanup.
 
-Fixtures live in the `thysql_test` database (`SEED_SQL` in `harness.py`):
+Fixtures live in the `thysql_test` database (`COMMON_FIXTURE_SQL` plus optional
+groups in `harness.py`):
 
-- `people(id, name, nickname, note)`: row 1 has a NULL nickname; row 2 has
-  unicode text; row 3 has a tab in `nickname` and a newline in `note`.
+- `people(id, name, nickname, note)`: common INT, VARCHAR, and TEXT values;
+  row 1 has a NULL nickname, row 2 has unicode text, row 3 has a tab in
+  `nickname` and a newline in `note`.
 - `blobs(id, data)`: `data` is the bytes `00 FF 10`.
-- `typed`: one column of each type the JSON and CSV output maps (integers, DECIMAL,
+- `portable_values`: common unsigned BIGINT, DECIMAL, date/time, JSON, BIT,
+  binary, Unicode text, and NULL values, checked independently in JSON and CSV.
+- `typed`: an optional extended group with one column of each type the JSON and CSV output maps (integers, DECIMAL,
   DOUBLE, FLOAT, YEAR, DATE, DATETIME, TIME, ENUM, SET, JSON, BIT, binary, GEOMETRY,
   TEXT). Row 1 has values, row 2 is all NULL, row 3 has zeros and empty strings.
-- `latin_text(id, s)`: `s` is latin1, so its value `caf` + `0xE9` is not valid UTF-8 on its own.
+- `padded_values`: an optional `ZEROFILL` group, including `YEAR 0`.
+- `latin_text(id, s)`: common fixture; `s` is latin1, so its value `caf` + `0xE9` is not valid UTF-8 on its own.
 - `thysql_pw` / `e2e-user-pw`: a user with a password, using the server's
   default auth plugin. It has SELECT on `thysql_test.*`.
 - `thysql_nopw`: a user with no password. It also has SELECT on `thysql_test.*`.
 - root uses the `e2e-root-pw` password. The containers are throwaway.
+
+Fixture data and fixture identity setup are separate operations. The baseline
+targets provision test users with SQL `CREATE USER`/`GRANT`; a future protocol
+endpoint can use its own supported identity mechanism. `Target.capabilities`
+controls optional fixture groups and `E2ETestCase.require_capability` records an
+individual skip with the target ID and missing capability. The baseline targets
+currently declare `geometry`, `zerofill`, `extended_type_metadata`, and the
+other exercised protocol behaviors.
+
+The e2e audit covers multi-result statements, column metadata, login failures
+and password users, TLS cipher inspection, connection killing/reconnect, and
+the timeout error-code/SQLSTATE contracts. Timeout setup SQL and expected errors
+come from each target's explicit family profile; tests also check that row 1
+was returned before the timeout error, so an error before result rows does not
+count. The procedure/trigger cases in `test_delimiter.py` require the
+`stored_routines` capability; delimiter-only cases remain independent.
 
 ### Socket tests
 
@@ -135,8 +156,10 @@ class SelectTests(E2ETestCase):
                 self.assertRegex(result.stdout, r"\|\s*3\s*\|")
 ```
 
-3. If the test needs a new table or user, add it to `SEED_SQL`. Make it
-   idempotent, because kept containers are re-seeded on every run.
+3. If the test needs a common table, add it to `COMMON_FIXTURE_SQL`. Put
+   specialized DDL in a named `FIXTURE_GROUPS` entry with the capabilities it
+   needs. Add or change users in `IDENTITY_SQL`, not in data fixture SQL. Keep
+   each group idempotent, because kept containers are re-seeded on every run.
 4. Put a password only in `env=`, never in `args`. The
    PasswordOnCommandLine rule applies to the tests too.
 5. Use `E2ETestCase.interactive` for terminal behavior such as prompts, `\c`,
