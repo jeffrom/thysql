@@ -401,6 +401,8 @@ fn loadNames(repl: *const Repl, db: *Mysql.DB, out: *std.Io.Writer, notice: bool
 /// printing the failure when the connection cannot be made.
 fn reconnectSession(db: *Mysql.DB, out: *std.Io.Writer, repl: *Repl) !bool {
     try out.print("No connection. Trying to reconnect...\n", .{});
+    try out.flush();
+
     db.reconnect() catch |err| switch (err) {
         Mysql.DBError.ConnectError => {
             try db.renderConnectFailure(out, null);
