@@ -267,6 +267,7 @@ class Server:
     adapter: str = "mysql"
     internal_port: int = 3306
     status_user: str = ROOT_USER
+    information_schema_name: str = "information_schema"
 
     def connect_args(self, user=ROOT_USER):
         """Args that point thysql at this server, without a password."""
@@ -353,6 +354,14 @@ TARGETS = {
         }),
         MYSQL_TIMEOUT, "vitess",
     ),
+    "tidb": Target(
+        "tidb", "tidb", "pingcap/tidb@sha256:00f015520ce91734c3fbec720f23448e790e691655c7e181544a620872a00c61",
+        "mariadb", "", BASE_CAPABILITIES - {
+            "geometry", "extended_type_metadata", "typed_output", "zerofill",
+            "stored_routines", "query_timeout",
+        },
+        MYSQL_TIMEOUT, "tidb",
+    ),
 }
 
 DEFAULT_TARGETS = ("mysql", "mariadb")
@@ -391,7 +400,7 @@ def servers():
     return list(_SERVERS)
 
 
-def docker(args, *, check=True, stdin=None, env=None):
+def docker(args, *, check=True, stdin=None, env=None, timeout=None):
     """Runs a docker CLI command and captures its output as text.
 
     Secrets go through `env` and `docker -e NAME`, never `-e NAME=value`,
@@ -403,6 +412,7 @@ def docker(args, *, check=True, stdin=None, env=None):
         capture_output=True,
         text=True,
         env=env,
+        timeout=timeout,
     )
     if check and result.returncode != 0:
         raise RuntimeError(f"docker {args[0]} failed: {result.stderr.strip()}")
@@ -459,7 +469,10 @@ def _wait_ready(server):
 
 
 def run_server_sql(server, sql, args=(), *, check=True):
-    """Runs SQL through the server image's client as root and returns its result."""
+    """Runs administrative SQL against the target endpoint as root."""
+    if server.adapter == "tidb":
+        return TIDB_ADAPTER.run_sql(server, sql, args=args, check=check)
+
     return docker(
         [
             "exec", "-i", "-e", "MYSQL_PWD",
@@ -557,6 +570,8 @@ def tls_material():
 def _start_one(target, tls):
     if target.adapter == "vitess":
         return VITESS_ADAPTER.start(target, tls)
+    if target.adapter == "tidb":
+        return TIDB_ADAPTER.start(target, tls)
 
     return MYSQL_ADAPTER.start(target, tls)
 
@@ -759,6 +774,130 @@ class VitessAdapter(DockerAdapter):
         for required, fixture_sql in FIXTURE_GROUPS.values():
             if required.issubset(server.capabilities):
                 _run_vitess_sql(server, fixture_sql)
+
+
+class TiDBAdapter(DockerAdapter):
+    """Runs standalone TiDB with its local UniStore engine for protocol tests."""
+
+    port = 4000
+
+    def start(self, target, tls):
+        container = _container_name(target.name)
+        config = (
+            '[security]\n'
+            f'ssl-ca = "{TLS_MOUNT}/ca.pem"\n'
+            f'ssl-cert = "{TLS_MOUNT}/server-cert.pem"\n'
+            f'ssl-key = "{TLS_MOUNT}/server-key.pem"\n'
+        )
+        bootstrap = f"ALTER USER '{ROOT_USER}'@'%' IDENTIFIED BY '{ROOT_PASSWORD}';\n"
+        for name, content in (("tidb.toml", config), ("tidb-init.sql", bootstrap)):
+            with open(os.path.join(tls.directory, name), "w") as handle:
+                handle.write(content)
+
+        startup_args = [
+            "--store=unistore", "--path=/tmp/thysql-tidb",
+            "--host=0.0.0.0", "-P", str(self.port),
+            f"--config={TLS_MOUNT}/tidb.toml",
+            f"--initialize-sql-file={TLS_MOUNT}/tidb-init.sql",
+        ]
+        fingerprint = _configuration_fingerprint(target, tls, runtime_config={
+            "startup_args": startup_args,
+            "config": config,
+            "bootstrap": bootstrap,
+        })
+        exists = docker(["container", "inspect", container], check=False).returncode == 0
+        if exists and (
+            _container_fingerprint(container) != fingerprint
+            or not _mounts_tls(container, tls.directory)
+        ):
+            docker(["rm", "-f", "-v", container])
+            exists = False
+
+        _STARTED.append(container)
+        if exists:
+            docker(["start", container])
+        else:
+            docker([
+                "run", "-d", "--name", container,
+                "--label", f"{LABEL}=1",
+                "--label", f"{CONFIG_LABEL}={fingerprint}",
+                "-v", f"{tls.directory}:{TLS_MOUNT}:ro",
+                "-p", f"127.0.0.1::{self.port}",
+                "--entrypoint", "/tidb-server", target.image, *startup_args,
+            ])
+
+        server = Server(
+            name=target.name,
+            image=target.image,
+            client=target.client,
+            container=container,
+            port=_host_port(container, self.port),
+            family=target.family,
+            capabilities=target.capabilities,
+            timeout_profile=target.timeout_profile,
+            version="",
+            adapter=target.adapter,
+            internal_port=self.port,
+            information_schema_name="INFORMATION_SCHEMA",
+        )
+        self.wait_ready(server)
+
+        server.version = self.run_sql(
+            server, "SELECT VERSION();", args=["-N", "-B"]
+        ).stdout.strip()
+        MySQLContainerAdapter.report(server)
+        self.seed(server)
+        self.provision_identities(server)
+        return server
+
+    def run_sql(self, server, sql, *, args=(), check=True):
+        # The TiDB image has no SQL client. Use an independent client in its
+        # network namespace so setup and streaming probes do not test thysql.
+        return docker(
+            [
+                "run", "--rm", "-i", "--network", f"container:{server.container}",
+                "-e", "MYSQL_PWD", TARGETS["mariadb"].image,
+                "mariadb", "--no-defaults", "--skip-ssl", "--connect-timeout=2",
+                "-h127.0.0.1", f"-P{server.internal_port}", "-uroot", *args,
+            ],
+            stdin=sql,
+            env=_docker_env(),
+            check=check,
+            timeout=30,
+        )
+
+    def wait_ready(self, server):
+        deadline = time.monotonic() + READY_TIMEOUT
+        last_error = ""
+        while time.monotonic() < deadline:
+            try:
+                result = self.run_sql(server, "SELECT 1;", check=False)
+            except subprocess.TimeoutExpired:
+                last_error = "readiness query timed out"
+                continue
+            if result.returncode == 0:
+                return
+            last_error = (result.stdout + result.stderr).strip()
+            state = docker(["inspect", "-f", "{{.State.Running}}", server.container], check=False)
+            if state.stdout.strip() != "true":
+                break
+            time.sleep(1)
+
+        logs = docker(["logs", "--tail", "50", server.container], check=False)
+        raise RuntimeError(
+            f"{server.name} did not become ready: {last_error}\n"
+            f"last server log lines:\n{(logs.stdout + logs.stderr).strip()}"
+        )
+
+    def seed(self, server):
+        self.run_sql(server, COMMON_FIXTURE_SQL)
+
+        for required, sql in FIXTURE_GROUPS.values():
+            if required.issubset(server.capabilities):
+                self.run_sql(server, sql)
+
+
+TIDB_ADAPTER = TiDBAdapter()
 
 
 def _run_vitess_sql(server, sql, *, check=True):

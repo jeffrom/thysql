@@ -344,6 +344,44 @@ Sharded routing, resharding, and failover topology tests are later work.
 
 ## Phase 5: TiDB
 
+**Status: implemented.** `tidb` pins the multi-architecture TiDB 8.5.3 image
+`pingcap/tidb@sha256:00f015520ce91734c3fbec720f23448e790e691655c7e181544a620872a00c61`.
+The observed version is `8.0.11-TiDB-v8.5.3`; the image runs natively on ARM64.
+The adapter starts a single UniStore instance at an isolated container-local
+path, with a random localhost host port. This is a client protocol test
+configuration and does not exercise a production TiKV/PD topology.
+
+Native TLS is configured through a generated TOML file. An initialization SQL
+file establishes the throwaway root password before authenticated readiness.
+The image has no SQL client, so administrative SQL and streaming probes use
+an independent MariaDB client container in TiDB's network namespace. The
+thysql binary remains the client under test, rather than provisioning itself.
+The helper uses the configured MariaDB target image and is removed on exit.
+TiDB's uppercase `INFORMATION_SCHEMA` metadata is an explicit endpoint profile;
+the database-completion test uses that spelling while retaining its exact
+prompt and success assertions.
+
+Validation:
+
+- `THYSQL_E2E_SERVERS=tidb python3 tests/e2e/run.py zig-out/bin/thysql` passed:
+  236 tests, 0 failures, 12 visible skips, 61.063 seconds.
+- All client TLS checks, authentication, KILL-based reconnect and credential
+  changes, warnings, status fields, latin1 bytes, completion, and portable
+  JSON/CSV types execute and pass.
+- Three kept-container runs, including stopping and restarting the container,
+  reused its ID and passed portable JSON/CSV checks after each reseed.
+- Direct probes confirmed geometry DDL rejection, unpadded output `42`/`1.5`
+  despite accepted padding syntax, and stored-procedure rejection.
+- An independent streaming client confirmed that the deadline error is 3024 /
+  HY000 but this fixture yields no partial row, even with initial chunk size 1.
+  The two existing mid-result timeout regressions remain explicit skips.
+- The remaining skips are the two full geometry fixture checks, two padded
+  output checks, four stored-routine cases, MariaDB-only invalid JSON text,
+  and the single-target cross-server prerequisite. Common types remain covered.
+
+The metadata-aware completion regression also passed unchanged on the
+MySQL/MariaDB baseline pair. Python compilation and `git diff --check` passed.
+
 Add a pinned, documented standalone test configuration using the smallest
 supported deployment suitable for these client tests. Verify its startup,
 readiness, SQL identity provisioning, TLS options, and architecture support.

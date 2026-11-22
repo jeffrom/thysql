@@ -2,7 +2,7 @@
 
 These tests run the built `thysql` binary against real servers: MySQL 8.4,
 MariaDB 11.4, Percona Server 8.4.11-12, and an unsharded Vitess 25.0 test
-environment, each in Docker. By default each test case runs against the
+environment, plus standalone TiDB 8.5.3, each in Docker. By default each test case runs against the
 original MySQL and MariaDB pair. Set `THYSQL_E2E_SERVERS` to select targets.
 The runner is Python 3 standard library only, so there is nothing to install.
 
@@ -20,10 +20,11 @@ THYSQL_E2E_SERVERS=mysql zig build e2e             # MySQL 8.4 only
 THYSQL_E2E_SERVERS=mariadb zig build e2e           # MariaDB 11.4 only
 THYSQL_E2E_SERVERS=percona python3 tests/e2e/run.py ./zig-out/bin/thysql
 THYSQL_E2E_SERVERS=vitess python3 tests/e2e/run.py ./zig-out/bin/thysql
+THYSQL_E2E_SERVERS=tidb python3 tests/e2e/run.py ./zig-out/bin/thysql
 ```
 
 `THYSQL_E2E_SERVERS` accepts comma-separated target IDs: `mysql`, `mariadb`,
-`percona`, and `vitess`; for example, `mysql,mariadb`. Unset means the original
+`percona`, `vitess`, and `tidb`; for example, `mysql,mariadb`. Unset means the original
 baseline pair (`mysql,mariadb`). Empty, duplicate, and unknown entries fail
 before Docker is contacted. Tests that require both
 servers, including the connection-switch suite, report a unittest skip when
@@ -156,6 +157,17 @@ architecture. TLS assertions use thysql’s negotiated client cipher from
 `status`, which verifies the client-to-VTGate connection. Phase 4’s exact
 coverage and skips are recorded in
 [`docs/plans/e2e-server-matrix.md`](../../docs/plans/e2e-server-matrix.md).
+
+TiDB pins `pingcap/tidb` 8.5.3 by its multi-architecture digest in the target
+registry. It runs natively on ARM64. The adapter uses standalone UniStore with
+container-local storage, native TLS from a generated TOML configuration, and
+an initialization SQL file for the root password. Administrative queries use
+a temporary MariaDB client container in TiDB's network namespace because the
+TiDB image contains no client. Application tests connect to TiDB's published
+listener. This setup covers client protocol behavior, not production TiKV/PD
+cluster operations. Geometry, padded numeric output, stored routines, and the
+existing partial-result timeout fixture are explicit omissions; portable
+numeric, date/time, JSON, BIT, binary, Unicode and NULL output remains covered.
 
 The e2e audit covers multi-result statements, column metadata, login failures
 and password users, TLS cipher inspection, connection killing/reconnect, and

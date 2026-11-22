@@ -37,9 +37,10 @@ class CompletionTests(E2ETestCase):
             with self.subTest(server=server.name):
                 session = self.start(server)
                 session.expect(main_prompt(server))
-                session.send("use inform" + TAB + ENTER)
+                database = server.information_schema_name
+                session.send("use " + database[:6] + TAB + ENTER)
                 session.expect("Database changed")
-                session.expect(main_prompt(server, "information_schema"))
+                session.expect(main_prompt(server, database))
                 self.finish(session)
 
     def test_tab_completes_a_table_name(self):
