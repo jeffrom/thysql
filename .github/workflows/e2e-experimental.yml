@@ -1,0 +1,41 @@
+name: experimental e2e targets
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Experimental standalone target
+        type: choice
+        required: true
+        options:
+          - vitess
+          - tidb
+
+permissions:
+  contents: read
+
+jobs:
+  experimental-e2e:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libzstd-dev libkrb5-dev openssl jq
+      - name: Experimental end-to-end tests (${{ inputs.target }})
+        env:
+          THYSQL_E2E_SERVERS: ${{ inputs.target }}
+        run: zig build e2e
+      - name: Upload failure diagnostics
+        if: failure() && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ inputs.target }}-diagnostics
+          path: e2e-diagnostics/
+          if-no-files-found: ignore

@@ -18,6 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import harness  # noqa: E402
+import reporting  # noqa: E402
 
 
 def main(argv):
@@ -45,17 +46,20 @@ def main(argv):
             program = unittest.main(
                 module=None,
                 exit=False,
+                testRunner=reporting.ReportingRunner,
                 argv=[
                     "run.py", "discover",
                     "-s", HERE, "-t", HERE, "-p", "test_*.py",
                     "-v", *argv[2:],
                 ],
             )
+            if not program.result.wasSuccessful():
+                harness.failure_diagnostics(harness.servers())
     except KeyboardInterrupt:
         sys.stderr.write("\ninterrupted; containers removed\n")
         return 130
     except RuntimeError as err:
-        sys.stderr.write(f"e2e setup failed: {err}\n")
+        sys.stderr.write(f"E2E STARTUP/SETUP FAILURE (before test execution): {err}\n")
         return 2
     return 0 if program.result.wasSuccessful() else 1
 

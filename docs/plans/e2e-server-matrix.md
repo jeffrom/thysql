@@ -403,6 +403,72 @@ Acceptance:
 
 ## Phase 6: CI matrix and reporting
 
+**Status: implemented locally; remote CI not run.** Required CI now runs the
+MySQL, MariaDB, and Percona targets as independent Ubuntu matrix jobs with
+`fail-fast: false`, plus a dedicated `mysql,mariadb` switch job. Vitess and
+TiDB are in a separate manual experimental workflow. The local default remains
+exactly `mysql,mariadb`.
+
+The three required target refs use verified multi-architecture index digests:
+MySQL 8.4 (`sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902`),
+MariaDB 11.4 (`sha256:a8992b5e5404d11e03c54a31d0c1bdea3fd116d283aa6d1a627551f29045309b`),
+and Percona Server 8.4.11-12
+(`sha256:e95917e6dc1242a773e35a1d93f2ede275c9b48eab4354c446d64cefe6bb79be`).
+Registry inspection confirmed linux/amd64 and linux/arm64/v8 for all three.
+Update procedure and CI layout are documented in `tests/e2e/README.md`.
+
+`run.py` now reports target-attributed subtest cases once per target and test,
+including nested subtests; target failures/skips remain distinct from global
+client cases and baseline-pair prerequisite skips. Startup/readiness/bootstrap
+errors have a separate label. Failed runs collect the last 100 log lines, capped at 12,000 characters
+per target after credential redaction and before teardown; CI uploads these
+files as artifacts. Reporting unit tests cover failed outcomes, skip
+attribution, nested cases, pair prerequisites, setup labeling, and redaction.
+
+Validation run for phase 6:
+
+- `docker buildx imagetools inspect mysql:8.4`, `mariadb:11.4`, and
+  `percona/percona-server:8.4.11-12` — passed; captured index digests and
+  confirmed amd64 and ARM64 manifests. The existing TiDB target remains pinned
+  by its already-configured digest.
+- `python3 -m unittest discover -s tests -p 'test_e2e_reporting.py' -v` —
+  passed: 10 tests executing real unittest suites and lifecycle callbacks.
+- `python3 -m py_compile tests/e2e/reporting.py tests/e2e/run.py
+  tests/e2e/harness.py tests/test_e2e_reporting.py` — passed.
+- `THYSQL_E2E_SERVERS=mysql,mariadb python3 tests/e2e/run.py
+  zig-out/bin/thysql -k portable` — passed against MySQL 8.4.13 and MariaDB
+  11.4.13: 2 target cases passed per server; summary attribution matched.
+- `git diff --check` — passed.
+- Parent review corrected real capability-skip attribution, preserved global
+  errors after targeted subtests, and retained full unittest option forwarding.
+  A fixture-failure regression verifies diagnostics precede cleanup even before
+  a server reaches the active list. Pair prerequisites have their own bucket.
+- A real MySQL bootstrap fault produced a redacted `mysql.log` artifact and
+  removed its actual container and TLS directory. Diagnostic collection errors
+  cannot replace the original test/setup failure.
+- Both changed workflows passed `rhysd/actionlint`. The experimental workflow
+  uses the selected input directly; the switch job runs only switch tests.
+- Final integrated command:
+  `THYSQL_E2E_SERVERS=mysql,mariadb,percona,vitess,tidb python3 tests/e2e/run.py zig-out/bin/thysql`
+  passed all 247 methods in 239.939 seconds, with 33 expected skip events and
+  no failures. Per-target method/target-pair counts are below; repeated
+  command variants are deduplicated, so these show 31 skipped pairs rather
+  than 33 individual unittest skip events. All 44 global/client cases passed,
+  and the baseline-pair prerequisite was satisfied.
+
+  | Target | Passed pairs | Failed pairs | Skipped pairs |
+  | --- | ---: | ---: | ---: |
+  | MySQL | 202 | 0 | 1 |
+  | MariaDB | 203 | 0 | 0 |
+  | Percona | 202 | 0 | 1 |
+  | Vitess | 185 | 0 | 18 |
+  | TiDB | 192 | 0 | 11 |
+
+  All disposable containers and TLS files were cleaned up. The pre-existing
+  kept MariaDB container was preserved.
+- GitHub Actions was not run from this environment. Experimental targets remain
+  manual pending CI validation; no remote CI result is claimed.
+
 Run each selected target in an independent Ubuntu job with `fail-fast: false`.
 Retain a dedicated `mysql,mariadb` job for cross-server switching. Keep local
 defaults unchanged. Pin CI image versions or digests and document updating them.

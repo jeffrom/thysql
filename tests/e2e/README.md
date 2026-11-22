@@ -34,7 +34,36 @@ The runner starts the selected containers on random host ports bound to 127.0.0.
 (for example, `-p 127.0.0.1::3306`), waits until each one answers queries, seeds fixtures,
 runs the suite, and removes the containers. Startup output identifies each
 target's configured image, observed `SELECT VERSION()` result, family, and
-capabilities. Cleanup also happens when a test fails or you press Ctrl-C.
+capabilities. The final coverage summary counts each test-method/target pair
+once, even when it contains several command variants or nested subtests. It
+reports target failures and skips separately, and lists global/client cases
+and baseline-pair prerequisite skips separately. A server startup or fixture
+setup failure has its own error label.
+
+On failure, bounded server logs are redacted and saved in
+`e2e-diagnostics/<target>.log` before containers are removed. Cleanup also
+happens when a test fails or you press Ctrl-C.
+
+## CI coverage
+
+Required CI runs MySQL, MariaDB, and Percona in independent Ubuntu jobs with
+matrix fail-fast disabled. A separate required `mysql,mariadb` run retains the
+cross-server connection-switch coverage without repeating the full baseline
+suites. Vitess and TiDB remain in the manual
+`experimental e2e targets` workflow until their CI runs establish a green
+baseline; no established job uses `continue-on-error`. The manual workflow
+lets you select Vitess or TiDB. Reporting/lifecycle unit tests run separately:
+
+```sh
+python3 -m unittest discover -s tests -p 'test_e2e_reporting.py' -v
+```
+
+The required target image refs are immutable multi-architecture manifest
+digests in `harness.py`. Registry inspection confirmed linux/amd64 and
+linux/arm64/v8 manifests for each ref. Local selection defaults remain exactly
+`mysql,mariadb`. To update an image, inspect the registry's versioned tag,
+record its index digest in `TARGETS`, confirm amd64 and ARM64 manifests, then
+run that target and the baseline pair before changing the documented pin.
 
 ### Keeping containers between runs
 

@@ -3,3 +3,5 @@
 /zig-pkg
 __pycache__/
 dist/
+
+/e2e-diagnostics/

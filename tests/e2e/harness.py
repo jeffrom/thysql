@@ -49,6 +49,7 @@ AUTH_PASSWORD = "e2e-auth-pw"
 
 LABEL = "thysql-e2e"
 READY_TIMEOUT = 240
+DIAGNOSTICS_DIR = "e2e-diagnostics"
 
 # The macOS keychain tests use this tool and this throwaway password.
 SECURITY = "/usr/bin/security"
@@ -334,15 +335,21 @@ MARIADB_TIMEOUT = TimeoutProfile("set session max_statement_time = 0.1;", 1969, 
 
 TARGETS = {
     "mysql": Target(
-        "mysql", "mysql", "mysql:8.4", "mysql", "MYSQL_ROOT_PASSWORD",
+        "mysql", "mysql",
+        "mysql:8.4@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902",
+        "mysql", "MYSQL_ROOT_PASSWORD",
         BASE_CAPABILITIES, MYSQL_TIMEOUT,
     ),
     "mariadb": Target(
-        "mariadb", "mariadb", "mariadb:11.4", "mariadb", "MARIADB_ROOT_PASSWORD",
+        "mariadb", "mariadb",
+        "mariadb:11.4@sha256:a8992b5e5404d11e03c54a31d0c1bdea3fd116d283aa6d1a627551f29045309b",
+        "mariadb", "MARIADB_ROOT_PASSWORD",
         MARIADB_CAPABILITIES, MARIADB_TIMEOUT,
     ),
     "percona": Target(
-        "percona", "mysql", "percona/percona-server:8.4.11-12", "mysql",
+        "percona", "mysql",
+        "percona/percona-server:8.4.11-12@sha256:e95917e6dc1242a773e35a1d93f2ede275c9b48eab4354c446d64cefe6bb79be",
+        "mysql",
         "MYSQL_ROOT_PASSWORD", BASE_CAPABILITIES, MYSQL_TIMEOUT,
     ),
     "vitess": Target(
@@ -424,6 +431,42 @@ def _docker_env():
     return {**os.environ, "MYSQL_PWD": ROOT_PASSWORD}
 
 
+def _redact(text):
+    for secret in (ROOT_PASSWORD, PW_PASSWORD, AUTH_PASSWORD, KEYCHAIN_PASSWORD):
+        text = text.replace(secret, "<redacted>")
+
+    return text
+
+
+def failure_diagnostics(running):
+    """Print bounded, redacted logs for selected targets before teardown."""
+    for server in running:
+        logs = _container_logs(server.container)
+        _write_diagnostic(server.name, server.image, server.version, logs)
+
+
+def _container_logs(container):
+    try:
+        result = docker(["logs", "--tail", "100", container], check=False, timeout=10)
+    except (OSError, subprocess.SubprocessError) as err:
+        return f"unable to collect container logs: {_redact(str(err))}"
+
+    return _redact((result.stdout + result.stderr).strip())[-12000:]
+
+
+def _write_diagnostic(name, image, version, logs):
+    heading = f"target={name}\nimage={image}\nobserved_version={version}\n\n"
+    content = _redact(heading) + _redact(logs or "(no container logs)")[-12000:] + "\n"
+    try:
+        os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+        with open(os.path.join(DIAGNOSTICS_DIR, f"{name}.log"), "w") as handle:
+            handle.write(content)
+    except OSError as err:
+        sys.stderr.write(f"unable to save diagnostics: {_redact(str(err))}\n")
+
+    sys.stderr.write(f"\n--- failure diagnostics: {name} ---\n{content}")
+
+
 def check_docker():
     result = docker(["info", "--format", "{{.ServerVersion}}"], check=False)
     if result.returncode != 0:
@@ -461,10 +504,11 @@ def _wait_ready(server):
             return
         last_error = result.stderr.strip()
         time.sleep(1)
-    logs = docker(["logs", "--tail", "30", server.container], check=False)
+    diagnostic_logs = _container_logs(server.container)
+    _write_diagnostic(server.name, server.image, server.version, diagnostic_logs)
     raise RuntimeError(
-        f"{server.name} did not become ready: {last_error}\n"
-        f"last server log lines:\n{(logs.stdout + logs.stderr).strip()}"
+        f"{server.name} did not become ready: {_redact(last_error)[-12000:]}\n"
+        f"last server log lines:\n{diagnostic_logs}"
     )
 
 
@@ -754,10 +798,12 @@ class VitessAdapter(DockerAdapter):
             last_error = result.stderr.strip()
             time.sleep(1)
 
-        logs = docker(["logs", "--tail", "50", server.container], check=False)
+        diagnostic_logs = _container_logs(server.container)
+        _write_diagnostic(server.name, server.image, server.version, diagnostic_logs)
         raise RuntimeError(
-            f"{server.name} VTGate did not become ready for keyspace {self.keyspace}: {last_error}\n"
-            f"last server log lines:\n{(logs.stdout + logs.stderr).strip()}"
+            f"{server.name} VTGate did not become ready for keyspace {self.keyspace}: "
+            f"{_redact(last_error)[-12000:]}\n"
+            f"last server log lines:\n{diagnostic_logs}"
         )
 
     def seed(self, server):
@@ -883,10 +929,11 @@ class TiDBAdapter(DockerAdapter):
                 break
             time.sleep(1)
 
-        logs = docker(["logs", "--tail", "50", server.container], check=False)
+        diagnostic_logs = _container_logs(server.container)
+        _write_diagnostic(server.name, server.image, server.version, diagnostic_logs)
         raise RuntimeError(
-            f"{server.name} did not become ready: {last_error}\n"
-            f"last server log lines:\n{(logs.stdout + logs.stderr).strip()}"
+            f"{server.name} did not become ready: {_redact(last_error)[-12000:]}\n"
+            f"last server log lines:\n{diagnostic_logs}"
         )
 
     def seed(self, server):
@@ -923,7 +970,18 @@ def start_servers(targets=None):
     targets = selected_targets() if targets is None else targets
     _TLS = _prepare_tls()
     for target in targets:
-        _SERVERS.append(_start_one(target, _TLS))
+        started_before = set(_STARTED)
+        try:
+            server = _start_one(target, _TLS)
+        except Exception as err:
+            # A target may fail while seeding, before it reaches _SERVERS.
+            containers = [name for name in _STARTED if name not in started_before]
+            logs = "\n".join(_container_logs(name) for name in containers)
+            detail = _redact(str(err))
+            _write_diagnostic(target.name, target.image, "", detail + "\n" + logs)
+            raise RuntimeError(f"{target.name} startup/setup failed: {detail}") from err
+
+        _SERVERS.append(server)
 
 
 def stop_servers():
@@ -948,6 +1006,9 @@ def running_servers(targets=None):
         check_docker()
         start_servers(targets)
         yield servers()
+    except Exception:
+        failure_diagnostics(_SERVERS)
+        raise
     finally:
         stop_servers()
 
