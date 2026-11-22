@@ -41,7 +41,8 @@ and baseline-pair prerequisite skips separately. A server startup or fixture
 setup failure has its own error label.
 
 On failure, bounded server logs are redacted and saved in
-`e2e-diagnostics/<target>.log` before containers are removed. Cleanup also
+`e2e-diagnostics/<target>.log` before containers are removed. The console prints
+the error and log-file location; full server logs stay in that file. Cleanup also
 happens when a test fails or you press Ctrl-C.
 
 ## CI coverage
@@ -55,7 +56,7 @@ baseline; no established job uses `continue-on-error`. The manual workflow
 lets you select Vitess or TiDB. Reporting/lifecycle unit tests run separately:
 
 ```sh
-python3 -m unittest discover -s tests -p 'test_e2e_reporting.py' -v
+python3 -m unittest discover -s tests -p 'test_e2e_*.py' -v
 ```
 
 The required target image refs are immutable multi-architecture manifest
@@ -73,8 +74,10 @@ THYSQL_E2E_KEEP=1 zig build e2e
 
 With `THYSQL_E2E_KEEP=1` the containers are named `thysql-e2e-<target>-keep`,
 are reused on the next run (started if stopped), and are not removed. The
-harness checks their image, startup flags, and TLS mount configuration before
-reuse, removing and recreating stale containers. Fixtures are re-seeded on each
+harness checks their image, startup flags, and TLS certificate contents before
+reuse, removing and recreating stale containers. Kept certificates are renewed
+automatically if missing, invalid, or expiring within an hour; affected servers
+are recreated so they load the new certificates. Fixtures are re-seeded on each
 run. Remove them when you are done:
 
 ```sh

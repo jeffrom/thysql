@@ -59,8 +59,9 @@ KEYCHAIN_PASSWORD = "e2e-keychain-pw"
 TLS_MOUNT = "/etc/thysql-tls"
 CONFIG_LABEL = f"{LABEL}-config"
 # Kept containers reference their TLS directory by path, so with
-# THYSQL_E2E_KEEP=1 the directory is fixed and only generated when missing.
+# THYSQL_E2E_KEEP=1 the directory is fixed and renewed before certificates expire.
 TLS_KEEP_DIR = os.path.join(tempfile.gettempdir(), "thysql-e2e-tls-keep")
+TLS_RENEW_SECONDS = 3600
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 
 _ANSI = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07)")
@@ -459,12 +460,14 @@ def _write_diagnostic(name, image, version, logs):
     content = _redact(heading) + _redact(logs or "(no container logs)")[-12000:] + "\n"
     try:
         os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
-        with open(os.path.join(DIAGNOSTICS_DIR, f"{name}.log"), "w") as handle:
+        path = os.path.join(DIAGNOSTICS_DIR, f"{name}.log")
+        with open(path, "w") as handle:
             handle.write(content)
     except OSError as err:
         sys.stderr.write(f"unable to save diagnostics: {_redact(str(err))}\n")
-
-    sys.stderr.write(f"\n--- failure diagnostics: {name} ---\n{content}")
+        sys.stderr.write(content)
+    else:
+        sys.stderr.write(f"{name} server logs saved to {path}\n")
 
 
 def check_docker():
@@ -503,12 +506,11 @@ def _wait_ready(server):
         if result.returncode == 0:
             return
         last_error = result.stderr.strip()
+        if "certificate has expired" in last_error:
+            break
         time.sleep(1)
-    diagnostic_logs = _container_logs(server.container)
-    _write_diagnostic(server.name, server.image, server.version, diagnostic_logs)
     raise RuntimeError(
-        f"{server.name} did not become ready: {_redact(last_error)[-12000:]}\n"
-        f"last server log lines:\n{diagnostic_logs}"
+        f"{server.name} did not become ready: {_redact(last_error)[-12000:]}"
     )
 
 
@@ -570,6 +572,7 @@ def _configuration_fingerprint(target, tls, *, runtime_config=None):
         "startup_args": _tls_server_args(),
         "tls_mount_source": os.path.realpath(tls.directory),
         "tls_mount_target": TLS_MOUNT,
+        "tls_contents": _tls_fingerprint(tls),
         "runtime_config": runtime_config,
     }
     return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
@@ -592,13 +595,59 @@ def _tls_server_args():
     ]
 
 
+def _tls_files(tls):
+    return (
+        tls.ca, tls.wrong_ca, tls.server_cert, tls.server_key,
+        tls.client_cert, tls.client_key,
+    )
+
+
+def _tls_fingerprint(tls):
+    digest = hashlib.sha256()
+    for path in _tls_files(tls):
+        with open(path, "rb") as handle:
+            digest.update(hashlib.sha256(handle.read()).digest())
+
+    return digest.hexdigest()
+
+
+def _tls_reusable(tls):
+    if not all(os.path.isfile(path) for path in _tls_files(tls)):
+        return False
+
+    for cert in (tls.ca, tls.wrong_ca, tls.server_cert, tls.client_cert):
+        result = subprocess.run(
+            ["openssl", "x509", "-checkend", str(TLS_RENEW_SECONDS), "-noout", "-in", cert],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            return False
+
+    try:
+        _openssl(["verify", "-CAfile", tls.ca, tls.server_cert, tls.client_cert], tls.directory)
+        for cert, key in ((tls.server_cert, tls.server_key), (tls.client_cert, tls.client_key)):
+            public = _openssl(["x509", "-in", cert, "-pubkey", "-noout"], tls.directory)
+            key_public = _openssl(["pkey", "-in", key, "-passin", "pass:", "-pubout"], tls.directory)
+            if public != key_public:
+                return False
+
+        ca_hash = _openssl(["x509", "-hash", "-noout", "-in", tls.ca], tls.directory).strip()
+        with open(tls.ca, "rb") as source, open(os.path.join(tls.capath, f"{ca_hash}.0"), "rb") as hashed:
+            return source.read() == hashed.read()
+    except (OSError, RuntimeError):
+        return False
+
+
 def _prepare_tls():
     """Generates the TLS material for this run, or reuses the kept material."""
     if keep_containers():
         os.makedirs(TLS_KEEP_DIR, exist_ok=True)
-        if not os.path.exists(os.path.join(TLS_KEEP_DIR, "server-key.pem")):
-            return make_tls_material(TLS_KEEP_DIR)
-        return tls_paths(TLS_KEEP_DIR)
+        tls = tls_paths(TLS_KEEP_DIR)
+        if _tls_reusable(tls):
+            return tls
+
+        sys.stderr.write("Generating fresh e2e TLS certificates for kept containers\n")
+        return make_tls_material(TLS_KEEP_DIR)
     directory = tempfile.mkdtemp(prefix="thysql-e2e-tls-")
     _TLS_DIRS.append(directory)
     return make_tls_material(directory)
@@ -796,14 +845,13 @@ class VitessAdapter(DockerAdapter):
             if result.returncode == 0:
                 return
             last_error = result.stderr.strip()
+            if "certificate has expired" in last_error:
+                break
             time.sleep(1)
 
-        diagnostic_logs = _container_logs(server.container)
-        _write_diagnostic(server.name, server.image, server.version, diagnostic_logs)
         raise RuntimeError(
             f"{server.name} VTGate did not become ready for keyspace {self.keyspace}: "
-            f"{_redact(last_error)[-12000:]}\n"
-            f"last server log lines:\n{diagnostic_logs}"
+            f"{_redact(last_error)[-12000:]}"
         )
 
     def seed(self, server):
@@ -924,16 +972,15 @@ class TiDBAdapter(DockerAdapter):
             if result.returncode == 0:
                 return
             last_error = (result.stdout + result.stderr).strip()
+            if "certificate has expired" in last_error:
+                break
             state = docker(["inspect", "-f", "{{.State.Running}}", server.container], check=False)
             if state.stdout.strip() != "true":
                 break
             time.sleep(1)
 
-        diagnostic_logs = _container_logs(server.container)
-        _write_diagnostic(server.name, server.image, server.version, diagnostic_logs)
         raise RuntimeError(
-            f"{server.name} did not become ready: {_redact(last_error)[-12000:]}\n"
-            f"last server log lines:\n{diagnostic_logs}"
+            f"{server.name} did not become ready: {_redact(last_error)[-12000:]}"
         )
 
     def seed(self, server):
@@ -1002,12 +1049,15 @@ def stop_servers():
 @contextlib.contextmanager
 def running_servers(targets=None):
     """Starts the containers and always removes them, even on failure or Ctrl-C."""
+    ready = False
     try:
         check_docker()
         start_servers(targets)
+        ready = True
         yield servers()
     except Exception:
-        failure_diagnostics(_SERVERS)
+        if ready:
+            failure_diagnostics(_SERVERS)
         raise
     finally:
         stop_servers()

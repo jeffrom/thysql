@@ -186,6 +186,48 @@ class ReportingTests(unittest.TestCase):
             self.assertNotIn(secret, saved + output.getvalue())
         self.assertIn("<redacted>", saved)
 
+    def test_expired_tls_readiness_does_not_repeat_failed_handshakes(self):
+        server = SimpleNamespace(name="mariadb", container="container", client="mariadb")
+        failure = SimpleNamespace(returncode=1, stderr="ERROR 2026: certificate has expired")
+        with mock.patch.object(harness, "docker", return_value=failure) as docker, \
+             mock.patch.object(harness.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "certificate has expired"):
+                harness._wait_ready(server)
+
+        self.assertEqual(docker.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_startup_failure_saves_only_failed_target_logs_once(self):
+        targets = [SimpleNamespace(name=name, image="image") for name in ("mysql", "mariadb")]
+
+        def start(target, tls):
+            harness._STARTED.append(target.name)
+            if target.name == "mariadb":
+                raise RuntimeError("certificate has expired")
+
+            return SimpleNamespace(name="mysql", image="image", version="version", container="mysql")
+
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(harness, "DIAGNOSTICS_DIR", directory), \
+             mock.patch.object(harness, "_STARTED", []), \
+             mock.patch.object(harness, "_SERVERS", []), \
+             mock.patch.object(harness, "check_docker"), \
+             mock.patch.object(harness, "_prepare_tls", return_value=None), \
+             mock.patch.object(harness, "_start_one", side_effect=start), \
+             mock.patch.object(harness, "_container_logs", return_value="[Warning] aborted connection") as logs, \
+             mock.patch.object(harness, "stop_servers"), contextlib.redirect_stderr(output):
+            with self.assertRaisesRegex(RuntimeError, "mariadb startup/setup failed"):
+                with harness.running_servers(targets):
+                    self.fail("setup unexpectedly succeeded")
+
+            self.assertEqual([path.name for path in Path(directory).iterdir()], ["mariadb.log"])
+            self.assertIn("[Warning]", Path(directory, "mariadb.log").read_text())
+
+        logs.assert_called_once_with("mariadb")
+        self.assertEqual(output.getvalue().count("server logs saved"), 1)
+        self.assertNotIn("[Warning]", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -113,7 +113,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Reporting unit tests
-        run: python3 -m unittest discover -s tests -p 'test_e2e_reporting.py' -v
+        run: python3 -m unittest discover -s tests -p 'test_e2e_*.py' -v
 
   static-macos:
     runs-on: macos-15
