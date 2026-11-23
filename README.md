@@ -288,8 +288,17 @@ the REPL. Nothing is cached, so short-lived tokens work.
 - The command sees these environment variables, so one script can serve many connections:
   `THYSQL_HOST`, `THYSQL_PORT`, `THYSQL_USER`, `THYSQL_DATABASE`, `THYSQL_SOCKET`,
   `THYSQL_CONNECTION` (empty without `-C`), and `THYSQL_REASON` (`connect`, `reconnect`,
-  or `complete`). They hold the values from flags and files, before any JSON settings are
+  `auth-retry`, or `complete`). They hold the values from flags and files, before any JSON settings are
   applied, and they stay the same on reconnects.
+
+When an auth-command connection receives error 1105 containing `unavailable: invalid auth credentials`,
+thysql runs the command again and retries the connection once with `THYSQL_REASON=auth-retry`.
+Helpers can use this reason to bypass cached credentials or request a fresh login.
+An interactive query can trigger one such refresh and reconnect; thysql prints the original error and
+does not replay the failed query. A successful refresh opens a new session, so prior session and
+transaction state is lost. `--skip-reconnect` disables this interactive recovery. Batch queries and
+completion never perform auth refresh recovery. Remaining statements in the submitted input or
+sourced files are stopped after an interactive auth refresh, including with `--force`.
 
 An example for AWS RDS IAM tokens:
 

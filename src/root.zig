@@ -125,6 +125,7 @@ fn connectInfo(options: *const Options.Options, provider: Mysql.PasswordProvider
         .tls = options.tls,
         .connect_timeout = options.connect_timeout,
         .locked = options.lockedFields(),
+        .auth_command = options.password_source == .command,
     };
 }
 
@@ -429,6 +430,35 @@ fn canReconnect(db: *Mysql.DB, repl: ?*const Repl) bool {
     return session.reconnect and Mysql.isLostConnection(db.lastErrno());
 }
 
+fn canRefreshAuth(db: *Mysql.DB, repl: ?*const Repl) bool {
+    const session = repl orelse return false;
+    return db.hasAuthCommand() and session.reconnect and Mysql.isInvalidAuthCredentials(db.lastErrno(), db.lastErrorMessage());
+}
+
+/// Callers unwind the submitted input after this attempt, whether it succeeds or fails.
+fn refreshAuthSession(db: *Mysql.DB, out: *std.Io.Writer, repl: *Repl) !bool {
+    try out.print("Refreshing authentication and reconnecting...\n", .{});
+    try out.flush();
+
+    db.refreshAuth() catch |err| switch (err) {
+        Mysql.DBError.ConnectError => {
+            try db.renderConnectFailure(out, null);
+            try out.print("ERROR: Can't reconnect with refreshed authentication\n", .{});
+            return false;
+        },
+        Mysql.DBError.PasswordFailed => {
+            try out.print("ERROR: Can't reconnect with refreshed authentication\n", .{});
+            return false;
+        },
+        else => return err,
+    };
+    try out.print("A new session was opened. The previous session and transaction state were lost. The failed query was not retried.\n", .{});
+    try repl.syntax.refresh(db);
+    try renderConnectionInfo(out, db);
+    try loadNames(repl, db, out, false);
+    return true;
+}
+
 /// Selects `database`. A lost connection is reconnected once, and the select is tried again.
 /// Errors are printed with the batch line number when `line` is set. Returns false after printing.
 fn selectDatabase(db: *Mysql.DB, out: *std.Io.Writer, err_out: *std.Io.Writer, line: ?usize, repl: ?*Repl, database: [:0]const u8) !bool {
@@ -453,6 +483,10 @@ fn selectDatabase(db: *Mysql.DB, out: *std.Io.Writer, err_out: *std.Io.Writer, l
             try db.renderLastErrorAt(err_out, number);
         } else {
             try db.renderLastError(err_out);
+        }
+        if (canRefreshAuth(db, repl)) {
+            _ = try refreshAuthSession(db, out, repl.?);
+            return error.AuthRefreshStopsInput;
         }
         return false;
     }
@@ -671,6 +705,10 @@ fn execReplStatement(context: *ReplContext, stdout: *std.Io.Writer, sql: []const
         // The server has the last word, but the statement's parse tree can say where the error is,
         // and what else in the statement it relates to.
         try context.repl.syntax.explainError(stdout, sql, db.lastErrno(), db.lastErrorMessage(), context.repl.names, diagnosticDisplay(&context.repl));
+        if (canRefreshAuth(db, &context.repl)) {
+            _ = try refreshAuthSession(db, stdout, &context.repl);
+            return error.AuthRefreshStopsInput;
+        }
         if (retried or !canReconnect(db, &context.repl)) {
             return null;
         }
@@ -731,6 +769,10 @@ fn executeQuery(context: *ReplContext, stdout: *std.Io.Writer, stderr: *std.Io.W
                 Mysql.DBError.ExecError, Mysql.DBError.StoreResultError => {
                     const error_code = db.lastErrno();
                     try db.renderLastError(stdout);
+                    if (canRefreshAuth(db, &context.repl)) {
+                        _ = try refreshAuthSession(db, stdout, &context.repl);
+                        return error.AuthRefreshStopsInput;
+                    }
                     try client.afterStatement(db, stdout, warnings, error_code);
                     return false;
                 },
@@ -1101,6 +1143,11 @@ fn readOneLine(
         if (ClientCommand.parse(line)) |command| {
             _ = runClientCommand(context.client, db, stdout, stdout, null, &context.repl, scanner.delimiterText(), context.switcher, command) catch |err| switch (err) {
                 error.ClientQuit => return true,
+                error.AuthRefreshStopsInput => {
+                    scanner.reset();
+                    try stdout.flush();
+                    return false;
+                },
                 else => return err,
             };
             try stdout.flush();
@@ -1110,6 +1157,8 @@ fn readOneLine(
 
     feedInteractiveInput(context, stdout, stderr, line, true) catch |err| switch (err) {
         error.ClientQuit => return true,
+        // Unwind sourced files (even with --force) and discard the rest of this input.
+        error.AuthRefreshStopsInput => scanner.reset(),
         else => return err,
     };
     try stdout.flush();

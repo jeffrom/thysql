@@ -20,6 +20,11 @@ pub fn isLostConnection(errno: u32) bool {
     return errno == crServerGoneError or errno == crServerLostError;
 }
 
+/// True only for the proxy/server error that reports invalid auth credentials.
+pub fn isInvalidAuthCredentials(errno: u32, message: []const u8) bool {
+    return errno == 1105 and std.mem.indexOf(u8, message, "unavailable: invalid auth credentials") != null;
+}
+
 /// What the last failed connect attempt reported. It is copied out because the
 /// handle is closed before the caller can read it.
 pub const ConnectFailure = struct {
@@ -98,6 +103,8 @@ pub const DBInfo = struct {
     locked: Options.ConnectFieldSet = .{},
     /// Do not print a failed connect to stderr. `thysql complete` sets this unless it is debugging.
     quiet_connect_error: bool = false,
+    /// Allows one credential refresh on connect failures. Leave false for completion.
+    auth_command: bool = false,
 };
 
 /// TLS settings as NUL-terminated strings for the C library. An empty string means unset.
@@ -163,6 +170,7 @@ pub const DB = struct {
     base_strings: std.heap.ArenaAllocator,
     /// Connection fields set on the command line. The auth command's settings may not change them.
     locked: Options.ConnectFieldSet,
+    auth_command: bool,
 
     /// Connects as `info` says, and prints a failed connect to stderr unless `info.quiet_connect_error`.
     pub fn init(allocator: Allocator, info: DBInfo) !DB {
@@ -188,7 +196,7 @@ pub const DB = struct {
         const password = try allocator.dupeSentinel(u8, if (info.password_provider == null) info.password else "", 0);
         errdefer allocator.free(password);
 
-        const next = try connectWith(allocator, base, password, info.locked, info.password_provider, .connect, failure);
+        const next = try connectWith(allocator, base, password, info.locked, info.password_provider, .connect, failure, info.auth_command);
 
         return .{
             .conn = next.conn,
@@ -207,6 +215,7 @@ pub const DB = struct {
             .base = base,
             .base_strings = base_strings,
             .locked = info.locked,
+            .auth_command = info.auth_command,
         };
     }
 
@@ -322,6 +331,10 @@ pub const DB = struct {
 
     pub fn lastErrno(self: *DB) u32 {
         return C.mysql_errno(self.conn);
+    }
+
+    pub fn hasAuthCommand(self: *const DB) bool {
+        return self.auth_command;
     }
 
     /// Prints the warnings of the last statement as mysql.cc does: `Warning (Code 1366): text`.
@@ -457,6 +470,11 @@ pub const DB = struct {
         return self.connectAs(null, null, .reconnect);
     }
 
+    /// Refreshes auth-command credentials once after an interactive query reports invalid credentials.
+    pub fn refreshAuth(self: *DB) DBError!void {
+        return self.connectAs(null, null, .auth_retry);
+    }
+
     /// Opens a new connection to `host` and selects `database`. Null keeps the current
     /// value. The old connection stays open when this fails, and the failure is kept
     /// for `renderConnectFailure`.
@@ -477,7 +495,7 @@ pub const DB = struct {
             locked.insert(.host);
         }
 
-        const next = connectWith(self.allocator, base, self.password, locked, self.password_provider, reason, &self.connect_failure) catch |err| switch (err) {
+        const next = connectWith(self.allocator, base, self.password, locked, self.password_provider, reason, &self.connect_failure, self.auth_command) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.PasswordFailed => return error.PasswordFailed,
             else => return error.ConnectError,
@@ -664,6 +682,26 @@ fn dupeOptionsTls(arena: Allocator, tls: Options.Tls) !Options.Tls {
 /// used. Any failure to get the password is `error.PasswordFailed`, and the provider has reported
 /// it. On failure, `failure` holds the connect error.
 fn connectWith(
+    allocator: Allocator,
+    base: Options.Options,
+    password: [:0]const u8,
+    locked: Options.ConnectFieldSet,
+    provider: ?PasswordProvider,
+    reason: Password.Reason,
+    failure: *ConnectFailure,
+    auth_command: bool,
+) !Connected {
+    return connectOnce(allocator, base, password, locked, provider, reason, failure) catch |err| {
+        const may_refresh = auth_command and provider != null and (reason == .connect or reason == .reconnect);
+        if (err == error.ConnectError and may_refresh and isInvalidAuthCredentials(failure.errno, failure.message())) {
+            return connectOnce(allocator, base, password, locked, provider, .auth_retry, failure);
+        }
+        return err;
+    };
+}
+
+/// One attempt owns and releases its auth output and temporary connection settings.
+fn connectOnce(
     allocator: Allocator,
     base: Options.Options,
     password: [:0]const u8,
@@ -1740,6 +1778,13 @@ test "lost connection means server gone (2006) or lost during query (2013)" {
     try std.testing.expect(!isLostConnection(1064));
     try std.testing.expect(!isLostConnection(1927));
     try std.testing.expect(!isLostConnection(0));
+}
+
+test "invalid auth credentials require both error 1105 and the specific message" {
+    try std.testing.expect(isInvalidAuthCredentials(1105, "unavailable: invalid auth credentials"));
+    try std.testing.expect(isInvalidAuthCredentials(1105, "proxy: unavailable: invalid auth credentials; retry"));
+    try std.testing.expect(!isInvalidAuthCredentials(1105, "unavailable: backend overloaded"));
+    try std.testing.expect(!isInvalidAuthCredentials(1045, "unavailable: invalid auth credentials"));
 }
 
 test "a connect failure keeps the message and error number" {

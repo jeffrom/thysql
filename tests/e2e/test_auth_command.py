@@ -10,6 +10,8 @@ import json
 import os
 import re
 import shlex
+import socket
+import threading
 
 from harness import (
     AUTH_PASSWORD,
@@ -36,6 +38,46 @@ def table_connection_id(text):
     match = re.search(r"\|\s*(\d+)\s*\|", text)
     assert match is not None, text
     return int(match.group(1))
+
+
+class AuthErrorServer:
+    """Reject handshakes with scripted MySQL error packets, without a backend."""
+
+    def __init__(self, failures):
+        self.failures = failures
+        self.attempts = 0
+        self.stopped = threading.Event()
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen()
+        self.listener.settimeout(0.1)
+        self.port = self.listener.getsockname()[1]
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self):
+        while not self.stopped.is_set():
+            try:
+                conn, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with conn:
+                errno, message = self.failures[min(self.attempts, len(self.failures) - 1)]
+                self.attempts += 1
+                payload = b"\xff" + errno.to_bytes(2, "little") + b"#HY000" + message.encode()
+                conn.sendall(len(payload).to_bytes(3, "little") + b"\x00" + payload)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stopped.set()
+        self.listener.close()
+        self.thread.join(timeout=2)
+        if self.thread.is_alive():
+            raise RuntimeError("auth error server did not stop")
 
 
 class AuthCommandTests(E2ETestCase):
@@ -127,6 +169,190 @@ class AuthCommandTests(E2ETestCase):
     def finish(self, session):
         session.send("\x04")
         self.assertEqual(session.wait_exit(), 0)
+
+    def test_handshake_auth_refresh_is_once_and_requires_auth_command_and_specific_error(self):
+        invalid = (1105, "unavailable: invalid auth credentials")
+        cases = [
+            ([invalid], True, 2, ["connect", "auth-retry"]),
+            ([invalid, (1045, "refreshed credentials rejected")], True, 2, ["connect", "auth-retry"]),
+            ([invalid], False, 1, []),
+            ([(1105, "unavailable: backend overloaded")], True, 1, ["connect"]),
+            ([(1045, invalid[1])], True, 1, ["connect"]),
+        ]
+        for failures, auth_command, attempts, reasons in cases:
+            with self.subTest(failures=failures, auth_command=auth_command):
+                self.forget_log()
+                with AuthErrorServer(failures) as server:
+                    args = ["-h", "127.0.0.1", "-P", str(server.port), "-u", ROOT_USER, *PLAINTEXT]
+                    if auth_command:
+                        args.append(f"--auth-command={self.script}")
+                    result = self.invoke(args + ["-e", "SELECT 1"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(server.attempts, attempts)
+                self.assertIn(failures[min(attempts - 1, len(failures) - 1)][1], result.stderr)
+                actual = [line.split("|")[0] for line in self.log_lines()] if auth_command else []
+                self.assertEqual(actual, reasons)
+
+    def create_auth_error_procedure(self, server, first_result=False, message="unavailable: invalid auth credentials"):
+        self.require_capability(server, "stored_routines")
+        sql = (
+            "DROP PROCEDURE IF EXISTS thysql_auth_error;\n"
+            "DROP TABLE IF EXISTS thysql_auth_error_calls;\n"
+            "CREATE TABLE thysql_auth_error_calls (n INT NOT NULL);\n"
+            "DELIMITER //\n"
+            "CREATE PROCEDURE thysql_auth_error() BEGIN "
+            "INSERT INTO thysql_auth_error_calls VALUES (1); "
+            + ("SELECT 123 AS before_error; " if first_result else "")
+            + "SIGNAL SQLSTATE 'HY000' SET MYSQL_ERRNO = 1105, "
+            f"MESSAGE_TEXT = '{message}'; "
+            "END//\n"
+            "DELIMITER ;\n"
+        )
+        result = run_thysql(server.connect_args(ROOT_USER) + [TEST_DB], stdin=sql, env=password_env(ROOT_USER))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def auth_error_call_count(self, server):
+        result = run_thysql(
+            server.connect_args(ROOT_USER) + ["-N", "-B", "-e", "SELECT COUNT(*) FROM thysql_auth_error_calls", TEST_DB],
+            env=password_env(ROOT_USER),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return int(result.stdout.strip())
+
+    def test_query_auth_refresh_opens_one_new_session_without_replay(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.create_auth_error_procedure(server)
+                session = self.start(server, [*PLAINTEXT, f"--auth-command={self.script}"])
+                session.expect("Welcome to thysql.")
+                session.expect(main_prompt(server))
+
+                session.send("CALL thysql_auth_error();" + ENTER)
+                text = session.expect("The failed query was not retried.")
+                self.assertIn("ERROR 1105", text)
+                self.assertIn("A new session was opened", text)
+                self.assertIn("previous session and transaction state were lost", text)
+                self.assertNotIn("1 row in set", text)
+                session.expect(main_prompt(server))
+                self.finish(session)
+
+                self.assertEqual(self.auth_error_call_count(server), 1)
+                self.assertEqual(
+                    self.log_lines(),
+                    [
+                        f"connect|127.0.0.1|{server.port}|root|",
+                        f"auth-retry|127.0.0.1|{server.port}|root|",
+                    ],
+                )
+                os.remove(self.log_path)
+
+    def test_auth_refresh_stops_remaining_input_and_sourced_files_even_with_force(self):
+        for server in self.each_server():
+            for sourced in (False, True):
+                with self.subTest(server=server.name, sourced=sourced):
+                    self.forget_log()
+                    self.create_auth_error_procedure(server)
+                    session = self.start(server, [*PLAINTEXT, "--force", f"--auth-command={self.script}"])
+                    session.expect(main_prompt(server))
+                    sql = "CALL thysql_auth_error(); INSERT INTO thysql_auth_error_calls VALUES (2);"
+                    if sourced:
+                        path = os.path.join(self.home, "auth-input.sql")
+                        with open(path, "w") as handle:
+                            handle.write(sql + "\n")
+                        sql = f"source {path}"
+                    session.send(sql + ENTER)
+                    session.expect("The failed query was not retried.")
+                    session.expect(main_prompt(server))
+                    session.send("SELECT 987654 AS usable_after_refresh;" + ENTER)
+                    session.expect("1 row in set")
+                    session.expect(main_prompt(server))
+                    self.finish(session)
+                    self.assertEqual(self.auth_error_call_count(server), 1)
+                    self.assertEqual([line.split("|")[0] for line in self.log_lines()], ["connect", "auth-retry"])
+
+    def test_auth_refresh_handles_an_error_after_the_first_result_without_replay(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.forget_log()
+                self.create_auth_error_procedure(server, first_result=True)
+                session = self.start(server, [*PLAINTEXT, f"--auth-command={self.script}"])
+                session.expect(main_prompt(server))
+                session.send("CALL thysql_auth_error();" + ENTER)
+                text = session.expect("The failed query was not retried.")
+                self.assertIn("before_error", text)
+                self.assertIn("ERROR 1105", text)
+                session.expect(main_prompt(server))
+                self.finish(session)
+                self.assertEqual(self.auth_error_call_count(server), 1)
+                self.assertEqual([line.split("|")[0] for line in self.log_lines()], ["connect", "auth-retry"])
+
+    def test_query_auth_refresh_requires_auth_command_and_specific_error(self):
+        for server in self.each_server():
+            for auth_command in (False, True):
+                with self.subTest(server=server.name, auth_command=auth_command):
+                    self.forget_log()
+                    message = "unavailable: backend overloaded" if auth_command else "unavailable: invalid auth credentials"
+                    self.create_auth_error_procedure(server, message=message)
+                    args = [*PLAINTEXT]
+                    if auth_command:
+                        args.append(f"--auth-command={self.script}")
+                    session = self.interactive(
+                        server.connect_args(ROOT_USER) + args + [TEST_DB],
+                        env={} if auth_command else password_env(ROOT_USER),
+                    )
+                    session.expect(main_prompt(server))
+                    session.send("CALL thysql_auth_error();" + ENTER)
+                    session.expect("ERROR 1105")
+                    text = session.expect(main_prompt(server))
+                    self.assertNotIn("Refreshing authentication", text)
+                    self.finish(session)
+                    self.assertEqual(self.auth_error_call_count(server), 1)
+                    if auth_command:
+                        self.assertEqual([line.split("|")[0] for line in self.log_lines()], ["connect"])
+
+    def test_query_auth_refresh_failure_does_not_replay_and_skip_reconnect_disables_it(self):
+        for server in self.each_server():
+            with self.subTest(server=server.name):
+                self.create_auth_error_procedure(server)
+                failing_refresh = self.write_script(
+                    "auth-refresh-fails.sh",
+                    self.log_context()
+                    + 'if [ "$THYSQL_REASON" = "auth-retry" ]; then exit 3; fi\n'
+                    + f"cat {shlex.quote(self.password_path)}\n",
+                )
+                session = self.start(server, [*PLAINTEXT, f"--auth-command={failing_refresh}"])
+                session.expect("Welcome to thysql.")
+                session.expect(main_prompt(server))
+                session.send("CALL thysql_auth_error();" + ENTER)
+                text = session.expect("ERROR: Can't reconnect with refreshed authentication")
+                self.assertIn("ERROR 1105", text)
+                self.assertIn("auth command failed with exit status 3", text)
+                session.expect(main_prompt(server))
+                self.finish(session)
+                self.assertEqual(self.auth_error_call_count(server), 1)
+                self.assertEqual([line.split("|")[0] for line in self.log_lines()], ["connect", "auth-retry"])
+                os.remove(self.log_path)
+
+                self.forget_log()
+                session = self.start(server, [*PLAINTEXT, "--skip-reconnect", f"--auth-command={self.script}"])
+                session.expect("Welcome to thysql.")
+                session.expect(main_prompt(server))
+                session.send("CALL thysql_auth_error();" + ENTER)
+                text = session.expect("ERROR 1105")
+                self.assertNotIn("A new session was opened", text)
+                session.expect(main_prompt(server))
+                self.finish(session)
+                self.assertEqual([line.split("|")[0] for line in self.log_lines()], ["connect"])
+                os.remove(self.log_path)
+
+                batch = self.invoke(
+                    server.connect_args(ROOT_USER)
+                    + [*PLAINTEXT, f"--auth-command={self.script}", "-e", "CALL thysql_auth_error();", TEST_DB]
+                )
+                self.assertNotEqual(batch.returncode, 0)
+                self.assertNotIn("A new session was opened", batch.stdout + batch.stderr)
+                self.assertEqual([line.split("|")[0] for line in self.log_lines()], ["connect"])
+                os.remove(self.log_path)
 
     def test_password_comes_from_the_command_and_is_never_printed(self):
         for server in self.each_server():

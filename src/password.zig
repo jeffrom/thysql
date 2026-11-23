@@ -25,7 +25,7 @@ pub const Secret = struct {
 };
 
 /// Why a password is needed. The auth command sees it as THYSQL_REASON.
-pub const Reason = enum { connect, reconnect, complete };
+pub const Reason = enum { connect, reconnect, auth_retry, complete };
 
 /// The server a password is for. The auth command sees these as THYSQL_* variables.
 pub const Target = struct {
@@ -442,7 +442,10 @@ fn commandEnvironment(allocator: Allocator, context: FetchContext) !std.process.
     try env.put("THYSQL_DATABASE", target.database);
     try env.put("THYSQL_SOCKET", target.socket);
     try env.put("THYSQL_CONNECTION", target.connection);
-    try env.put("THYSQL_REASON", @tagName(context.reason));
+    try env.put("THYSQL_REASON", switch (context.reason) {
+        .auth_retry => "auth-retry",
+        else => @tagName(context.reason),
+    });
     return env;
 }
 
@@ -618,6 +621,10 @@ test "auth command sees the target and the reason as THYSQL_* variables" {
     var output = try Supplier.fetchOpaque(&supplier, .{ .host = "db.example", .user = "app", .port = 3307, .database = "shop", .socket = "" }, .reconnect);
     defer output.deinit();
     try std.testing.expectEqualStrings("reconnect|db.example|3307|app|shop||main/ro", output.password.bytes);
+
+    var refreshed = try Supplier.fetchOpaque(&supplier, .{ .host = "db.example", .user = "app", .port = 3307, .database = "shop", .socket = "" }, .auth_retry);
+    defer refreshed.deinit();
+    try std.testing.expectEqualStrings("auth-retry|db.example|3307|app|shop||main/ro", refreshed.password.bytes);
 }
 
 test "auth command failures are reported on stderr, and an empty password is an error" {
